@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import FastAPI, HTTPException, Request, Security, Body, Header
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import uvicorn
@@ -79,6 +79,19 @@ async def admin_panel(request: Request):
         "request": request,
         "base_url": os.getenv("BASE_URL")
     })
+
+# Маршрут для проверки админ-ключа
+@app.post("/admin/validate")
+async def validate_admin_key(request: Request):
+    """Проверяет валидность админ-ключа."""
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key:
+        raise HTTPException(status_code=401, detail="Admin key is required")
+    
+    if admin_key != os.getenv("ADMIN_KEY"):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    
+    return {"status": "ok"}
 
 async def auth_middleware(request: Request, platform: str):
     auth_header = request.headers.get('authorization')

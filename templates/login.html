@@ -95,7 +95,7 @@
         }
 
         try {
-            const response = await fetch(`${BASE_URL}/api/admin/validate`, {
+            const response = await fetch(`${BASE_URL}/admin/validate`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -120,7 +120,7 @@
     async function validateAndRedirect() {
         const adminKey = localStorage.getItem('adminKey');
         try {
-            const response = await fetch(`${BASE_URL}/api/admin/validate`, {
+            const response = await fetch(`${BASE_URL}/admin/validate`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
