@@ -257,4 +257,18 @@ async def update_user_vk_token(api_key: str, vk_token: str) -> bool:
     
     users[api_key]["vk_accounts"].append(account_data)
     save_users(users)
+    return True
+
+async def verify_api_key(api_key: str) -> bool:
+    """Проверяет валидность API ключа пользователя."""
+    users = load_users()
+    if api_key not in users:
+        raise HTTPException(
+            status_code=401,
+            detail="Неверный API ключ"
+        )
+    
+    # Обновляем время последнего использования
+    users[api_key]["last_used"] = datetime.now().isoformat()
+    save_users(users)
     return True 
