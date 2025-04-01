@@ -82,6 +82,10 @@ async def login(request: Request):
 @app.get("/admin")
 async def admin_panel(request: Request):
     """Отображает админ-панель."""
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
+        return RedirectResponse(url="/login")
+    
     return templates.TemplateResponse(
         "admin_panel.html",
         get_base_context(request)
