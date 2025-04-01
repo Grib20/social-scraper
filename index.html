@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Перенаправление...</title>
+    <script>
+        // Проверяем наличие админ-ключа
+        const adminKey = localStorage.getItem('adminKey');
+        
+        // Если есть админ-ключ, проверяем его валидность
+        if (adminKey) {
+            fetch('/admin/validate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Key': adminKey
+                }
+            })
+            .then(response => {
+                if (response.ok) {
+                    // Если ключ валидный, перенаправляем на админ-панель
+                    window.location.href = '/static/admin_panel.html';
+                } else {
+                    // Если ключ невалидный, удаляем его и перенаправляем на страницу входа
+                    localStorage.removeItem('adminKey');
+                    window.location.href = '/static/login.html';
+                }
+            })
+            .catch(error => {
+                console.error('Error validating admin key:', error);
+                localStorage.removeItem('adminKey');
+                window.location.href = '/static/login.html';
+            });
+        } else {
+            // Если нет админ-ключа, сразу перенаправляем на страницу входа
+            window.location.href = '/static/login.html';
+        }
+    </script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+        }
+        .loader {
+            width: 48px;
+            height: 48px;
+            border: 5px solid #007bff;
+            border-bottom-color: transparent;
+            border-radius: 50%;
+            animation: rotation 1s linear infinite;
+        }
+
+        @keyframes rotation {
+            0% {
+                transform: rotate(0deg);
+            }
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="loader"></div>
+</body>
+</html> 

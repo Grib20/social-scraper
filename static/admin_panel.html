@@ -124,6 +124,10 @@
     <div class="container">
         <h1>Админ-панель</h1>
         
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 20px;">
+            <button class="btn btn-danger" onclick="logout()">Выйти</button>
+        </div>
+
         <div class="section">
             <h2>Статистика системы</h2>
             <div id="system-stats">
@@ -250,9 +254,50 @@
     </div>
 
     <script>
+        // Проверяем наличие админ-ключа
+        if (!localStorage.getItem('adminKey')) {
+            window.location.href = '/login';
+        }
+
         let currentUserApiKey = null;
         let currentTelegramAuthData = null;
-        const adminKey = localStorage.getItem('adminKey') || '';
+        const adminKey = localStorage.getItem('adminKey');
+
+        // Функция для выхода из админ-панели
+        function logout() {
+            localStorage.removeItem('adminKey');
+            window.location.href = '/login';
+        }
+
+        // Добавляем кнопку выхода в верхний правый угол
+        document.querySelector('.container').insertAdjacentHTML('afterbegin', `
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 20px;">
+                <button class="btn btn-danger" onclick="logout()">Выйти</button>
+            </div>
+        `);
+
+        // Функция для проверки валидности админ-ключа
+        async function validateAdminKey() {
+            try {
+                const response = await fetch('/admin/validate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': adminKey
+                    }
+                });
+
+                if (!response.ok) {
+                    // Если ключ недействителен, перенаправляем на страницу входа
+                    localStorage.removeItem('adminKey');
+                    window.location.href = '/login';
+                }
+            } catch (error) {
+                console.error('Error validating admin key:', error);
+                localStorage.removeItem('adminKey');
+                window.location.href = '/login';
+            }
+        }
 
         // Функции для работы с модальными окнами
         function showRegisterUserModal() {
@@ -635,7 +680,14 @@
                         'X-Admin-Key': adminKey
                     }
                 });
-                const users = await response.json();
+                const data = await response.json();
+                
+                // Проверяем структуру ответа
+                console.log('Server response:', data);
+                
+                // Убеждаемся, что у нас есть массив пользователей
+                const users = Array.isArray(data) ? data : (data.users || []);
+                
                 if (users.length === 0) {
                     document.getElementById('users-list').innerHTML = '<p>Нет зарегистрированных пользователей</p>';
                     return;
@@ -672,11 +724,11 @@
                                     </tr>
                                     ${user.telegram_accounts.map(acc => `
                                         <tr>
-                                            <td>${acc.id}</td>
-                                            <td>${acc.api_id}</td>
+                                            <td>${acc.id || '-'}</td>
+                                            <td>${acc.api_id || '-'}</td>
                                             <td>${acc.phone || '-'}</td>
-                                            <td class="status-${acc.status}">${acc.status}</td>
-                                            <td>${acc.requests_count}</td>
+                                            <td class="status-${acc.status || 'active'}">${acc.status || 'active'}</td>
+                                            <td>${acc.requests_count || 0}</td>
                                             <td>${acc.last_request_time ? new Date(acc.last_request_time).toLocaleString() : '-'}</td>
                                             <td>
                                                 <button class="btn btn-danger" onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')">Удалить</button>
@@ -704,14 +756,14 @@
                                     </tr>
                                     ${user.vk_accounts.map(acc => `
                                         <tr>
-                                            <td>${acc.id}</td>
+                                            <td>${acc.id || '-'}</td>
                                             <td>
                                                 <code style="background: #f8f9fa; padding: 2px 4px; border-radius: 2px;">
-                                                    ${acc.token.substring(0, 10)}...
+                                                    ${acc.token ? acc.token.substring(0, 10) + '...' : '-'}
                                                 </code>
                                             </td>
-                                            <td class="status-${acc.status}">${acc.status}</td>
-                                            <td>${acc.requests_count}</td>
+                                            <td class="status-${acc.status || 'active'}">${acc.status || 'active'}</td>
+                                            <td>${acc.requests_count || 0}</td>
                                             <td>${acc.last_request_time ? new Date(acc.last_request_time).toLocaleString() : '-'}</td>
                                             <td>
                                                 <button class="btn btn-danger" onclick="deleteVkAccount('${user.api_key}', '${acc.id}')">Удалить</button>
@@ -726,6 +778,7 @@
                 
                 document.getElementById('users-list').innerHTML = usersHtml;
             } catch (error) {
+                console.error('Error loading users:', error);
                 document.getElementById('users-list').innerHTML = `
                     <div class="error">
                         <p>Ошибка загрузки пользователей: ${error.message}</p>
@@ -735,7 +788,8 @@
         }
 
         // Загружаем данные при загрузке страницы
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', async () => {
+            await validateAdminKey();
             loadSystemStats();
             loadUsers();
         });

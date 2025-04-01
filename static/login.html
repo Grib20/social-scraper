@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Авторизация</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background-color: #f5f5f5;
+        }
+        .login-container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 400px;
+        }
+        h1 {
+            color: #333;
+            margin: 0 0 20px 0;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #444;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .btn {
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .btn:hover {
+            background-color: #0056b3;
+        }
+        .error {
+            color: #dc3545;
+            margin-top: 10px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>Авторизация</h1>
+        <div class="form-group">
+            <label for="adminKey">Админ-ключ:</label>
+            <input type="password" id="adminKey" required>
+        </div>
+        <button class="btn" onclick="login()">Войти</button>
+        <div id="loginResult"></div>
+    </div>
+
+    <script>
+        // Проверяем, есть ли уже сохраненный админ-ключ
+        if (localStorage.getItem('adminKey')) {
+            // Если ключ есть, проверяем его валидность
+            validateAndRedirect();
+        }
+
+        async function login() {
+            const adminKey = document.getElementById('adminKey').value;
+            if (!adminKey) {
+                document.getElementById('loginResult').innerHTML = 
+                    '<div class="error">Введите админ-ключ</div>';
+                return;
+            }
+
+            try {
+                const response = await fetch('/admin/validate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': adminKey
+                    }
+                });
+
+                if (response.ok) {
+                    // Сохраняем ключ и перенаправляем на админ-панель
+                    localStorage.setItem('adminKey', adminKey);
+                    window.location.href = '/admin';
+                } else {
+                    document.getElementById('loginResult').innerHTML = 
+                        '<div class="error">Неверный админ-ключ</div>';
+                }
+            } catch (error) {
+                document.getElementById('loginResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.message}</div>`;
+            }
+        }
+
+        async function validateAndRedirect() {
+            const adminKey = localStorage.getItem('adminKey');
+            try {
+                const response = await fetch('/admin/validate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': adminKey
+                    }
+                });
+
+                if (response.ok) {
+                    window.location.href = '/admin';
+                } else {
+                    // Если ключ недействителен, удаляем его
+                    localStorage.removeItem('adminKey');
+                }
+            } catch (error) {
+                console.error('Error validating admin key:', error);
+                localStorage.removeItem('adminKey');
+            }
+        }
+
+        // Добавляем обработку Enter для поля ввода
+        document.getElementById('adminKey').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                login();
+            }
+        });
+    </script>
+</body>
+</html> 
