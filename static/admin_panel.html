@@ -55,6 +55,69 @@
         .status-cooldown {
             color: #dc3545;
         }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .form-group input, .form-group textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .btn-primary {
+            background-color: #007bff;
+            color: white;
+        }
+        .btn-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+        .btn-success {
+            background-color: #28a745;
+            color: white;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        .modal-content {
+            background-color: white;
+            margin: 15% auto;
+            padding: 20px;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 500px;
+        }
+        .close {
+            float: right;
+            cursor: pointer;
+            font-size: 24px;
+        }
+        .error {
+            color: #dc3545;
+            margin-top: 5px;
+        }
+        .success {
+            color: #28a745;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
@@ -69,20 +132,427 @@
         </div>
 
         <div class="section">
-            <h2>Пользователи</h2>
+            <h2>Управление пользователями</h2>
+            <button class="btn btn-primary" onclick="showRegisterUserModal()">Зарегистрировать нового пользователя</button>
             <div id="users-list">
                 Загрузка...
             </div>
         </div>
     </div>
 
+    <!-- Модальное окно для регистрации пользователя -->
+    <div id="registerUserModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeRegisterUserModal()">&times;</span>
+            <h2>Регистрация нового пользователя</h2>
+            <div id="registerUserForm">
+                <div class="form-group">
+                    <label for="adminKey">Админ-ключ:</label>
+                    <input type="password" id="adminKey" required>
+                </div>
+                <button class="btn btn-primary" onclick="registerUser()">Зарегистрировать</button>
+                <div id="registerUserResult"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для добавления аккаунта Telegram -->
+    <div id="addTelegramAccountModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeAddTelegramAccountModal()">&times;</span>
+            <h2>Добавление аккаунта Telegram</h2>
+            <div id="addTelegramAccountForm">
+                <div class="form-group">
+                    <label for="telegramApiId">API ID:</label>
+                    <input type="text" id="telegramApiId" required>
+                </div>
+                <div class="form-group">
+                    <label for="telegramApiHash">API Hash:</label>
+                    <input type="text" id="telegramApiHash" required>
+                </div>
+                <div class="form-group">
+                    <label for="telegramPhone">Номер телефона:</label>
+                    <input type="text" id="telegramPhone" required placeholder="+79001234567">
+                </div>
+                <div class="form-group">
+                    <label for="telegramProxy">Прокси (опционально):</label>
+                    <input type="text" id="telegramProxy">
+                </div>
+                <div class="form-group">
+                    <label for="telegramSession">Файл сессии (опционально):</label>
+                    <input type="file" id="telegramSession" accept=".session">
+                    <small class="form-text text-muted">Загрузите файл .session, если хотите использовать уже авторизованный аккаунт</small>
+                </div>
+                <button class="btn btn-primary" onclick="startTelegramAuth()">Начать авторизацию</button>
+                <div id="addTelegramAccountResult"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для ввода кода подтверждения Telegram -->
+    <div id="telegramCodeModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeTelegramCodeModal()">&times;</span>
+            <h2>Введите код подтверждения</h2>
+            <div id="telegramCodeForm">
+                <div class="form-group">
+                    <label for="telegramCode">Код из Telegram:</label>
+                    <input type="text" id="telegramCode" required>
+                </div>
+                <button class="btn btn-primary" onclick="submitTelegramCode()">Подтвердить</button>
+                <div id="telegramCodeResult"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для ввода пароля двухфакторной аутентификации -->
+    <div id="telegram2FAModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeTelegram2FAModal()">&times;</span>
+            <h2>Введите пароль двухфакторной аутентификации</h2>
+            <div id="telegram2FAForm">
+                <div class="form-group">
+                    <label for="telegram2FAPassword">Пароль:</label>
+                    <input type="password" id="telegram2FAPassword" required>
+                </div>
+                <button class="btn btn-primary" onclick="submitTelegram2FA()">Подтвердить</button>
+                <div id="telegram2FAResult"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для добавления аккаунта VK -->
+    <div id="addVkAccountModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeAddVkAccountModal()">&times;</span>
+            <h2>Добавление аккаунта VK</h2>
+            <div id="addVkAccountForm">
+                <div class="form-group">
+                    <label for="vkToken">Токен VK:</label>
+                    <input type="text" id="vkToken" required>
+                </div>
+                <button class="btn btn-primary" onclick="addVkAccount()">Добавить</button>
+                <div id="addVkAccountResult"></div>
+            </div>
+        </div>
+    </div>
+
     <script>
+        let currentUserApiKey = null;
+        let currentTelegramAuthData = null;
+        const adminKey = localStorage.getItem('adminKey') || '';
+
+        // Функции для работы с модальными окнами
+        function showRegisterUserModal() {
+            document.getElementById('registerUserModal').style.display = 'block';
+        }
+
+        function closeRegisterUserModal() {
+            document.getElementById('registerUserModal').style.display = 'none';
+        }
+
+        function showAddTelegramAccountModal(apiKey) {
+            currentUserApiKey = apiKey;
+            document.getElementById('addTelegramAccountModal').style.display = 'block';
+        }
+
+        function closeAddTelegramAccountModal() {
+            document.getElementById('addTelegramAccountModal').style.display = 'none';
+        }
+
+        function showAddVkAccountModal(apiKey) {
+            currentUserApiKey = apiKey;
+            document.getElementById('addVkAccountModal').style.display = 'block';
+        }
+
+        function closeAddVkAccountModal() {
+            document.getElementById('addVkAccountModal').style.display = 'none';
+        }
+
+        function showTelegramCodeModal() {
+            document.getElementById('telegramCodeModal').style.display = 'block';
+        }
+
+        function closeTelegramCodeModal() {
+            document.getElementById('telegramCodeModal').style.display = 'none';
+        }
+
+        function showTelegram2FAModal() {
+            document.getElementById('telegram2FAModal').style.display = 'block';
+        }
+
+        function closeTelegram2FAModal() {
+            document.getElementById('telegram2FAModal').style.display = 'none';
+        }
+
+        // Функция для регистрации нового пользователя
+        async function registerUser() {
+            const adminKeyInput = document.getElementById('adminKey').value;
+            try {
+                const response = await fetch('/register', {
+                    method: 'POST',
+                    headers: {
+                        'X-Admin-Key': adminKeyInput
+                    }
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    document.getElementById('registerUserResult').innerHTML = 
+                        `<div class="success">Пользователь зарегистрирован. API ключ: ${result.api_key}</div>`;
+                    setTimeout(() => {
+                        closeRegisterUserModal();
+                        loadUsers();
+                    }, 2000);
+                } else {
+                    document.getElementById('registerUserResult').innerHTML = 
+                        `<div class="error">Ошибка: ${result.detail}</div>`;
+                }
+            } catch (error) {
+                document.getElementById('registerUserResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.message}</div>`;
+            }
+        }
+
+        // Функция для добавления аккаунта Telegram
+        async function startTelegramAuth() {
+            const apiId = document.getElementById('telegramApiId').value;
+            const apiHash = document.getElementById('telegramApiHash').value;
+            const phone = document.getElementById('telegramPhone').value;
+            const proxy = document.getElementById('telegramProxy').value;
+            const sessionFile = document.getElementById('telegramSession').files[0];
+
+            try {
+                const formData = new FormData();
+                formData.append('api_id', apiId);
+                formData.append('api_hash', apiHash);
+                formData.append('phone', phone);
+                if (proxy) formData.append('proxy', proxy);
+                if (sessionFile) formData.append('session_file', sessionFile);
+
+                const response = await fetch(`/admin/users/${currentUserApiKey}/telegram-accounts/auth`, {
+                    method: 'POST',
+                    headers: {
+                        'X-Admin-Key': adminKey
+                    },
+                    body: formData
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    currentTelegramAuthData = result;
+                    if (result.requires_code) {
+                        closeAddTelegramAccountModal();
+                        showTelegramCodeModal();
+                        document.getElementById('telegramCodeResult').innerHTML = 
+                            `<div class="success">Код подтверждения отправлен в Telegram</div>`;
+                    } else if (result.requires_2fa) {
+                        closeAddTelegramAccountModal();
+                        showTelegram2FAModal();
+                        document.getElementById('telegram2FAResult').innerHTML = 
+                            `<div class="success">Требуется двухфакторная аутентификация</div>`;
+                    } else {
+                        document.getElementById('addTelegramAccountResult').innerHTML = 
+                            `<div class="success">Аккаунт Telegram успешно добавлен</div>`;
+                        setTimeout(() => {
+                            closeAddTelegramAccountModal();
+                            loadUsers();
+                        }, 2000);
+                    }
+                } else {
+                    document.getElementById('addTelegramAccountResult').innerHTML = 
+                        `<div class="error">Ошибка: ${result.detail}</div>`;
+                }
+            } catch (error) {
+                document.getElementById('addTelegramAccountResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.message}</div>`;
+            }
+        }
+
+        // Функция для отправки кода подтверждения
+        async function submitTelegramCode() {
+            const code = document.getElementById('telegramCode').value;
+
+            try {
+                const response = await fetch(`/admin/users/${currentUserApiKey}/telegram-accounts/auth/code`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': adminKey
+                    },
+                    body: JSON.stringify({
+                        ...currentTelegramAuthData,
+                        code: code
+                    })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    if (result.requires_2fa) {
+                        closeTelegramCodeModal();
+                        showTelegram2FAModal();
+                        document.getElementById('telegram2FAResult').innerHTML = 
+                            `<div class="success">Требуется двухфакторная аутентификация</div>`;
+                    } else {
+                        document.getElementById('telegramCodeResult').innerHTML = 
+                            `<div class="success">Аккаунт Telegram успешно добавлен</div>`;
+                        setTimeout(() => {
+                            closeTelegramCodeModal();
+                            loadUsers();
+                        }, 2000);
+                    }
+                } else {
+                    document.getElementById('telegramCodeResult').innerHTML = 
+                        `<div class="error">Ошибка: ${result.detail}</div>`;
+                }
+            } catch (error) {
+                document.getElementById('telegramCodeResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.message}</div>`;
+            }
+        }
+
+        // Функция для отправки пароля двухфакторной аутентификации
+        async function submitTelegram2FA() {
+            const password = document.getElementById('telegram2FAPassword').value;
+
+            try {
+                const response = await fetch(`/admin/users/${currentUserApiKey}/telegram-accounts/auth/2fa`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': adminKey
+                    },
+                    body: JSON.stringify({
+                        ...currentTelegramAuthData,
+                        password: password
+                    })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    document.getElementById('telegram2FAResult').innerHTML = 
+                        `<div class="success">Аккаунт Telegram успешно добавлен</div>`;
+                    setTimeout(() => {
+                        closeTelegram2FAModal();
+                        loadUsers();
+                    }, 2000);
+                } else {
+                    document.getElementById('telegram2FAResult').innerHTML = 
+                        `<div class="error">Ошибка: ${result.detail}</div>`;
+                }
+            } catch (error) {
+                document.getElementById('telegram2FAResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.message}</div>`;
+            }
+        }
+
+        // Функция для добавления аккаунта VK
+        async function addVkAccount() {
+            const token = document.getElementById('vkToken').value;
+
+            try {
+                const response = await fetch(`/admin/users/${currentUserApiKey}/vk-accounts`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': adminKey
+                    },
+                    body: JSON.stringify({
+                        token: token
+                    })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    document.getElementById('addVkAccountResult').innerHTML = 
+                        `<div class="success">Аккаунт VK добавлен</div>`;
+                    setTimeout(() => {
+                        closeAddVkAccountModal();
+                        loadUsers();
+                    }, 2000);
+                } else {
+                    document.getElementById('addVkAccountResult').innerHTML = 
+                        `<div class="error">Ошибка: ${result.detail}</div>`;
+                }
+            } catch (error) {
+                document.getElementById('addVkAccountResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.message}</div>`;
+            }
+        }
+
+        // Функция для удаления пользователя
+        async function deleteUser(apiKey) {
+            if (!confirm('Вы уверены, что хотите удалить этого пользователя?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/admin/users/${apiKey}`, {
+                    method: 'DELETE',
+                    headers: {
+                        'X-Admin-Key': adminKey
+                    }
+                });
+                if (response.ok) {
+                    loadUsers();
+                } else {
+                    const result = await response.json();
+                    alert(`Ошибка: ${result.detail}`);
+                }
+            } catch (error) {
+                alert(`Ошибка: ${error.message}`);
+            }
+        }
+
+        // Функция для удаления аккаунта Telegram
+        async function deleteTelegramAccount(apiKey, accountId) {
+            if (!confirm('Вы уверены, что хотите удалить этот аккаунт Telegram?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/admin/users/${apiKey}/telegram-accounts/${accountId}`, {
+                    method: 'DELETE',
+                    headers: {
+                        'X-Admin-Key': adminKey
+                    }
+                });
+                if (response.ok) {
+                    loadUsers();
+                } else {
+                    const result = await response.json();
+                    alert(`Ошибка: ${result.detail}`);
+                }
+            } catch (error) {
+                alert(`Ошибка: ${error.message}`);
+            }
+        }
+
+        // Функция для удаления аккаунта VK
+        async function deleteVkAccount(apiKey, accountId) {
+            if (!confirm('Вы уверены, что хотите удалить этот аккаунт VK?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/admin/users/${apiKey}/vk-accounts/${accountId}`, {
+                    method: 'DELETE',
+                    headers: {
+                        'X-Admin-Key': adminKey
+                    }
+                });
+                if (response.ok) {
+                    loadUsers();
+                } else {
+                    const result = await response.json();
+                    alert(`Ошибка: ${result.detail}`);
+                }
+            } catch (error) {
+                alert(`Ошибка: ${error.message}`);
+            }
+        }
+
         // Функция для загрузки статистики системы
         async function loadSystemStats() {
             try {
                 const response = await fetch('/admin/stats', {
                     headers: {
-                        'X-Admin-Key': localStorage.getItem('adminKey') || ''
+                        'X-Admin-Key': adminKey
                     }
                 });
                 const stats = await response.json();
@@ -102,7 +572,7 @@
             try {
                 const response = await fetch('/admin/users', {
                     headers: {
-                        'X-Admin-Key': localStorage.getItem('adminKey') || ''
+                        'X-Admin-Key': adminKey
                     }
                 });
                 const users = await response.json();
@@ -111,13 +581,17 @@
                         <h3>API ключ: ${user.api_key}</h3>
                         <p>Создан: ${new Date(user.created_at).toLocaleString()}</p>
                         <p>Последнее использование: ${new Date(user.last_used).toLocaleString()}</p>
+                        <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить пользователя</button>
+                        
                         <h4>Аккаунты Telegram:</h4>
+                        <button class="btn btn-success" onclick="showAddTelegramAccountModal('${user.api_key}')">Добавить аккаунт Telegram</button>
                         <table>
                             <tr>
                                 <th>ID</th>
                                 <th>Статус</th>
                                 <th>Запросов</th>
                                 <th>Последний запрос</th>
+                                <th>Действия</th>
                             </tr>
                             ${user.telegram_accounts.map(acc => `
                                 <tr>
@@ -125,16 +599,22 @@
                                     <td class="status-${acc.status}">${acc.status}</td>
                                     <td>${acc.requests_count}</td>
                                     <td>${new Date(acc.last_request_time).toLocaleString()}</td>
+                                    <td>
+                                        <button class="btn btn-danger" onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')">Удалить</button>
+                                    </td>
                                 </tr>
                             `).join('')}
                         </table>
+                        
                         <h4>Аккаунты VK:</h4>
+                        <button class="btn btn-success" onclick="showAddVkAccountModal('${user.api_key}')">Добавить аккаунт VK</button>
                         <table>
                             <tr>
                                 <th>ID</th>
                                 <th>Статус</th>
                                 <th>Запросов</th>
                                 <th>Последний запрос</th>
+                                <th>Действия</th>
                             </tr>
                             ${user.vk_accounts.map(acc => `
                                 <tr>
@@ -142,6 +622,9 @@
                                     <td class="status-${acc.status}">${acc.status}</td>
                                     <td>${acc.requests_count}</td>
                                     <td>${new Date(acc.last_request_time).toLocaleString()}</td>
+                                    <td>
+                                        <button class="btn btn-danger" onclick="deleteVkAccount('${user.api_key}', '${acc.id}')">Удалить</button>
+                                    </td>
                                 </tr>
                             `).join('')}
                         </table>
