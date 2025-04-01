@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libjpeg-dev \
     zlib1g-dev \
     libpng-dev \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем файлы зависимостей

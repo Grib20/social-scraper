@@ -7,7 +7,10 @@ aiohttp==3.9.1
 python-multipart==0.0.6
 cryptography==41.0.5
 boto3==1.29.3
-schedule==1.2.1
 redis==5.0.1
 Pillow==10.2.0
 aiojobs==0.3.0
+async-timeout==4.0.3
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-magic==0.4.27
