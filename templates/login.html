@@ -106,7 +106,7 @@
             if (response.ok) {
                 // Сохраняем ключ и перенаправляем на админ-панель
                 localStorage.setItem('adminKey', adminKey);
-                window.location.href = `${BASE_URL}/static/admin_panel.html`;
+                window.location.href = `${BASE_URL}/admin`;
             } else {
                 document.getElementById('loginResult').innerHTML = 
                     '<div class="error">Неверный админ-ключ</div>';
@@ -129,7 +129,7 @@
             });
 
             if (response.ok) {
-                window.location.href = `${BASE_URL}/static/admin_panel.html`;
+                window.location.href = `${BASE_URL}/admin`;
             } else {
                 // Если ключ недействителен, удаляем его
                 localStorage.removeItem('adminKey');
