@@ -10,3 +10,4 @@ boto3==1.29.3
 schedule==1.2.1
 redis==5.0.1
 Pillow==10.2.0
+aiojobs==0.3.0
