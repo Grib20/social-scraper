@@ -254,9 +254,11 @@
     </div>
 
     <script>
+        const BASE_URL = 'https://scraper.pushrom.ru';
+
         // Проверяем наличие админ-ключа
         if (!localStorage.getItem('adminKey')) {
-            window.location.href = '/login';
+            window.location.href = `${BASE_URL}/static/login.html`;
         }
 
         let currentUserApiKey = null;
@@ -266,7 +268,7 @@
         // Функция для выхода из админ-панели
         function logout() {
             localStorage.removeItem('adminKey');
-            window.location.href = '/login';
+            window.location.href = `${BASE_URL}/static/login.html`;
         }
 
         // Добавляем кнопку выхода в верхний правый угол
@@ -279,7 +281,7 @@
         // Функция для проверки валидности админ-ключа
         async function validateAdminKey() {
             try {
-                const response = await fetch('/admin/validate', {
+                const response = await fetch(`${BASE_URL}/api/admin/validate`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -290,12 +292,12 @@
                 if (!response.ok) {
                     // Если ключ недействителен, перенаправляем на страницу входа
                     localStorage.removeItem('adminKey');
-                    window.location.href = '/login';
+                    window.location.href = `${BASE_URL}/static/login.html`;
                 }
             } catch (error) {
                 console.error('Error validating admin key:', error);
                 localStorage.removeItem('adminKey');
-                window.location.href = '/login';
+                window.location.href = `${BASE_URL}/static/login.html`;
             }
         }
 
@@ -361,7 +363,7 @@
             const vkToken = document.getElementById('registerVkToken').value;
 
             try {
-                const response = await fetch('/register', {
+                const response = await fetch(`${BASE_URL}/api/register`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -434,7 +436,7 @@
                 if (proxy) formData.append('proxy', proxy);
                 if (sessionFile) formData.append('session_file', sessionFile);
 
-                const response = await fetch(`/admin/users/${currentUserApiKey}/telegram-accounts/auth`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${currentUserApiKey}/telegram-accounts/auth`, {
                     method: 'POST',
                     headers: {
                         'X-Admin-Key': adminKey
@@ -477,7 +479,7 @@
             const code = document.getElementById('telegramCode').value;
 
             try {
-                const response = await fetch(`/admin/users/${currentUserApiKey}/telegram-accounts/auth/code`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${currentUserApiKey}/telegram-accounts/auth/code`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -518,7 +520,7 @@
             const password = document.getElementById('telegram2FAPassword').value;
 
             try {
-                const response = await fetch(`/admin/users/${currentUserApiKey}/telegram-accounts/auth/2fa`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${currentUserApiKey}/telegram-accounts/auth/2fa`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -552,7 +554,7 @@
             const token = document.getElementById('vkToken').value;
 
             try {
-                const response = await fetch(`/admin/users/${currentUserApiKey}/vk-accounts`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${currentUserApiKey}/vk-accounts`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -587,7 +589,7 @@
             }
 
             try {
-                const response = await fetch(`/admin/users/${apiKey}`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${apiKey}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Admin-Key': adminKey
@@ -611,7 +613,7 @@
             }
 
             try {
-                const response = await fetch(`/admin/users/${apiKey}/telegram-accounts/${accountId}`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${apiKey}/telegram-accounts/${accountId}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Admin-Key': adminKey
@@ -635,7 +637,7 @@
             }
 
             try {
-                const response = await fetch(`/admin/users/${apiKey}/vk-accounts/${accountId}`, {
+                const response = await fetch(`${BASE_URL}/api/admin/users/${apiKey}/vk-accounts/${accountId}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Admin-Key': adminKey
@@ -655,7 +657,7 @@
         // Функция для загрузки статистики системы
         async function loadSystemStats() {
             try {
-                const response = await fetch('/admin/stats', {
+                const response = await fetch(`${BASE_URL}/api/admin/stats`, {
                     headers: {
                         'X-Admin-Key': adminKey
                     }
@@ -675,7 +677,7 @@
         // Функция для загрузки списка пользователей
         async function loadUsers() {
             try {
-                const response = await fetch('/admin/users', {
+                const response = await fetch(`${BASE_URL}/api/admin/users`, {
                     headers: {
                         'X-Admin-Key': adminKey
                     }

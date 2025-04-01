@@ -20,11 +20,11 @@ COPY requirements.txt .
 # Устанавливаем зависимости Python
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Создаем директории для статических файлов и шаблонов
+RUN mkdir -p /app/static /app/templates
+
 # Копируем файлы приложения
 COPY . .
-
-# Создаем директорию для статических файлов
-RUN mkdir -p /app/static
 
 # Создаем директорию для сессий Telegram
 RUN mkdir -p telegram_sessions

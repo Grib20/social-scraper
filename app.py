@@ -2,6 +2,7 @@ import asyncio
 from fastapi import FastAPI, HTTPException, Request, Security, Body, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import uvicorn
 import logging
@@ -9,8 +10,14 @@ from dotenv import load_dotenv  # Импортируем раньше всех
 import os
 import uuid
 from typing import List
+import sys
 
 load_dotenv()  # Загружаем .env до импорта модулей
+
+# Проверяем наличие обязательных переменных окружения
+if not os.getenv("BASE_URL"):
+    print("Ошибка: Переменная окружения BASE_URL не установлена")
+    sys.exit(1)
 
 # Импорты модулей после load_dotenv
 from telegram_utils import start_client, find_channels, get_trending_posts as get_telegram_trending, get_posts_in_channels, get_posts_by_keywords, get_posts_by_period
@@ -40,14 +47,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Инициализируем шаблоны
+templates = Jinja2Templates(directory="templates")
+
 # Монтируем статические файлы
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Маршрут для главной страницы
+@app.get("/")
+async def index(request: Request):
+    """Отображает главную страницу."""
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "base_url": os.getenv("BASE_URL")
+    })
+
+# Маршрут для страницы входа
+@app.get("/login")
+async def login(request: Request):
+    """Отображает страницу входа."""
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "base_url": os.getenv("BASE_URL")
+    })
+
 # Маршрут для админ-панели
 @app.get("/admin")
-async def admin_panel():
+async def admin_panel(request: Request):
     """Отображает админ-панель."""
-    return FileResponse("admin_panel.html")
+    return templates.TemplateResponse("admin_panel.html", {
+        "request": request,
+        "base_url": os.getenv("BASE_URL")
+    })
 
 async def auth_middleware(request: Request, platform: str):
     auth_header = request.headers.get('authorization')

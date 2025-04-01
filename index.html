@@ -5,12 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Перенаправление...</title>
     <script>
+        const BASE_URL = 'https://scraper.pushrom.ru';
+        
         // Проверяем наличие админ-ключа
         const adminKey = localStorage.getItem('adminKey');
         
         // Если есть админ-ключ, проверяем его валидность
         if (adminKey) {
-            fetch('/admin/validate', {
+            fetch(`${BASE_URL}/api/admin/validate`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -20,21 +22,21 @@
             .then(response => {
                 if (response.ok) {
                     // Если ключ валидный, перенаправляем на админ-панель
-                    window.location.href = '/static/admin_panel.html';
+                    window.location.href = `${BASE_URL}/static/admin_panel.html`;
                 } else {
                     // Если ключ невалидный, удаляем его и перенаправляем на страницу входа
                     localStorage.removeItem('adminKey');
-                    window.location.href = '/static/login.html';
+                    window.location.href = `${BASE_URL}/static/login.html`;
                 }
             })
             .catch(error => {
                 console.error('Error validating admin key:', error);
                 localStorage.removeItem('adminKey');
-                window.location.href = '/static/login.html';
+                window.location.href = `${BASE_URL}/static/login.html`;
             });
         } else {
             // Если нет админ-ключа, сразу перенаправляем на страницу входа
-            window.location.href = '/static/login.html';
+            window.location.href = `${BASE_URL}/static/login.html`;
         }
     </script>
     <style>

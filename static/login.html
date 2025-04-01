@@ -78,6 +78,8 @@
     </div>
 
     <script>
+        const BASE_URL = 'https://scraper.pushrom.ru';
+
         // Проверяем, есть ли уже сохраненный админ-ключ
         if (localStorage.getItem('adminKey')) {
             // Если ключ есть, проверяем его валидность
@@ -93,7 +95,7 @@
             }
 
             try {
-                const response = await fetch('/admin/validate', {
+                const response = await fetch(`${BASE_URL}/api/admin/validate`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -104,7 +106,7 @@
                 if (response.ok) {
                     // Сохраняем ключ и перенаправляем на админ-панель
                     localStorage.setItem('adminKey', adminKey);
-                    window.location.href = '/admin';
+                    window.location.href = `${BASE_URL}/static/admin_panel.html`;
                 } else {
                     document.getElementById('loginResult').innerHTML = 
                         '<div class="error">Неверный админ-ключ</div>';
@@ -118,7 +120,7 @@
         async function validateAndRedirect() {
             const adminKey = localStorage.getItem('adminKey');
             try {
-                const response = await fetch('/admin/validate', {
+                const response = await fetch(`${BASE_URL}/api/admin/validate`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -127,7 +129,7 @@
                 });
 
                 if (response.ok) {
-                    window.location.href = '/admin';
+                    window.location.href = `${BASE_URL}/static/admin_panel.html`;
                 } else {
                     // Если ключ недействителен, удаляем его
                     localStorage.removeItem('adminKey');
