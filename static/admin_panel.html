@@ -150,6 +150,18 @@
                     <label for="adminKey">Админ-ключ:</label>
                     <input type="password" id="adminKey" required>
                 </div>
+                <div class="form-group">
+                    <label for="telegramApiId">Telegram API ID (опционально):</label>
+                    <input type="text" id="registerTelegramApiId">
+                </div>
+                <div class="form-group">
+                    <label for="telegramApiHash">Telegram API Hash (опционально):</label>
+                    <input type="text" id="registerTelegramApiHash">
+                </div>
+                <div class="form-group">
+                    <label for="vkToken">VK Token (опционально):</label>
+                    <input type="text" id="registerVkToken">
+                </div>
                 <button class="btn btn-primary" onclick="registerUser()">Зарегистрировать</button>
                 <div id="registerUserResult"></div>
             </div>
@@ -285,24 +297,52 @@
             document.getElementById('telegram2FAModal').style.display = 'none';
         }
 
+        // Функция для копирования текста в буфер обмена
+        async function copyToClipboard(text) {
+            try {
+                await navigator.clipboard.writeText(text);
+                return true;
+            } catch (err) {
+                console.error('Ошибка при копировании:', err);
+                return false;
+            }
+        }
+
         // Функция для регистрации нового пользователя
         async function registerUser() {
             const adminKeyInput = document.getElementById('adminKey').value;
+            const telegramApiId = document.getElementById('registerTelegramApiId').value;
+            const telegramApiHash = document.getElementById('registerTelegramApiHash').value;
+            const vkToken = document.getElementById('registerVkToken').value;
+
             try {
                 const response = await fetch('/register', {
                     method: 'POST',
                     headers: {
+                        'Content-Type': 'application/json',
                         'X-Admin-Key': adminKeyInput
-                    }
+                    },
+                    body: JSON.stringify({
+                        telegram_api_id: telegramApiId || null,
+                        telegram_api_hash: telegramApiHash || null,
+                        vk_token: vkToken || null
+                    })
                 });
                 const result = await response.json();
                 if (response.ok) {
-                    document.getElementById('registerUserResult').innerHTML = 
-                        `<div class="success">Пользователь зарегистрирован. API ключ: ${result.api_key}</div>`;
-                    setTimeout(() => {
-                        closeRegisterUserModal();
-                        loadUsers();
-                    }, 2000);
+                    const apiKey = result.api_key;
+                    document.getElementById('registerUserResult').innerHTML = `
+                        <div class="success">
+                            <p>Пользователь успешно зарегистрирован!</p>
+                            <div style="background: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0;">
+                                <p style="margin: 0 0 10px 0;"><strong>API ключ:</strong></p>
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <code style="flex-grow: 1; padding: 8px; background: #fff; border: 1px solid #ddd; border-radius: 4px;">${apiKey}</code>
+                                    <button class="btn btn-primary" onclick="copyApiKey('${apiKey}')">Копировать</button>
+                                </div>
+                            </div>
+                            <p style="margin-top: 10px;">Сохраните этот ключ! После закрытия окна он будет недоступен.</p>
+                        </div>`;
                 } else {
                     document.getElementById('registerUserResult').innerHTML = 
                         `<div class="error">Ошибка: ${result.detail}</div>`;
@@ -311,6 +351,26 @@
                 document.getElementById('registerUserResult').innerHTML = 
                     `<div class="error">Ошибка: ${error.message}</div>`;
             }
+        }
+
+        // Функция для копирования API ключа
+        async function copyApiKey(apiKey) {
+            const success = await copyToClipboard(apiKey);
+            const button = event.target;
+            const originalText = button.textContent;
+            
+            if (success) {
+                button.textContent = 'Скопировано!';
+                button.style.backgroundColor = '#28a745';
+            } else {
+                button.textContent = 'Ошибка';
+                button.style.backgroundColor = '#dc3545';
+            }
+            
+            setTimeout(() => {
+                button.textContent = originalText;
+                button.style.backgroundColor = '';
+            }, 2000);
         }
 
         // Функция для добавления аккаунта Telegram
@@ -576,63 +636,101 @@
                     }
                 });
                 const users = await response.json();
+                if (users.length === 0) {
+                    document.getElementById('users-list').innerHTML = '<p>Нет зарегистрированных пользователей</p>';
+                    return;
+                }
+
                 const usersHtml = users.map(user => `
-                    <div class="user-item">
-                        <h3>API ключ: ${user.api_key}</h3>
-                        <p>Создан: ${new Date(user.created_at).toLocaleString()}</p>
-                        <p>Последнее использование: ${new Date(user.last_used).toLocaleString()}</p>
-                        <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить пользователя</button>
+                    <div class="user-item" style="margin-bottom: 30px; padding: 20px; border: 1px solid #ddd; border-radius: 4px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                            <div>
+                                <h3 style="margin: 0;">API ключ: <code style="background: #f8f9fa; padding: 4px 8px; border-radius: 4px;">${user.api_key}</code></h3>
+                                <p style="margin: 5px 0;">Создан: ${new Date(user.created_at).toLocaleString()}</p>
+                                <p style="margin: 5px 0;">Последнее использование: ${new Date(user.last_used).toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить пользователя</button>
+                            </div>
+                        </div>
                         
-                        <h4>Аккаунты Telegram:</h4>
-                        <button class="btn btn-success" onclick="showAddTelegramAccountModal('${user.api_key}')">Добавить аккаунт Telegram</button>
-                        <table>
-                            <tr>
-                                <th>ID</th>
-                                <th>Статус</th>
-                                <th>Запросов</th>
-                                <th>Последний запрос</th>
-                                <th>Действия</th>
-                            </tr>
-                            ${user.telegram_accounts.map(acc => `
-                                <tr>
-                                    <td>${acc.id}</td>
-                                    <td class="status-${acc.status}">${acc.status}</td>
-                                    <td>${acc.requests_count}</td>
-                                    <td>${new Date(acc.last_request_time).toLocaleString()}</td>
-                                    <td>
-                                        <button class="btn btn-danger" onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')">Удалить</button>
-                                    </td>
-                                </tr>
-                            `).join('')}
-                        </table>
+                        <div style="margin-bottom: 20px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <h4 style="margin: 0;">Аккаунты Telegram:</h4>
+                                <button class="btn btn-success" onclick="showAddTelegramAccountModal('${user.api_key}')">Добавить аккаунт Telegram</button>
+                            </div>
+                            ${user.telegram_accounts && user.telegram_accounts.length > 0 ? `
+                                <table>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>API ID</th>
+                                        <th>Телефон</th>
+                                        <th>Статус</th>
+                                        <th>Запросов</th>
+                                        <th>Последний запрос</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                    ${user.telegram_accounts.map(acc => `
+                                        <tr>
+                                            <td>${acc.id}</td>
+                                            <td>${acc.api_id}</td>
+                                            <td>${acc.phone || '-'}</td>
+                                            <td class="status-${acc.status}">${acc.status}</td>
+                                            <td>${acc.requests_count}</td>
+                                            <td>${acc.last_request_time ? new Date(acc.last_request_time).toLocaleString() : '-'}</td>
+                                            <td>
+                                                <button class="btn btn-danger" onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')">Удалить</button>
+                                            </td>
+                                        </tr>
+                                    `).join('')}
+                                </table>
+                            ` : '<p>Нет добавленных аккаунтов Telegram</p>'}
+                        </div>
                         
-                        <h4>Аккаунты VK:</h4>
-                        <button class="btn btn-success" onclick="showAddVkAccountModal('${user.api_key}')">Добавить аккаунт VK</button>
-                        <table>
-                            <tr>
-                                <th>ID</th>
-                                <th>Статус</th>
-                                <th>Запросов</th>
-                                <th>Последний запрос</th>
-                                <th>Действия</th>
-                            </tr>
-                            ${user.vk_accounts.map(acc => `
-                                <tr>
-                                    <td>${acc.id}</td>
-                                    <td class="status-${acc.status}">${acc.status}</td>
-                                    <td>${acc.requests_count}</td>
-                                    <td>${new Date(acc.last_request_time).toLocaleString()}</td>
-                                    <td>
-                                        <button class="btn btn-danger" onclick="deleteVkAccount('${user.api_key}', '${acc.id}')">Удалить</button>
-                                    </td>
-                                </tr>
-                            `).join('')}
-                        </table>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <h4 style="margin: 0;">Аккаунты VK:</h4>
+                                <button class="btn btn-success" onclick="showAddVkAccountModal('${user.api_key}')">Добавить аккаунт VK</button>
+                            </div>
+                            ${user.vk_accounts && user.vk_accounts.length > 0 ? `
+                                <table>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Токен</th>
+                                        <th>Статус</th>
+                                        <th>Запросов</th>
+                                        <th>Последний запрос</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                    ${user.vk_accounts.map(acc => `
+                                        <tr>
+                                            <td>${acc.id}</td>
+                                            <td>
+                                                <code style="background: #f8f9fa; padding: 2px 4px; border-radius: 2px;">
+                                                    ${acc.token.substring(0, 10)}...
+                                                </code>
+                                            </td>
+                                            <td class="status-${acc.status}">${acc.status}</td>
+                                            <td>${acc.requests_count}</td>
+                                            <td>${acc.last_request_time ? new Date(acc.last_request_time).toLocaleString() : '-'}</td>
+                                            <td>
+                                                <button class="btn btn-danger" onclick="deleteVkAccount('${user.api_key}', '${acc.id}')">Удалить</button>
+                                            </td>
+                                        </tr>
+                                    `).join('')}
+                                </table>
+                            ` : '<p>Нет добавленных аккаунтов VK</p>'}
+                        </div>
                     </div>
                 `).join('');
+                
                 document.getElementById('users-list').innerHTML = usersHtml;
             } catch (error) {
-                document.getElementById('users-list').innerHTML = 'Ошибка загрузки пользователей';
+                document.getElementById('users-list').innerHTML = `
+                    <div class="error">
+                        <p>Ошибка загрузки пользователей: ${error.message}</p>
+                        <button class="btn btn-primary" onclick="loadUsers()">Попробовать снова</button>
+                    </div>`;
             }
         }
 
