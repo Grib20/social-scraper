@@ -1,0 +1,270 @@
+{
+    "info": {
+        "name": "Social Media Scraper API",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "item": [
+        {
+            "name": "Регистрация",
+            "item": [
+                {
+                    "name": "Регистрация пользователя",
+                    "request": {
+                        "method": "POST",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/register",
+                            "host": ["{{base_url}}"],
+                            "path": ["register"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{}"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Telegram API",
+            "item": [
+                {
+                    "name": "Поиск групп",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/find-groups",
+                            "host": ["{{base_url}}"],
+                            "path": ["find-groups"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"telegram\",\n    \"keywords\": [\"keyword1\", \"keyword2\"],\n    \"min_members\": 100000,\n    \"max_groups\": 20\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Трендовые посты",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/trending-posts",
+                            "host": ["{{base_url}}"],
+                            "path": ["trending-posts"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"telegram\",\n    \"group_ids\": [123456789],\n    \"days_back\": 7,\n    \"posts_per_group\": 10,\n    \"min_views\": 1000\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Поиск постов",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/posts",
+                            "host": ["{{base_url}}"],
+                            "path": ["posts"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"telegram\",\n    \"group_ids\": [123456789],\n    \"keywords\": [\"keyword1\", \"keyword2\"],\n    \"count\": 10,\n    \"min_views\": 1000,\n    \"days_back\": 3\n}"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "VK API",
+            "item": [
+                {
+                    "name": "Поиск групп",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/find-groups",
+                            "host": ["{{base_url}}"],
+                            "path": ["find-groups"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"vk\",\n    \"keywords\": [\"keyword1\", \"keyword2\"],\n    \"min_members\": 1000,\n    \"max_groups\": 10\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Трендовые посты",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/trending-posts",
+                            "host": ["{{base_url}}"],
+                            "path": ["trending-posts"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"vk\",\n    \"group_ids\": [123456789],\n    \"days_back\": 7,\n    \"posts_per_group\": 10,\n    \"min_views\": 1000\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Поиск постов",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/posts",
+                            "host": ["{{base_url}}"],
+                            "path": ["posts"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"vk\",\n    \"group_ids\": [123456789],\n    \"keywords\": [\"keyword1\", \"keyword2\"],\n    \"count\": 10,\n    \"min_views\": 1000,\n    \"days_back\": 7\n}"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Админ-панель",
+            "item": [
+                {
+                    "name": "Статистика",
+                    "request": {
+                        "method": "GET",
+                        "header": [
+                            {
+                                "key": "X-Admin-Key",
+                                "value": "{{admin_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/admin/stats",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "stats"]
+                        }
+                    }
+                },
+                {
+                    "name": "Список пользователей",
+                    "request": {
+                        "method": "GET",
+                        "header": [
+                            {
+                                "key": "X-Admin-Key",
+                                "value": "{{admin_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/admin/users",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "users"]
+                        }
+                    }
+                },
+                {
+                    "name": "Добавить аккаунт Telegram",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "X-Admin-Key",
+                                "value": "{{admin_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/admin/users/{{api_key}}/telegram-accounts",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "users", "{{api_key}}", "telegram-accounts"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"api_id\": \"your-api-id\",\n    \"api_hash\": \"your-api-hash\",\n    \"phone\": \"+79001234567\",\n    \"proxy\": \"socks5://user:pass@host:port\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Добавить аккаунт VK",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "X-Admin-Key",
+                                "value": "{{admin_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/admin/users/{{api_key}}/vk-accounts",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "users", "{{api_key}}", "vk-accounts"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"token\": \"your-vk-token\",\n    \"proxy\": \"socks5://user:pass@host:port\"\n}"
+                        }
+                    }
+                }
+            ]
+        }
+    ],
+    "variable": [
+        {
+            "key": "base_url",
+            "value": "http://localhost:3030"
+        },
+        {
+            "key": "api_key",
+            "value": "your-api-key"
+        },
+        {
+            "key": "admin_key",
+            "value": "your-admin-key"
+        }
+    ]
+} 
