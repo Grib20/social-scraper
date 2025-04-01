@@ -1,5 +1,5 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Request, Security, Body
+from fastapi import FastAPI, HTTPException, Request, Security, Body, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
@@ -8,11 +8,12 @@ import logging
 from dotenv import load_dotenv  # Импортируем раньше всех
 import os
 import uuid
+from typing import List
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
 # Импорты модулей после load_dotenv
-from telegram_utils import start_client, find_channels, get_trending_posts as get_telegram_trending, get_posts_in_channels, get_posts_by_keywords
+from telegram_utils import start_client, find_channels, get_trending_posts as get_telegram_trending, get_posts_in_channels, get_posts_by_keywords, get_posts_by_period
 from vk_utils import VKClient, find_vk_groups, get_vk_posts, get_vk_posts_in_groups
 from user_manager import register_user, set_vk_token, get_vk_token
 from media_utils import init_scheduler, close_scheduler
@@ -21,7 +22,7 @@ from admin_panel import (
     update_user_vk_token, get_system_stats,
     add_telegram_account, update_telegram_account, delete_telegram_account,
     add_vk_account, update_vk_account, delete_vk_account,
-    get_next_available_account, update_account_usage
+    get_next_available_account, update_account_usage, verify_api_key, get_account_status
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -249,6 +250,75 @@ async def posts_by_keywords(request: Request, data: dict):
         vk = await auth_middleware(request, 'vk')
         return await get_vk_posts(vk, group_keywords, post_keywords, count, min_views, days_back, max_groups)
     raise HTTPException(400, "Платформа не поддерживается")
+
+@app.post("/posts-by-period")
+async def get_posts_by_period(
+    request: Request,
+    platform: str = Body(...),
+    group_ids: List[int] = Body(...),
+    max_posts: int = Body(100),
+    days_back: int = Body(7),
+    min_views: int = Body(0)
+):
+    """Получение постов из групп за указанный период."""
+    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API ключ не указан")
+    
+    if platform == "telegram":
+        account = await get_next_available_account(api_key, "telegram")
+        if not account:
+            raise HTTPException(status_code=400, detail="Нет доступных аккаунтов Telegram")
+        
+        client = await auth_middleware(request, 'telegram')
+        posts = await get_posts_by_period(client, group_ids, max_posts, days_back, min_views)
+        await update_account_usage(api_key, account["id"], "telegram")
+        return posts
+    elif platform == "vk":
+        account = await get_next_available_account(api_key, "vk")
+        if not account:
+            raise HTTPException(status_code=400, detail="Нет доступных аккаунтов VK")
+        
+        vk = await auth_middleware(request, 'vk')
+        posts = await get_posts_by_period(vk, group_ids, max_posts, days_back, min_views)
+        await update_account_usage(api_key, account["id"], "vk")
+        return posts
+    else:
+        raise HTTPException(status_code=400, detail="Неподдерживаемая платформа")
+
+@app.get("/api/accounts/status")
+async def get_accounts_status(api_key: str = Header(...)):
+    """Получает статус всех аккаунтов."""
+    if not verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Неверный API ключ")
+    
+    telegram_status = get_account_status(api_key, "telegram")
+    vk_status = get_account_status(api_key, "vk")
+    
+    return {
+        "telegram": telegram_status,
+        "vk": vk_status
+    }
+
+@app.post("/api/vk/posts-by-period")
+async def get_vk_posts_by_period(
+    group_ids: List[int],
+    max_posts: int = 100,
+    days_back: int = 7,
+    min_views: int = 0,
+    api_key: str = Header(...)
+):
+    """Получение постов из групп за указанный период."""
+    if not verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Неверный API ключ")
+    
+    account = get_next_available_account(api_key, "vk")
+    if not account:
+        raise HTTPException(status_code=429, detail="Достигнут лимит запросов")
+    
+    async with VKClient(account["access_token"], account.get("proxy"), account["id"]) as vk:
+        posts = await vk.get_posts_by_period(group_ids, max_posts, days_back, min_views)
+        return {"posts": posts}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))

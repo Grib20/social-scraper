@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 USERS_FILE = 'users.json'
 ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
 cipher = Fernet(ENCRYPTION_KEY.encode())
+
+# Константы для ротации аккаунтов
+MAX_REQUESTS_PER_ACCOUNT = 1000  # Максимальное количество запросов на аккаунт
+ACCOUNT_COOLDOWN = 3600  # Время отдыха аккаунта в секундах (1 час)
+MAX_ACTIVE_ACCOUNTS = 3  # Максимальное количество одновременно активных аккаунтов
+DEGRADED_MODE_DELAY = 0.5  # Задержка в режиме пониженной производительности (500мс)
+DEGRADED_MODE_SEMAPHORE = 1  # Максимум 1 одновременный запрос в режиме пониженной производительности
 
 async def init_users_file():
     if not os.path.exists(USERS_FILE):
@@ -175,36 +182,55 @@ def delete_vk_account(api_key: str, account_id: str) -> bool:
     save_users(users)
     return True
 
-def get_next_available_account(api_key: str, platform: str) -> Optional[Dict]:
-    """Получает следующий доступный аккаунт для использования."""
+def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
+    """Получает список активных аккаунтов для платформы."""
     users = load_users()
     if api_key not in users:
-        return None
+        return []
     
     accounts_key = f"{platform}_accounts"
     if accounts_key not in users[api_key]:
-        return None
+        return []
     
     accounts = users[api_key][accounts_key]
-    if not accounts:
-        return None
+    current_time = time.time()
     
-    # Сортируем аккаунты по количеству запросов
-    sorted_accounts = sorted(accounts, key=lambda x: x.get("requests_count", 0))
-    
-    # Проверяем, есть ли аккаунты, не достигшие лимита
-    available_accounts = [
-        acc for acc in sorted_accounts
-        if acc.get("requests_count", 0) < 1000  # Максимальное количество запросов на аккаунт
+    # Получаем все аккаунты, которые не достигли лимита запросов
+    active_accounts = [
+        acc for acc in accounts
+        if acc.get("requests_count", 0) < MAX_REQUESTS_PER_ACCOUNT and
+        (not acc.get("token_expired", False))  # Проверяем, не истек ли токен
     ]
     
-    if not available_accounts:
+    # Если есть аккаунты в кулдауне, но нет других активных аккаунтов,
+    # возвращаем аккаунт с наименьшим количеством запросов
+    if not active_accounts:
+        accounts.sort(key=lambda x: x.get("requests_count", 0))
+        return [accounts[0]]
+    
+    # Сортируем по количеству запросов (меньше запросов = выше приоритет)
+    active_accounts.sort(key=lambda x: x.get("requests_count", 0))
+    
+    # Возвращаем только MAX_ACTIVE_ACCOUNTS аккаунтов
+    return active_accounts[:MAX_ACTIVE_ACCOUNTS]
+
+def get_next_available_account(api_key: str, platform: str) -> Optional[Dict]:
+    """Получает следующий доступный аккаунт для использования."""
+    active_accounts = get_active_accounts(api_key, platform)
+    if not active_accounts:
         return None
     
-    # Возвращаем аккаунт с наименьшим количеством запросов
-    return available_accounts[0]
+    # Если есть только один аккаунт или все аккаунты в кулдауне,
+    # используем режим пониженной производительности
+    if len(active_accounts) == 1:
+        account = active_accounts[0]
+        account["degraded_mode"] = True
+        return account
+    
+    # Выбираем аккаунт с наименьшим количеством запросов
+    return active_accounts[0]
 
-def update_account_usage(api_key: str, account_id: str, platform: str) -> bool:
+def update_account_usage(api_key: str, account_id: str, platform: str, token_expired: bool = False) -> bool:
     """Обновляет статистику использования аккаунта."""
     users = load_users()
     if api_key not in users:
@@ -217,8 +243,66 @@ def update_account_usage(api_key: str, account_id: str, platform: str) -> bool:
     for account in users[api_key][accounts_key]:
         if account.get("id") == account_id:
             account["requests_count"] = account.get("requests_count", 0) + 1
-            account["last_request_time"] = datetime.now().isoformat()
+            account["last_request_time"] = time.time()
+            
+            # Если токен истек, помечаем аккаунт
+            if token_expired:
+                account["token_expired"] = True
+            
+            # Если аккаунт достиг лимита запросов, но это единственный аккаунт,
+            # продолжаем использовать его в режиме пониженной производительности
+            if account["requests_count"] >= MAX_REQUESTS_PER_ACCOUNT:
+                account["degraded_mode"] = True
+            
             save_users(users)
             return True
     
     return False
+
+def get_account_status(api_key: str, platform: str) -> Dict:
+    """Получает статус всех аккаунтов для платформы."""
+    users = load_users()
+    if api_key not in users:
+        return {"total": 0, "active": 0, "in_cooldown": 0, "token_expired": 0, "accounts": []}
+    
+    accounts_key = f"{platform}_accounts"
+    if accounts_key not in users[api_key]:
+        return {"total": 0, "active": 0, "in_cooldown": 0, "token_expired": 0, "accounts": []}
+    
+    accounts = users[api_key][accounts_key]
+    current_time = time.time()
+    
+    status = {
+        "total": len(accounts),
+        "active": 0,
+        "in_cooldown": 0,
+        "token_expired": 0,
+        "accounts": []
+    }
+    
+    for account in accounts:
+        account_status = {
+            "id": account.get("id"),
+            "requests_count": account.get("requests_count", 0),
+            "last_request_time": account.get("last_request_time"),
+            "degraded_mode": account.get("degraded_mode", False),
+            "token_expired": account.get("token_expired", False),
+            "status": "active"
+        }
+        
+        if account.get("token_expired", False):
+            status["token_expired"] += 1
+            account_status["status"] = "token_expired"
+        elif account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT:
+            if account.get("degraded_mode", False):
+                status["active"] += 1
+                account_status["status"] = "degraded"
+            else:
+                status["in_cooldown"] += 1
+                account_status["status"] = "cooldown"
+        else:
+            status["active"] += 1
+        
+        status["accounts"].append(account_status)
+    
+    return status

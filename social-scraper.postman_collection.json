@@ -93,6 +93,28 @@
                             "raw": "{\n    \"platform\": \"telegram\",\n    \"group_ids\": [123456789],\n    \"keywords\": [\"keyword1\", \"keyword2\"],\n    \"count\": 10,\n    \"min_views\": 1000,\n    \"days_back\": 3\n}"
                         }
                     }
+                },
+                {
+                    "name": "Посты за период",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{api_key}}",
+                                "type": "text"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/posts-by-period",
+                            "host": ["{{base_url}}"],
+                            "path": ["posts-by-period"]
+                        },
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"platform\": \"telegram\",\n    \"group_ids\": [123456789],\n    \"max_posts\": 100,\n    \"days_back\": 7,\n    \"min_views\": 0\n}"
+                        }
+                    }
                 }
             ]
         },
