@@ -50,6 +50,13 @@ app = FastAPI(lifespan=lifespan)
 # Инициализируем шаблоны
 templates = Jinja2Templates(directory="templates")
 
+# Добавляем базовый контекст для всех шаблонов
+def get_base_context(request: Request):
+    return {
+        "request": request,
+        "base_url": os.getenv("BASE_URL")
+    }
+
 # Монтируем статические файлы
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -57,28 +64,28 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/")
 async def index(request: Request):
     """Отображает главную страницу."""
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "base_url": os.getenv("BASE_URL")
-    })
+    return templates.TemplateResponse(
+        "index.html",
+        get_base_context(request)
+    )
 
 # Маршрут для страницы входа
 @app.get("/login")
 async def login(request: Request):
     """Отображает страницу входа."""
-    return templates.TemplateResponse("login.html", {
-        "request": request,
-        "base_url": os.getenv("BASE_URL")
-    })
+    return templates.TemplateResponse(
+        "login.html",
+        get_base_context(request)
+    )
 
 # Маршрут для админ-панели
 @app.get("/admin")
 async def admin_panel(request: Request):
     """Отображает админ-панель."""
-    return templates.TemplateResponse("admin_panel.html", {
-        "request": request,
-        "base_url": os.getenv("BASE_URL")
-    })
+    return templates.TemplateResponse(
+        "admin_panel.html",
+        get_base_context(request)
+    )
 
 # Маршрут для проверки админ-ключа
 @app.post("/admin/validate")
