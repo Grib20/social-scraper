@@ -6,6 +6,7 @@ from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from datetime import datetime
+import uuid
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -234,4 +235,26 @@ def update_account_usage(api_key: str, account_id: str, platform: str) -> bool:
             save_users(users)
             return True
     
-    return False 
+    return False
+
+async def update_user_vk_token(api_key: str, vk_token: str) -> bool:
+    """Обновляет VK токен пользователя."""
+    users = load_users()
+    if api_key not in users:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    if "vk_accounts" not in users[api_key]:
+        users[api_key]["vk_accounts"] = []
+    
+    # Создаем новый аккаунт с токеном
+    account_data = {
+        "id": str(uuid.uuid4()),
+        "token": vk_token,
+        "requests_count": 0,
+        "last_request_time": None,
+        "added_at": datetime.now().isoformat()
+    }
+    
+    users[api_key]["vk_accounts"].append(account_data)
+    save_users(users)
+    return True 
