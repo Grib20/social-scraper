@@ -271,4 +271,53 @@ async def verify_api_key(api_key: str) -> bool:
     # Обновляем время последнего использования
     users[api_key]["last_used"] = datetime.now().isoformat()
     save_users(users)
-    return True 
+    return True
+
+async def get_account_status(api_key: str) -> Dict:
+    """Получает статус аккаунтов пользователя."""
+    users = load_users()
+    if api_key not in users:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    user_data = users[api_key]
+    
+    # Получаем статус Telegram аккаунтов
+    telegram_accounts = []
+    for account in user_data.get("telegram_accounts", []):
+        status = "active"
+        if account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT:
+            status = "cooldown"
+        elif account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT * 0.8:
+            status = "degraded"
+            
+        telegram_accounts.append({
+            "id": account.get("id"),
+            "status": status,
+            "requests_count": account.get("requests_count", 0),
+            "last_request_time": account.get("last_request_time"),
+            "added_at": account.get("added_at")
+        })
+    
+    # Получаем статус VK аккаунтов
+    vk_accounts = []
+    for account in user_data.get("vk_accounts", []):
+        status = "active"
+        if account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT:
+            status = "cooldown"
+        elif account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT * 0.8:
+            status = "degraded"
+            
+        vk_accounts.append({
+            "id": account.get("id"),
+            "status": status,
+            "requests_count": account.get("requests_count", 0),
+            "last_request_time": account.get("last_request_time"),
+            "added_at": account.get("added_at")
+        })
+    
+    return {
+        "telegram_accounts": telegram_accounts,
+        "vk_accounts": vk_accounts,
+        "created_at": user_data.get("created_at"),
+        "last_used": user_data.get("last_used")
+    } 
