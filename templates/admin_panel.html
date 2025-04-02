@@ -628,15 +628,25 @@
 
     // Функция для добавления Telegram аккаунта
     async function addTelegramAccount() {
-        const apiId = document.getElementById('telegramApiId').value;
-        const apiHash = document.getElementById('telegramApiHash').value;
-        const phone = document.getElementById('telegramPhone').value;
-        const proxy = document.getElementById('telegramProxy').value;
-        const sessionFile = document.getElementById('telegramSession').files[0];
+        const modal = document.getElementById('telegramModal');
+        const apiId = modal.querySelector('#telegramApiId').value;
+        const apiHash = modal.querySelector('#telegramApiHash').value;
+        const phone = modal.querySelector('#telegramPhone').value;
+        const proxy = modal.querySelector('#telegramProxy').value;
+        const sessionFile = modal.querySelector('#telegramSession').files[0];
+        const resultDiv = modal.querySelector('#telegramResult');
+
+        console.log('Adding Telegram account:', {
+            apiId,
+            apiHash,
+            phone,
+            proxy,
+            hasSessionFile: !!sessionFile,
+            currentUser
+        });
 
         if (!apiId || !apiHash || !phone) {
-            document.getElementById('telegramResult').innerHTML = 
-                '<div class="error">Заполните обязательные поля</div>';
+            resultDiv.innerHTML = '<div class="error">Заполните обязательные поля</div>';
             return;
         }
 
@@ -656,19 +666,19 @@
                 body: formData
             });
 
+            const data = await response.json();
+            console.log('Server response:', data);
+
             if (response.ok) {
-                document.getElementById('telegramResult').innerHTML = 
-                    '<div class="success">Аккаунт успешно добавлен</div>';
+                resultDiv.innerHTML = '<div class="success">Аккаунт успешно добавлен</div>';
                 closeTelegramModal();
                 await loadUsers();
             } else {
-                const error = await response.json();
-                document.getElementById('telegramResult').innerHTML = 
-                    `<div class="error">Ошибка: ${error.detail}</div>`;
+                resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail || 'Неизвестная ошибка'}</div>`;
             }
         } catch (error) {
-            document.getElementById('telegramResult').innerHTML = 
-                `<div class="error">Ошибка: ${error.message}</div>`;
+            console.error('Error adding Telegram account:', error);
+            resultDiv.innerHTML = `<div class="error">Ошибка: ${error.message}</div>`;
         }
     }
 
