@@ -192,27 +192,41 @@
     .user-info p {
         margin: 5px 0;
     }
+    .api-key-container {
+        margin: 15px 0;
+    }
+
     .api-key {
-        background-color: #e9ecef;
+        display: flex;
+        align-items: center;
+        background-color: #f8f9fa;
         padding: 8px;
         border-radius: 4px;
-        font-family: monospace;
-        margin: 10px 0;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
+        border: 1px solid #ddd;
+        margin-top: 5px;
     }
-    .copy-btn {
+
+    .api-key input {
+        font-family: monospace;
+        font-size: 14px;
+        color: #333;
+    }
+
+    .api-key .copy-btn {
         background-color: #28a745;
         color: white;
         border: none;
         padding: 4px 8px;
         border-radius: 4px;
         cursor: pointer;
+        margin-left: 10px;
+        font-size: 12px;
     }
-    .copy-btn:hover {
+
+    .api-key .copy-btn:hover {
         background-color: #218838;
     }
+
     .modal {
         display: none;
         position: fixed;
@@ -773,12 +787,13 @@
             userDiv.innerHTML = `
                 <h3>${username}</h3>
                 <div class="user-info">
-                    <p><strong>API ключ:</strong> 
-                        <span class="api-key">
-                            ${apiKey.substring(0, 8)}...
-                            <button class="copy-btn" onclick="showApiKey('${apiKey}')">Показать</button>
-                        </span>
-                    </p>
+                    <div class="api-key-container">
+                        <p><strong>API ключ:</strong></p>
+                        <div class="api-key">
+                            <input type="text" value="${apiKey.substring(0, 8)}..." readonly style="width: 80%; border: none; background: transparent;">
+                            <button class="copy-btn" onclick="showFullApiKey('${apiKey}')">Показать</button>
+                        </div>
+                    </div>
                     <p><strong>Создан:</strong> ${createdAt}</p>
                     <p><strong>Последнее использование:</strong> ${lastUsed}</p>
                     
@@ -829,6 +844,15 @@
             
             userList.appendChild(userDiv);
         }
+    }
+
+    function copyToClipboard(text) {
+        navigator.clipboard.writeText(text).then(() => {
+            alert('API ключ скопирован в буфер обмена');
+        }).catch(err => {
+            console.error('Ошибка при копировании:', err);
+            alert('Не удалось скопировать API ключ');
+        });
     }
 
     // Функция для удаления пользователя
@@ -912,6 +936,13 @@
     function closeVkModal() {
         document.getElementById('vkModal').style.display = 'none';
         currentUser = null;
+    }
+
+    function showFullApiKey(apiKey) {
+        const modal = document.getElementById('apiKeyModal');
+        const apiKeyText = document.getElementById('apiKeyText');
+        apiKeyText.textContent = apiKey;
+        modal.style.display = 'block';
     }
 </script>
 {% endblock %} 
