@@ -81,7 +81,8 @@
 {% block scripts %}
 <script>
     // Проверяем, есть ли уже сохраненный админ-ключ
-    if (localStorage.getItem('adminKey')) {
+    const adminKey = localStorage.getItem('adminKey');
+    if (adminKey) {
         // Если ключ есть, проверяем его валидность
         validateAndRedirect();
     }
@@ -106,7 +107,6 @@
             if (response.ok) {
                 // Сохраняем ключ и перенаправляем на админ-панель
                 localStorage.setItem('adminKey', adminKey);
-                // Делаем GET запрос на /admin с админ-ключом
                 window.location.href = `${BASE_URL}/admin`;
             } else {
                 document.getElementById('loginResult').innerHTML = 
@@ -120,6 +120,8 @@
 
     async function validateAndRedirect() {
         const adminKey = localStorage.getItem('adminKey');
+        if (!adminKey) return;
+
         try {
             const response = await fetch(`${BASE_URL}/admin/validate`, {
                 method: 'POST',
