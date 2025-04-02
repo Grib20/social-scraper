@@ -1,138 +1,155 @@
-{% extends "base.html" %}
-
-{% block title %}Вход в админ-панель{% endblock %}
-
-{% block head %}
-<style>
-    body {
-        font-family: Arial, sans-serif;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        min-height: 100vh;
-        margin: 0;
-        background-color: #f5f5f5;
-    }
-    .login-container {
-        background-color: white;
-        padding: 30px;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        width: 100%;
-        max-width: 400px;
-    }
-    .login-container h1 {
-        margin: 0 0 20px;
-        text-align: center;
-        color: #333;
-    }
-    .form-group {
-        margin-bottom: 15px;
-    }
-    .form-group label {
-        display: block;
-        margin-bottom: 5px;
-        color: #666;
-    }
-    .form-group input {
-        width: 100%;
-        padding: 8px;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        box-sizing: border-box;
-    }
-    .login-btn {
-        width: 100%;
-        padding: 10px;
-        background-color: #007bff;
-        color: white;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 16px;
-    }
-    .login-btn:hover {
-        background-color: #0056b3;
-    }
-    .error {
-        color: #dc3545;
-        margin-top: 10px;
-        text-align: center;
-    }
-</style>
-{% endblock %}
-
-{% block content %}
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход в админ-панель</title>
+    <link rel="stylesheet" href="/static/css/admin.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
 <div class="login-container">
-    <h1>Вход в админ-панель</h1>
+            <div class="login-header">
+                <i class="fas fa-shield-alt fa-3x"></i>
+                <h1>Вход в админ-панель</h1>
+                <p>Введите админ-ключ для доступа к панели управления</p>
+            </div>
+            <form id="loginForm">
     <div class="form-group">
-        <label>Админ-ключ:</label>
-        <input type="password" id="adminKey" placeholder="Введите админ-ключ">
+                    <label for="adminKey"><i class="fas fa-key"></i> Админ-ключ:</label>
+                    <input type="password" id="adminKey" name="adminKey" required>
+                </div>
+                <button type="submit"><i class="fas fa-sign-in-alt"></i> Войти</button>
+            </form>
+        </div>
     </div>
-    <button class="login-btn" onclick="login()">Войти</button>
-    <div id="loginResult"></div>
-</div>
-{% endblock %}
 
-{% block scripts %}
 <script>
-    // Если уже есть админ-ключ, проверяем его
-    document.addEventListener('DOMContentLoaded', async () => {
-        const adminKey = localStorage.getItem('adminKey');
-        if (adminKey) {
+        // Функция для сохранения админ-ключа
+        function saveAdminKey(adminKey) {
+            // Сохраняем в localStorage
+            localStorage.setItem('adminKey', adminKey);
+            
+            // Устанавливаем cookie на всякий случай
+            document.cookie = `admin_key=${adminKey}; path=/; expires=Fri, 31 Dec 9999 23:59:59 GMT`;
+            
+            console.log('AdminKey сохранен:', adminKey);
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            // Меняем текст кнопки при отправке
+            const submitButton = this.querySelector('button[type="submit"]');
+            const originalText = submitButton.innerHTML;
+            submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Вход...';
+            submitButton.disabled = true;
+            
+            const adminKey = document.getElementById('adminKey').value;
+            
+            console.log('Попытка входа с ключом:', adminKey);
+
             try {
-                const response = await fetch(`${BASE_URL}/admin/validate`, {
-                    method: 'POST',
+                const response = await fetch('/admin/validate', {
+                method: 'POST',
                     headers: {
-                        'X-Admin-Key': adminKey
-                    }
+                        'X-Admin-Key': adminKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({})
                 });
 
                 if (response.ok) {
-                    window.location.href = `${BASE_URL}/admin`;
-                    return;
+                    console.log('Валидация успешна, сохраняю ключ');
+                    saveAdminKey(adminKey);
+                    // Используем параметр URL для передачи ключа
+                    window.location.href = `/admin?admin_key=${encodeURIComponent(adminKey)}`;
+                } else {
+                    console.error('Ошибка валидации:', response.status);
+                    
+                    // Восстанавливаем кнопку
+                    submitButton.innerHTML = originalText;
+                    submitButton.disabled = false;
+                    
+                    // Покажем анимированное уведомление об ошибке
+                    const input = document.getElementById('adminKey');
+                    input.classList.add('error');
+                    input.value = '';
+                    input.placeholder = 'Неверный админ-ключ';
+                    setTimeout(() => {
+                        input.classList.remove('error');
+                        input.placeholder = '';
+                    }, 3000);
                 }
             } catch (error) {
-                console.error('Ошибка проверки авторизации:', error);
+                console.error('Ошибка при входе:', error);
+                
+                // Восстанавливаем кнопку
+                submitButton.innerHTML = originalText;
+                submitButton.disabled = false;
+                
+                // Показываем уведомление об ошибке
+                const input = document.getElementById('adminKey');
+                input.classList.add('error');
+                input.value = '';
+                input.placeholder = 'Ошибка соединения';
+                setTimeout(() => {
+                    input.classList.remove('error');
+                    input.placeholder = '';
+                }, 3000);
             }
-            localStorage.removeItem('adminKey');
+        });
+    </script>
+    
+    <style>
+        .login-container {
+            max-width: 450px;
+            margin: 40px auto;
+            padding: 30px;
+            border-radius: 12px;
+            background-color: var(--card-bg);
+            box-shadow: var(--card-shadow);
+            border: 1px solid var(--border-color);
         }
-    });
-
-    // Обработка нажатия Enter в поле ввода
-    document.getElementById('adminKey').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') {
-            login();
+        
+        .login-header {
+            text-align: center;
+            margin-bottom: 30px;
         }
-    });
-
-    async function login() {
-        const adminKey = document.getElementById('adminKey').value;
-        const resultDiv = document.getElementById('loginResult');
-
-        if (!adminKey) {
-            resultDiv.innerHTML = '<div class="error">Введите админ-ключ</div>';
-            return;
+        
+        .login-header i {
+            color: var(--accent-color);
+            margin-bottom: 15px;
         }
-
-        try {
-            const response = await fetch(`${BASE_URL}/admin/validate`, {
-                method: 'POST',
-                headers: {
-                    'X-Admin-Key': adminKey
-                }
-            });
-
-            if (response.ok) {
-                localStorage.setItem('adminKey', adminKey);
-                window.location.href = `${BASE_URL}/admin`;
-            } else {
-                resultDiv.innerHTML = '<div class="error">Неверный админ-ключ</div>';
-            }
-        } catch (error) {
-            console.error('Ошибка авторизации:', error);
-            resultDiv.innerHTML = '<div class="error">Ошибка авторизации</div>';
+        
+        .login-header h1 {
+            margin-bottom: 10px;
         }
-    }
-</script>
-{% endblock %} 
+        
+        .login-header p {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+        }
+        
+        #loginForm button {
+            width: 100%;
+            margin-top: 10px;
+            padding: 14px;
+        }
+        
+        /* Анимация ошибки */
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            10%, 30%, 50%, 70%, 90% { transform: translateX(-10px); }
+            20%, 40%, 60%, 80% { transform: translateX(10px); }
+        }
+        
+        .error {
+            animation: shake 0.6s;
+            border-color: var(--danger-color) !important;
+            color: var(--danger-color) !important;
+        }
+    </style>
+</body>
+</html> 

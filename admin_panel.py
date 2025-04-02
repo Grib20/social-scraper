@@ -46,41 +46,41 @@ def save_users(users: Dict) -> None:
 ADMIN_KEY = os.getenv('ADMIN_KEY', 'your-secret-admin-key')
 api_key_header = APIKeyHeader(name="X-Admin-Key")
 
-async def verify_admin_key(api_key: str = Security(api_key_header)) -> bool:
+async def verify_admin_key(api_key: str) -> bool:
     """Проверяет, является ли ключ админ-ключом."""
-    if api_key != ADMIN_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Неверный админ-ключ"
-        )
-    return True
+    return api_key == ADMIN_KEY
 
 # Функции для работы с аккаунтами Telegram
-async def add_telegram_account(api_key: str, account_data: Dict) -> bool:
+async def add_telegram_account(user_id: str, account_data: Dict) -> bool:
     """Добавляет аккаунт Telegram для пользователя."""
     users = load_users()
-    if api_key not in users:
+    if user_id not in users:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    if "telegram_accounts" not in users[api_key]:
-        users[api_key]["telegram_accounts"] = []
+    if "telegram_accounts" not in users[user_id]:
+        users[user_id]["telegram_accounts"] = []
+    
+    # Проверяем наличие аккаунта с таким же номером телефона
+    for account in users[user_id]["telegram_accounts"]:
+        if account["phone"] == account_data["phone"]:
+            raise HTTPException(status_code=400, detail="Аккаунт с таким номером телефона уже существует")
     
     # Добавляем информацию о запросах
     account_data["requests_count"] = 0
     account_data["last_request_time"] = None
     account_data["added_at"] = datetime.now().isoformat()
     
-    users[api_key]["telegram_accounts"].append(account_data)
+    users[user_id]["telegram_accounts"].append(account_data)
     save_users(users)
     return True
 
-async def update_telegram_account(api_key: str, account_id: str, account_data: Dict) -> bool:
+async def update_telegram_account(user_id: str, account_id: str, account_data: Dict) -> bool:
     """Обновляет данные аккаунта Telegram."""
     users = load_users()
-    if api_key not in users or "telegram_accounts" not in users[api_key]:
+    if user_id not in users or "telegram_accounts" not in users[user_id]:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
     
-    for account in users[api_key]["telegram_accounts"]:
+    for account in users[user_id]["telegram_accounts"]:
         if account.get("id") == account_id:
             account.update(account_data)
             save_users(users)
@@ -88,14 +88,14 @@ async def update_telegram_account(api_key: str, account_id: str, account_data: D
     
     raise HTTPException(status_code=404, detail="Аккаунт не найден")
 
-async def delete_telegram_account(api_key: str, account_id: str) -> bool:
+async def delete_telegram_account(user_id: str, account_id: str) -> bool:
     """Удаляет аккаунт Telegram."""
     users = load_users()
-    if api_key not in users or "telegram_accounts" not in users[api_key]:
+    if user_id not in users or "telegram_accounts" not in users[user_id]:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
     
-    users[api_key]["telegram_accounts"] = [
-        acc for acc in users[api_key]["telegram_accounts"]
+    users[user_id]["telegram_accounts"] = [
+        acc for acc in users[user_id]["telegram_accounts"]
         if acc.get("id") != account_id
     ]
     save_users(users)
@@ -346,13 +346,13 @@ async def get_account_status(api_key: str) -> Dict:
         "last_used": user_data.get("last_used")
     }
 
-async def get_telegram_account(api_key: str, account_id: str) -> Optional[Dict]:
-    """Получает информацию о конкретном Telegram аккаунте."""
+async def get_telegram_account(user_id: str, account_id: str) -> Optional[Dict]:
+    """Получает данные аккаунта Telegram."""
     users = load_users()
-    if api_key not in users or "telegram_accounts" not in users[api_key]:
+    if user_id not in users or "telegram_accounts" not in users[user_id]:
         return None
     
-    for account in users[api_key]["telegram_accounts"]:
+    for account in users[user_id]["telegram_accounts"]:
         if account.get("id") == account_id:
             return account
     

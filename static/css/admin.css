@@ -1,0 +1,721 @@
+/* Импорт Google шрифтов */
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&family=Poppins:wght@300;400;500;600;700&display=swap');
+
+/* Основные цветовые переменные */
+:root {
+    --background-color: #f5f7fa;
+    --card-bg-color: #ffffff;
+    --text-color: #333333;
+    --text-secondary-color: #666666;
+    --accent-color: #4a6cf7;
+    --accent-hover-color: #3a5ce4;
+    --error-color: #e74c3c;
+    --error-hover-color: #c0392b;
+    --success-color: #2ecc71;
+    --success-hover-color: #27ae60;
+    --warning-color: #f39c12;
+    --border-color: #e0e0e0;
+    --input-bg-color: #f8f9fa;
+    --placeholder-color: #aaaaaa;
+    --shadow-color: rgba(0, 0, 0, 0.1);
+    --modal-bg: rgba(0, 0, 0, 0.7);
+    --modal-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --card-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+/* Тёмная тема */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --background-color: #1a1a2e;
+        --card-bg-color: #242644;
+        --text-color: #e0e0e0;
+        --text-secondary-color: #a0a0a0;
+        --accent-color: #4a6cf7;
+        --accent-hover-color: #3a5ce4;
+        --error-color: #ff6b6b;
+        --error-hover-color: #e45d5d;
+        --success-color: #2ecc71;
+        --success-hover-color: #27ae60;
+        --warning-color: #f39c12;
+        --border-color: #3a3a55;
+        --input-bg-color: #30304d;
+        --placeholder-color: #7a7a8c;
+        --shadow-color: rgba(0, 0, 0, 0.4);
+        --modal-bg: rgba(0, 0, 0, 0.8);
+        --modal-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+        --card-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+}
+
+body {
+    font-family: 'Poppins', sans-serif;
+    line-height: 1.6;
+    margin: 0;
+    padding: 0;
+    background-color: var(--background-color);
+    color: var(--text-color);
+    min-height: 100vh;
+}
+
+.container {
+    width: 90%;
+    max-width: 1200px;
+    margin: 30px auto;
+    padding: 25px;
+    background: var(--card-bg-color);
+    border-radius: 10px;
+    box-shadow: var(--card-shadow);
+    border: 1px solid var(--border-color);
+}
+
+h1, h2, h3, h4 {
+    font-family: 'Montserrat', sans-serif;
+    color: var(--text-color);
+    margin-bottom: 20px;
+    font-weight: 600;
+}
+
+h1 {
+    font-size: 2.2rem;
+    text-align: center;
+    margin-bottom: 30px;
+    color: var(--accent-color);
+    letter-spacing: 0.5px;
+}
+
+h2 {
+    font-size: 1.8rem;
+}
+
+h3 {
+    font-size: 1.5rem;
+    margin-bottom: 10px;
+    color: var(--accent-color);
+}
+
+h4 {
+    font-size: 1.2rem;
+    color: var(--text-secondary-color);
+    margin-top: 20px;
+    margin-bottom: 15px;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 8px;
+}
+
+/* Шапка админ-панели */
+.admin-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 30px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.admin-header h1 {
+    margin: 0;
+    text-align: left;
+}
+
+.header-actions {
+    display: flex;
+    gap: 10px;
+}
+
+#logout-btn {
+    background-color: var(--error-color);
+    padding: 8px 15px;
+}
+
+#logout-btn:hover {
+    background-color: var(--error-hover-color);
+}
+
+/* Иконки */
+i {
+    margin-right: 8px;
+}
+
+h1 i, h2 i, h3 i {
+    font-size: 90%;
+    opacity: 0.9;
+}
+
+.loading {
+    text-align: center;
+    padding: 40px 0;
+    color: var(--text-secondary-color);
+}
+
+.loading i {
+    font-size: 2rem;
+    margin-bottom: 15px;
+    color: var(--accent-color);
+}
+
+/* Стили для API ключа */
+.api-key-container {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 15px;
+    background-color: var(--input-bg-color);
+    border-radius: 8px;
+    padding: 15px;
+    border: 1px solid var(--border-color);
+}
+
+.api-key-container p {
+    margin: 0 0 10px 0;
+    font-size: 0.95rem;
+}
+
+.api-key {
+    font-family: monospace;
+    background-color: rgba(0, 0, 0, 0.15);
+    padding: 8px 12px;
+    border-radius: 6px;
+    color: var(--accent-color);
+    font-weight: bold;
+    word-break: break-all;
+    display: inline-block;
+    margin-bottom: 10px;
+}
+
+.copy-button {
+    background: var(--accent-color);
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    margin-left: auto;
+    transition: all 0.2s;
+}
+
+.copy-button:hover {
+    background: var(--accent-hover-color);
+    transform: translateY(-2px);
+}
+
+/* Форма входа */
+#loginForm {
+    max-width: 400px;
+    margin: 0 auto;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 500;
+    color: var(--text-secondary-color);
+}
+
+.form-group input {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 16px;
+    background-color: var(--input-bg-color);
+    color: var(--text-color);
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+    box-shadow: 0 0 0 2px rgba(114, 137, 218, 0.3);
+}
+
+button {
+    background-color: var(--accent-color);
+    color: white;
+    border: none;
+    padding: 10px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 1rem;
+    font-weight: 500;
+    transition: all 0.3s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+
+button:hover {
+    background-color: var(--accent-hover-color);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 10px var(--shadow-color);
+}
+
+button i {
+    margin-right: 0;
+}
+
+/* Модальные окна */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(5px);
+}
+
+.modal-content {
+    background-color: var(--card-bg-color);
+    margin: 10% auto;
+    padding: 30px;
+    border: 1px solid var(--border-color);
+    width: 50%;
+    max-width: 650px;
+    border-radius: 10px;
+    box-shadow: var(--modal-shadow);
+    animation: modalFadeIn 0.3s;
+}
+
+@keyframes modalFadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.close {
+    color: var(--text-secondary-color);
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: color 0.2s;
+}
+
+.close:hover,
+.close:focus {
+    color: var(--text-color);
+}
+
+/* Пользовательские карточки */
+.user-card {
+    background: var(--card-bg-color);
+    border: 1px solid var(--border-color);
+    padding: 20px;
+    margin-bottom: 20px;
+    border-radius: 10px;
+    box-shadow: var(--card-shadow);
+    transition: all 0.3s ease;
+}
+
+.user-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 8px 15px var(--shadow-color);
+}
+
+.accounts {
+    margin-top: 15px;
+}
+
+.account {
+    background: var(--input-bg-color);
+    padding: 12px 15px;
+    margin-bottom: 8px;
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border: 1px solid var(--border-color);
+}
+
+.account p {
+    margin: 0;
+    font-size: 0.95rem;
+}
+
+.account button {
+    background: var(--error-color);
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 14px;
+    transition: all 0.2s;
+}
+
+.account button:hover {
+    background-color: var(--error-hover-color);
+}
+
+/* Секция действий */
+.actions {
+    margin-bottom: 30px;
+    text-align: right;
+}
+
+.actions button {
+    background: var(--success-color);
+}
+
+.actions button:hover {
+    background-color: var(--success-hover-color);
+}
+
+/* Кнопки добавления аккаунтов */
+.accounts button {
+    margin-top: 10px;
+    width: auto;
+    display: inline-block;
+}
+
+/* Адаптивность */
+@media (max-width: 768px) {
+    .container {
+        width: 95%;
+        padding: 15px;
+    }
+    
+    .modal-content {
+        width: 90%;
+        padding: 20px;
+    }
+    
+    h1 {
+        font-size: 1.8rem;
+    }
+    
+    .api-key-container {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .api-key-container p {
+        margin-bottom: 10px;
+        margin-right: 0;
+    }
+    
+    .copy-button {
+        margin-left: 0;
+        margin-top: 10px;
+    }
+    
+    .admin-header {
+        flex-direction: column;
+        gap: 15px;
+    }
+    
+    .admin-header h1 {
+        text-align: center;
+    }
+}
+
+/* Стили для уведомления о копировании */
+.copy-notification {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background-color: var(--success-color);
+    color: white;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    animation: slideIn 0.3s ease-out;
+}
+
+.copy-notification i {
+    margin-right: 10px;
+    font-size: 16px;
+}
+
+.copy-notification.fade-out {
+    animation: fadeOut 0.5s ease-out forwards;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(100px);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+@keyframes fadeOut {
+    from {
+        opacity: 1;
+    }
+    to {
+        opacity: 0;
+    }
+}
+
+/* Стили для модального окна с API ключом */
+.api-key-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 5px;
+}
+
+.copy-button, .regenerate-key-button {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+
+.copy-button {
+    background-color: var(--accent-color);
+    color: white;
+}
+
+.copy-button:hover {
+    background-color: var(--accent-hover-color);
+    transform: translateY(-2px);
+}
+
+.regenerate-key-button {
+    background-color: var(--success-color);
+    color: white;
+}
+
+.regenerate-key-button:hover {
+    background-color: var(--success-hover-color);
+    transform: translateY(-2px);
+}
+
+.api-key-display {
+    background-color: var(--card-bg-color);
+    border-radius: 8px;
+    padding: 15px;
+    margin: 15px 0;
+}
+
+.api-key-value {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background-color: rgba(0, 0, 0, 0.1);
+    padding: 10px;
+    border-radius: 4px;
+    margin-top: 10px;
+    margin-bottom: 10px;
+    overflow-x: auto;
+}
+
+.api-key-value code {
+    font-family: monospace;
+    font-size: 1rem;
+    color: var(--accent-color);
+    word-break: break-all;
+}
+
+.api-key-warning {
+    color: var(--error-color);
+    font-weight: bold;
+    margin-top: 10px;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 20px;
+}
+
+.modal-actions button {
+    background-color: var(--accent-color);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 15px;
+    cursor: pointer;
+    font-size: 1rem;
+    transition: background-color 0.3s;
+}
+
+.modal-actions button:hover {
+    background-color: var(--accent-hover-color);
+}
+
+/* Стили для заголовка карточки пользователя */
+.user-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+
+.user-header h3 {
+    margin: 0;
+}
+
+.delete-user-btn {
+    background-color: var(--error-color);
+    padding: 6px 12px;
+    font-size: 14px;
+    border-radius: 4px;
+}
+
+.delete-user-btn:hover {
+    background-color: var(--error-hover-color);
+}
+
+/* Стили для модального окна с новым API ключом */
+#newApiKeyModal .modal-content {
+    max-width: 600px;
+}
+
+#newApiKeyModal h2 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--accent-color);
+    margin-bottom: 20px;
+}
+
+.api-key-display {
+    background-color: var(--card-bg-color);
+    border-radius: 8px;
+    padding: 15px;
+    margin: 15px 0;
+}
+
+.api-key-display p {
+    margin-bottom: 10px;
+    font-weight: 500;
+}
+
+.api-key-value {
+    background-color: rgba(0, 0, 0, 0.15);
+    padding: 15px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.api-key-value code {
+    font-family: monospace;
+    font-size: 1rem;
+    color: var(--accent-color);
+    word-break: break-all;
+    flex: 1;
+}
+
+.api-key-value button {
+    background-color: var(--accent-color);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 5px 10px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    transition: background-color 0.3s;
+}
+
+.api-key-value button:hover {
+    background-color: var(--accent-hover-color);
+}
+
+.api-key-warning {
+    color: var(--error-color);
+    font-weight: bold;
+    margin-top: 15px;
+}
+
+/* Стили для уведомлений */
+.notification {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background-color: var(--card-bg-color);
+    border-left: 4px solid var(--accent-color);
+    border-radius: 6px;
+    padding: 15px;
+    box-shadow: 0 4px 12px var(--shadow-color);
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-width: 300px;
+    max-width: 450px;
+    transform: translateX(110%);
+    transition: transform 0.3s ease-out;
+}
+
+.notification.show {
+    transform: translateX(0);
+}
+
+.notification.success {
+    border-left-color: var(--success-color);
+}
+
+.notification.error {
+    border-left-color: var(--error-color);
+}
+
+.notification.info i {
+    color: var(--accent-color);
+}
+
+.notification-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.notification-content i {
+    font-size: 1.2rem;
+}
+
+.notification.success i {
+    color: var(--success-color);
+}
+
+.notification.error i {
+    color: var(--error-color);
+}
+
+.notification.info i {
+    color: var(--accent-color);
+}
+
+.close-notification {
+    background: none;
+    border: none;
+    color: var(--text-secondary-color);
+    font-size: 1.2rem;
+    cursor: pointer;
+    padding: 0 5px;
+}
+
+.close-notification:hover {
+    color: var(--text-color);
+} 
