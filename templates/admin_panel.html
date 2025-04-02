@@ -409,141 +409,72 @@
         <button class="logout-btn" onclick="logout()">Выйти</button>
     </div>
 
-    <div class="section register-section">
-        <h2>Регистрация пользователя</h2>
-        <div class="register-form">
-            <div class="form-group">
-                <label>Имя пользователя:</label>
-                <input type="text" id="registerUsername" required>
-            </div>
-            <div class="form-group">
-                <label>Пароль:</label>
-                <input type="password" id="registerPassword" required>
-            </div>
-            <div class="register-buttons">
-                <button class="btn btn-primary" onclick="registerUser()">Зарегистрировать</button>
-            </div>
-        </div>
-        <div id="registerResult"></div>
-    </div>
-
     <div class="section">
-        <h2>Системная статистика</h2>
-        <div id="systemStats" class="stats-grid">
-            <div class="stat-card">
-                <h3>Загрузка...</h3>
-                <div class="stat-value">-</div>
+        <h2>Управление пользователями</h2>
+        <div class="user-management">
+            <div class="user-form">
+                <h3>Добавить пользователя</h3>
+                <form id="addUserForm">
+                    <div class="form-group">
+                        <label for="username">Имя пользователя:</label>
+                        <input type="text" id="username" name="username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Пароль:</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn">Добавить пользователя</button>
+                </form>
+            </div>
+            <div id="usersList" class="users-list">
+                <!-- Список пользователей будет добавлен динамически -->
             </div>
         </div>
     </div>
 
-    <div class="section">
-        <h2>Управление аккаунтами</h2>
-        <div class="account-management">
-            <div class="account-form">
-                <h3>Добавить Telegram аккаунт</h3>
+    <!-- Модальные окна -->
+    <div id="telegramModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Добавить аккаунт Telegram</h2>
+            <form id="addTelegramForm">
                 <div class="form-group">
-                    <label>API ID:</label>
-                    <input type="text" id="telegramApiId" placeholder="Введите API ID">
+                    <label for="telegramApiId">API ID:</label>
+                    <input type="text" id="telegramApiId" name="api_id" required>
                 </div>
                 <div class="form-group">
-                    <label>API Hash:</label>
-                    <input type="text" id="telegramApiHash" placeholder="Введите API Hash">
+                    <label for="telegramApiHash">API Hash:</label>
+                    <input type="text" id="telegramApiHash" name="api_hash" required>
                 </div>
                 <div class="form-group">
-                    <label>Номер телефона:</label>
-                    <input type="text" id="telegramPhone" required>
+                    <label for="telegramPhone">Номер телефона:</label>
+                    <input type="text" id="telegramPhone" name="phone" required>
                 </div>
                 <div class="form-group">
-                    <label>Прокси (опционально):</label>
-                    <input type="text" id="telegramProxy" placeholder="socks5://user:pass@host:port">
+                    <label for="telegramProxy">Прокси (опционально):</label>
+                    <input type="text" id="telegramProxy" name="proxy">
                 </div>
-                <div class="form-group">
-                    <label>Файл сессии (опционально):</label>
-                    <input type="file" id="telegramSession" accept=".session">
-                </div>
-                <button class="btn btn-add" onclick="addTelegramAccount()">Добавить Telegram аккаунт</button>
-            </div>
-
-            <div class="account-form">
-                <h3>Добавить VK аккаунт</h3>
-                <div class="form-group">
-                    <label>Access Token:</label>
-                    <input type="text" id="vkToken" placeholder="Введите Access Token">
-                </div>
-                <div class="form-group">
-                    <label>Прокси (опционально):</label>
-                    <input type="text" id="vkProxy" placeholder="socks5://user:pass@host:port">
-                </div>
-                <button class="btn btn-add" onclick="addVkAccount()">Добавить VK аккаунт</button>
-            </div>
+                <button type="submit" class="btn">Добавить</button>
+            </form>
         </div>
     </div>
 
-    <div class="section">
-        <h2>Пользователи</h2>
-        <div id="usersList" class="users-list"></div>
-    </div>
-</div>
-
-<!-- Модальное окно для отображения API ключа -->
-<div id="apiKeyModal" class="modal">
-    <div class="modal-content">
-        <span class="close" onclick="closeApiKeyModal()">&times;</span>
-        <h2>API ключ пользователя</h2>
-        <div class="api-key">
-            <span id="apiKeyText"></span>
-            <button class="copy-btn" onclick="copyApiKey()">Копировать</button>
+    <div id="vkModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Добавить аккаунт VK</h2>
+            <form id="addVkForm">
+                <div class="form-group">
+                    <label for="vkToken">Токен VK:</label>
+                    <input type="text" id="vkToken" name="token" required>
+                </div>
+                <div class="form-group">
+                    <label for="vkProxy">Прокси (опционально):</label>
+                    <input type="text" id="vkProxy" name="proxy">
+                </div>
+                <button type="submit" class="btn">Добавить</button>
+            </form>
         </div>
-        <button class="btn btn-primary" onclick="closeApiKeyModal()">Закрыть</button>
-    </div>
-</div>
-
-<!-- Модальное окно для добавления Telegram аккаунта -->
-<div id="telegramModal" class="modal">
-    <div class="modal-content">
-        <span class="close" onclick="closeTelegramModal()">&times;</span>
-        <h2>Добавить Telegram аккаунт</h2>
-        <div class="form-group">
-            <label>API ID:</label>
-            <input type="text" id="telegramApiId" required>
-        </div>
-        <div class="form-group">
-            <label>API Hash:</label>
-            <input type="text" id="telegramApiHash" required>
-        </div>
-        <div class="form-group">
-            <label>Номер телефона:</label>
-            <input type="text" id="telegramPhone" required>
-        </div>
-        <div class="form-group">
-            <label>Прокси (опционально):</label>
-            <input type="text" id="telegramProxy" placeholder="socks5://user:pass@host:port">
-        </div>
-        <div class="form-group">
-            <label>Файл сессии (опционально):</label>
-            <input type="file" id="telegramSession" accept=".session">
-        </div>
-        <button class="btn btn-primary" onclick="addTelegramAccount()">Добавить</button>
-        <div id="telegramResult"></div>
-    </div>
-</div>
-
-<!-- Модальное окно для добавления VK аккаунта -->
-<div id="vkModal" class="modal">
-    <div class="modal-content">
-        <span class="close" onclick="closeVkModal()">&times;</span>
-        <h2>Добавить VK аккаунт</h2>
-        <div class="form-group">
-            <label>Access Token:</label>
-            <input type="text" id="vkToken" required>
-        </div>
-        <div class="form-group">
-            <label>Прокси (опционально):</label>
-            <input type="text" id="vkProxy" placeholder="socks5://user:pass@host:port">
-        </div>
-        <button class="btn btn-primary" onclick="addVkAccount()">Добавить</button>
-        <div id="vkResult"></div>
     </div>
 </div>
 {% endblock %}
@@ -551,9 +482,9 @@
 {% block scripts %}
 <script>
     let currentUser = null;
+    let adminKey = localStorage.getItem('adminKey');
 
     // Проверяем наличие админ-ключа при загрузке
-    const adminKey = localStorage.getItem('adminKey');
     if (!adminKey) {
         window.location.href = `${BASE_URL}/login`;
     }
@@ -798,97 +729,59 @@
     }
 
     function getStatusText(status) {
-        switch(status) {
-            case 'active':
-                return 'Активный';
-            case 'degraded':
-                return 'Ограничен';
-            case 'cooldown':
-                return 'Охлаждение';
-            default:
-                return 'Неизвестно';
-        }
+        const statusMap = {
+            'active': 'Активен',
+            'degraded': 'Ухудшен',
+            'cooldown': 'Ожидание'
+        };
+        return statusMap[status] || status;
     }
 
     function displayUsers(users) {
-        const userList = document.getElementById('usersList');
-        userList.innerHTML = '';
-
+        const usersList = document.getElementById('usersList');
         if (!users || users.length === 0) {
-            userList.innerHTML = '<p>Нет зарегистрированных пользователей</p>';
+            usersList.innerHTML = '<p>Нет зарегистрированных пользователей</p>';
             return;
         }
 
-        for (const userData of users) {
-            console.log('Processing user:', userData); // Для отладки
-            const userDiv = document.createElement('div');
-            userDiv.className = 'user-card';
-            
-            const username = userData.username || 'Неизвестно';
-            const apiKey = userData.api_key;
-            const createdAt = userData.created_at ? new Date(userData.created_at).toLocaleString() : 'Неизвестно';
-            const lastUsed = userData.last_used ? new Date(userData.last_used).toLocaleString() : 'Никогда';
-            
-            userDiv.innerHTML = `
-                <h3>${username}</h3>
-                <div class="user-info">
-                    <div class="api-key-container">
-                        <p><strong>API ключ:</strong></p>
-                        <div class="api-key">
-                            <input type="text" value="${apiKey ? apiKey.substring(0, 8) + '...' : 'Ключ не найден'}" readonly style="width: 80%; border: none; background: transparent;">
-                            <button class="copy-btn" onclick="showFullApiKey('${apiKey}')">Показать</button>
-                        </div>
-                    </div>
-                    <p><strong>Создан:</strong> ${createdAt}</p>
-                    <p><strong>Последнее использование:</strong> ${lastUsed}</p>
-                    
-                    <div class="accounts-info">
-                        <div class="telegram-accounts">
-                            <div class="account-header">
-                                <h4>Telegram аккаунты (${userData.telegram_accounts ? userData.telegram_accounts.length : 0})</h4>
-                                <button onclick="showTelegramModal('${apiKey}')">Добавить аккаунт</button>
-                            </div>
-                            ${userData.telegram_accounts && userData.telegram_accounts.length > 0 ? userData.telegram_accounts.map(account => `
-                                <div class="account-details">
-                                    <div class="account-header">
-                                        <span class="account-phone">${account.phone}</span>
-                                        <span class="status status-${account.status}">${getStatusText(account.status)}</span>
-                                    </div>
-                                    <p>Прокси: ${account.proxy || 'Нет'}</p>
-                                    <p>Запросов: ${account.requests_made || 0}</p>
-                                    <button onclick="deleteTelegramAccount('${apiKey}', '${account.id}')">Удалить</button>
-                                </div>
-                            `).join('') : '<p>Нет аккаунтов</p>'}
-                        </div>
-                        
-                        <div class="vk-accounts">
-                            <div class="account-header">
-                                <h4>VK аккаунты (${userData.vk_accounts ? userData.vk_accounts.length : 0})</h4>
-                                <button onclick="showVkModal('${apiKey}')">Добавить аккаунт</button>
-                            </div>
-                            ${userData.vk_accounts && userData.vk_accounts.length > 0 ? userData.vk_accounts.map(account => `
-                                <div class="account-details">
-                                    <div class="account-header">
-                                        <span class="account-token">${account.token.substring(0, 10)}...</span>
-                                        <span class="status status-${account.status}">${getStatusText(account.status)}</span>
-                                    </div>
-                                    <p>Прокси: ${account.proxy || 'Нет'}</p>
-                                    <p>Запросов: ${account.requests_made || 0}</p>
-                                    <button onclick="deleteVkAccount('${apiKey}', '${account.id}')">Удалить</button>
-                                </div>
-                            `).join('') : '<p>Нет аккаунтов</p>'}
-                        </div>
-                    </div>
+        usersList.innerHTML = users.map(user => `
+            <div class="user-card">
+                <h3>Пользователь: ${user.username}</h3>
+                <p>API ключ: ${user.api_key}</p>
+                <p>Создан: ${new Date(user.created_at).toLocaleString()}</p>
+                <p>Последнее использование: ${user.last_used ? new Date(user.last_used).toLocaleString() : 'Нет'}</p>
+                
+                <div class="accounts-info">
+                    <h4>Telegram аккаунты (${user.telegram_accounts.length})</h4>
+                    <ul>
+                        ${user.telegram_accounts.map(acc => `
+                            <li>
+                                ${acc.phone} - ${getStatusText(acc.status)}
+                                ${acc.proxy ? `<br>Прокси: ${acc.proxy}` : ''}
+                                <button onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')" class="delete-btn">Удалить</button>
+                            </li>
+                        `).join('')}
+                    </ul>
+                    <button onclick="showTelegramModal('${user.api_key}')" class="add-btn">Добавить Telegram</button>
                 </div>
-                <div class="user-actions">
-                    <button class="btn btn-primary" onclick="showTelegramModal('${apiKey}')">Добавить Telegram</button>
-                    <button class="btn btn-primary" onclick="showVkModal('${apiKey}')">Добавить VK</button>
-                    <button class="btn btn-danger" onclick="deleteUser('${apiKey}')">Удалить пользователя</button>
+
+                <div class="accounts-info">
+                    <h4>VK аккаунты (${user.vk_accounts.length})</h4>
+                    <ul>
+                        ${user.vk_accounts.map(acc => `
+                            <li>
+                                Токен: ${acc.token.substring(0, 10)}... - ${getStatusText(acc.status)}
+                                ${acc.proxy ? `<br>Прокси: ${acc.proxy}` : ''}
+                                <button onclick="deleteVkAccount('${user.api_key}', '${acc.id}')" class="delete-btn">Удалить</button>
+                            </li>
+                        `).join('')}
+                    </ul>
+                    <button onclick="showVkModal('${user.api_key}')" class="add-btn">Добавить VK</button>
                 </div>
-            `;
-            
-            userList.appendChild(userDiv);
-        }
+
+                <button onclick="deleteUser('${user.api_key}')" class="delete-btn">Удалить пользователя</button>
+            </div>
+        `).join('');
     }
 
     function copyToClipboard(text) {
@@ -970,25 +863,114 @@
         }
     }
 
+    // Функции для работы с модальными окнами
     function showTelegramModal(apiKey) {
         currentUser = apiKey;
-        document.getElementById('telegramModal').style.display = 'block';
-    }
-
-    function closeTelegramModal() {
-        document.getElementById('telegramModal').style.display = 'none';
-        currentUser = null;
+        const modal = document.getElementById('telegramModal');
+        const title = modal.querySelector('h2');
+        title.textContent = `Добавить аккаунт Telegram для пользователя ${apiKey}`;
+        modal.style.display = 'block';
     }
 
     function showVkModal(apiKey) {
         currentUser = apiKey;
-        document.getElementById('vkModal').style.display = 'block';
+        const modal = document.getElementById('vkModal');
+        const title = modal.querySelector('h2');
+        title.textContent = `Добавить аккаунт VK для пользователя ${apiKey}`;
+        modal.style.display = 'block';
     }
 
-    function closeVkModal() {
-        document.getElementById('vkModal').style.display = 'none';
-        currentUser = null;
+    // Закрытие модальных окон
+    document.querySelectorAll('.close').forEach(closeBtn => {
+        closeBtn.onclick = function() {
+            this.closest('.modal').style.display = 'none';
+            currentUser = null;
+        }
+    });
+
+    window.onclick = function(event) {
+        if (event.target.classList.contains('modal')) {
+            event.target.style.display = 'none';
+            currentUser = null;
+        }
     }
+
+    // Обработка форм
+    document.getElementById('addTelegramForm').onsubmit = async function(e) {
+        e.preventDefault();
+        if (!currentUser) {
+            alert('Пользователь не выбран');
+            return;
+        }
+
+        const formData = new FormData(this);
+        const data = {
+            api_id: formData.get('api_id'),
+            api_hash: formData.get('api_hash'),
+            phone: formData.get('phone'),
+            proxy: formData.get('proxy') || null
+        };
+
+        try {
+            const response = await fetch(`/admin/users/${currentUser}/telegram`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Key': adminKey
+                },
+                body: JSON.stringify(data)
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            alert('Аккаунт Telegram успешно добавлен');
+            document.getElementById('telegramModal').style.display = 'none';
+            loadUsers(); // Перезагружаем список пользователей
+        } catch (error) {
+            console.error('Error:', error);
+            alert('Ошибка при добавлении аккаунта Telegram');
+        }
+    };
+
+    document.getElementById('addVkForm').onsubmit = async function(e) {
+        e.preventDefault();
+        if (!currentUser) {
+            alert('Пользователь не выбран');
+            return;
+        }
+
+        const formData = new FormData(this);
+        const data = {
+            token: formData.get('token'),
+            proxy: formData.get('proxy') || null
+        };
+
+        try {
+            const response = await fetch(`/admin/users/${currentUser}/vk`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Key': adminKey
+                },
+                body: JSON.stringify(data)
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            alert('Аккаунт VK успешно добавлен');
+            document.getElementById('vkModal').style.display = 'none';
+            loadUsers(); // Перезагружаем список пользователей
+        } catch (error) {
+            console.error('Error:', error);
+            alert('Ошибка при добавлении аккаунта VK');
+        }
+    };
 
     function showFullApiKey(apiKey) {
         const modal = document.getElementById('apiKeyModal');

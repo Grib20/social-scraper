@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import FastAPI, HTTPException, Request, Security, Body, Header
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import uvicorn
@@ -141,11 +141,22 @@ async def auth_middleware(request: Request, platform: str):
     return api_key
 
 # Админ-эндпоинты для управления аккаунтами
-@app.post("/admin/users/{api_key}/telegram-accounts", dependencies=[Security(verify_admin_key)])
-async def admin_add_telegram_account(api_key: str, account_data: dict = Body(...)):
+@app.post("/admin/users/{api_key}/telegram")
+async def add_telegram_account_route(
+    api_key: str,
+    account_data: dict = Body(...),
+    admin_key: str = Security(api_key_header)
+):
     """Добавляет аккаунт Telegram для пользователя."""
-    account_data["id"] = str(uuid.uuid4())
-    return await add_telegram_account(api_key, account_data)
+    try:
+        await verify_admin_key(admin_key)
+        await add_telegram_account(api_key, account_data)
+        return {"status": "success", "message": "Аккаунт Telegram успешно добавлен"}
+    except HTTPException as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"status": "error", "message": e.detail}
+        )
 
 @app.put("/admin/users/{api_key}/telegram-accounts/{account_id}", dependencies=[Security(verify_admin_key)])
 async def admin_update_telegram_account(api_key: str, account_id: str, account_data: dict = Body(...)):
@@ -157,11 +168,22 @@ async def admin_delete_telegram_account(api_key: str, account_id: str):
     """Удаляет аккаунт Telegram."""
     return await delete_telegram_account(api_key, account_id)
 
-@app.post("/admin/users/{api_key}/vk-accounts", dependencies=[Security(verify_admin_key)])
-async def admin_add_vk_account(api_key: str, account_data: dict = Body(...)):
+@app.post("/admin/users/{api_key}/vk")
+async def add_vk_account_route(
+    api_key: str,
+    account_data: dict = Body(...),
+    admin_key: str = Security(api_key_header)
+):
     """Добавляет аккаунт VK для пользователя."""
-    account_data["id"] = str(uuid.uuid4())
-    return await add_vk_account(api_key, account_data)
+    try:
+        await verify_admin_key(admin_key)
+        await add_vk_account(api_key, account_data)
+        return {"status": "success", "message": "Аккаунт VK успешно добавлен"}
+    except HTTPException as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"status": "error", "message": e.detail}
+        )
 
 @app.put("/admin/users/{api_key}/vk-accounts/{account_id}", dependencies=[Security(verify_admin_key)])
 async def admin_update_vk_account(api_key: str, account_id: str, account_data: dict = Body(...)):
