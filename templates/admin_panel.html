@@ -249,6 +249,23 @@
         margin-top: 10px;
         text-align: center;
     }
+    .register-section {
+        background-color: #f8f9fa;
+        padding: 20px;
+        border-radius: 8px;
+        margin-bottom: 30px;
+        border: 1px solid #ddd;
+    }
+    .register-form {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+    }
+    .register-buttons {
+        grid-column: 1 / -1;
+        display: flex;
+        gap: 10px;
+    }
 </style>
 {% endblock %}
 
@@ -257,6 +274,24 @@
     <div class="header">
         <h1>Админ-панель</h1>
         <button class="logout-btn" onclick="logout()">Выйти</button>
+    </div>
+
+    <div class="section register-section">
+        <h2>Регистрация пользователя</h2>
+        <div class="register-form">
+            <div class="form-group">
+                <label>Имя пользователя:</label>
+                <input type="text" id="registerUsername" required>
+            </div>
+            <div class="form-group">
+                <label>Пароль:</label>
+                <input type="password" id="registerPassword" required>
+            </div>
+            <div class="register-buttons">
+                <button class="btn btn-primary" onclick="registerUser()">Зарегистрировать</button>
+            </div>
+        </div>
+        <div id="registerResult"></div>
     </div>
 
     <div class="section">
@@ -314,9 +349,7 @@
 
     <div class="section">
         <h2>Пользователи</h2>
-        <div id="usersList" class="users-list">
-            <!-- Здесь будут отображаться пользователи -->
-        </div>
+        <div id="usersList" class="users-list"></div>
     </div>
 </div>
 
@@ -457,22 +490,14 @@
                 }
             });
 
-            if (!response.ok) {
-                if (response.status === 401) {
-                    localStorage.removeItem('adminKey');
-                    window.location.href = `${BASE_URL}/login`;
-                    return;
-                }
-                throw new Error('Ошибка загрузки пользователей');
+            if (response.ok) {
+                const users = await response.json();
+                displayUsers(users);
+            } else {
+                console.error('Ошибка загрузки пользователей');
             }
-
-            const users = await response.json();
-            displayUsers(users);
         } catch (error) {
-            console.error('Error loading users:', error);
-            document.querySelector('#usersList').innerHTML = `
-                <div class="error">Ошибка загрузки пользователей</div>
-            `;
+            console.error('Ошибка:', error);
         }
     }
 
@@ -480,18 +505,24 @@
         const container = document.getElementById('usersList');
         container.innerHTML = users.map(user => `
             <div class="user-card">
-                <h3>Пользователь</h3>
+                <h3>${user.username}</h3>
                 <div class="user-info">
-                    <p><strong>API ключ:</strong> ${user.api_key}</p>
+                    <p><strong>API ключ:</strong> 
+                        <span class="api-key">
+                            ${user.api_key.substring(0, 8)}...
+                            <button class="copy-btn" onclick="showApiKey('${user.api_key}')">Показать</button>
+                        </span>
+                    </p>
                     <p><strong>Создан:</strong> ${new Date(user.created_at).toLocaleString()}</p>
                     <p><strong>Последнее использование:</strong> ${user.last_used ? new Date(user.last_used).toLocaleString() : 'Нет'}</p>
                     <p><strong>Telegram аккаунтов:</strong> ${user.telegram_accounts.length}</p>
                     <p><strong>VK аккаунтов:</strong> ${user.vk_accounts.length}</p>
                 </div>
-                <button class="btn btn-primary" onclick="showApiKey('${user.api_key}')">Показать API ключ</button>
-                <button class="btn btn-primary" onclick="showTelegramModal('${user.api_key}')">Добавить Telegram</button>
-                <button class="btn btn-primary" onclick="showVkModal('${user.api_key}')">Добавить VK</button>
-                <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить</button>
+                <div class="user-actions">
+                    <button class="btn btn-primary" onclick="showTelegramModal('${user.api_key}')">Добавить Telegram</button>
+                    <button class="btn btn-primary" onclick="showVkModal('${user.api_key}')">Добавить VK</button>
+                    <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить</button>
+                </div>
             </div>
         `).join('');
     }
@@ -677,6 +708,42 @@
     function closeVkModal() {
         document.getElementById('vkModal').style.display = 'none';
         currentUser = null;
+    }
+
+    async function registerUser() {
+        const username = document.getElementById('registerUsername').value;
+        const password = document.getElementById('registerPassword').value;
+        const resultDiv = document.getElementById('registerResult');
+
+        if (!username || !password) {
+            resultDiv.innerHTML = '<div class="error">Заполните все поля</div>';
+            return;
+        }
+
+        try {
+            const response = await fetch(`${BASE_URL}/register`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Key': adminKey
+                },
+                body: JSON.stringify({ username, password })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                resultDiv.innerHTML = '<div class="success">Пользователь успешно зарегистрирован</div>';
+                document.getElementById('registerUsername').value = '';
+                document.getElementById('registerPassword').value = '';
+                showApiKey(data.api_key);
+                loadUsers();
+            } else {
+                resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail}</div>`;
+            }
+        } catch (error) {
+            resultDiv.innerHTML = `<div class="error">Ошибка: ${error.message}</div>`;
+        }
     }
 
     // Загружаем данные при загрузке страницы
