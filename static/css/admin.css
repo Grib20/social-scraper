@@ -718,4 +718,77 @@ button i {
 
 .close-notification:hover {
     color: var(--text-color);
-} 
+}
+
+.account-status {
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    margin-left: auto;
+}
+
+.status-active {
+    background-color: var(--success-color);
+    color: white;
+}
+
+.status-pending {
+    background-color: var(--warning-color);
+    color: white;
+}
+
+.status-error {
+    background-color: var(--danger-color);
+    color: white;
+}
+
+.account-actions {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.check-connection-btn {
+    background-color: var(--primary-color);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background-color 0.2s;
+}
+
+.check-connection-btn:hover {
+    background-color: var(--primary-hover);
+}
+
+.delete-account-btn {
+    background-color: var(--danger-color);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background-color 0.2s;
+}
+
+.delete-account-btn:hover {
+    background-color: var(--danger-hover);
+}
+
+.reauth-btn {
+    background-color: var(--warning-color);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background-color 0.2s;
+}
+
+.reauth-btn:hover {
+    background-color: #e6a700; /* Темнее для hover */
+}

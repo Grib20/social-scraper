@@ -14,8 +14,7 @@ from typing import List
 import sys
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
-from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, AuthRestartError
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -157,7 +156,7 @@ async def auth_middleware(request: Request, platform: str):
         
         if account["id"] not in telegram_clients:
             client = TelegramClient(
-                StringSession(account.get("session_string", "")),
+                account["session_file"],
                 account["api_id"],
                 account["api_hash"]
             )
@@ -648,21 +647,19 @@ async def add_telegram_account_endpoint(request: Request):
     account_id = str(uuid.uuid4())
     account_data["id"] = account_id
 
-    # Создаем стандартное имя сессии (Telethon добавит .session)
-    session_name = f"{user_sessions_dir}/{phone}"
-    session_string = ""  # Изначально пустая строка для новой сессии
-    account_data["session_file"] = session_name
-    account_data["session_string"] = session_string  # Добавляем для хранения строки сессии
-    logger.info(f"Назначено имя сессии: {session_name}")
-    
-    # Создаем Telegram клиент и отправляем код
-    logger.info(f"Создаем Telegram клиент с сессией {session_name}")
+    # Создаем имя сессии для Telethon
+    session_path = f"{user_sessions_dir}/{phone}"
+    account_data["session_file"] = session_path
+    logger.info(f"Назначен путь к сессии: {session_path}")
+
+    # Создаем Telegram клиент
+    logger.info(f"Создаем Telegram клиент с сессией {session_path}")
     try:
         # Убедимся, что api_id передается как число
         api_id_int = int(api_id)
         logger.info(f"Преобразован api_id в число: {api_id_int}")
         
-        client = await create_telegram_client(session_string, api_id_int, api_hash, proxy)
+        client = await create_telegram_client(session_path, api_id_int, api_hash, proxy)
         
         logger.info("Устанавливаем соединение с Telegram")
         await client.connect()
@@ -681,8 +678,8 @@ async def add_telegram_account_endpoint(request: Request):
             logger.info("Соединение с Telegram закрыто")
             
             # Сохраняем строку сессии после успешного подключения
-            session_string = client.session.save()
-            account_data["session_string"] = session_string
+            session_path = client.session.save()
+            account_data["session_file"] = session_path
             logger.info("Сохранена строка сессии")
             
             return {
@@ -713,13 +710,13 @@ async def add_telegram_account_endpoint(request: Request):
     except Exception as e:
         logger.error(f"Ошибка при создании аккаунта: {str(e)}")
         # Если произошла ошибка, удаляем файл сессии, если он был создан
-        session_name = account_data.get("session_file")
-        if session_name:
-            session_path = f"{session_name}.session"
+        session_path = account_data.get("session_file")
+        if session_path:
+            session_path = f"{session_path}.session"
             if os.path.exists(session_path):
                 os.remove(session_path)
             # Проверяем, пуста ли директория пользователя, и если да, удаляем её
-            user_dir = os.path.dirname(session_name)
+            user_dir = os.path.dirname(session_path)
             if os.path.exists(user_dir) and not os.listdir(user_dir):
                 os.rmdir(user_dir)
                 logger.info(f"Удалена пустая директория: {user_dir}")
@@ -744,8 +741,9 @@ async def verify_telegram_code(request: Request):
     data = await request.json()
     account_id = data.get('account_id')
     code = data.get('code')
+    client_phone_code_hash = data.get('phone_code_hash')  # Получаем хеш из запроса
     
-    logger.info(f"Полученные данные: account_id={account_id}, code={code}")
+    logger.info(f"Полученные данные: account_id={account_id}, code={code}, client_hash={client_phone_code_hash}")
     
     if not account_id or not code:
         logger.error("Не указаны необходимые параметры")
@@ -766,10 +764,9 @@ async def verify_telegram_code(request: Request):
                     found = True
                     logger.info(f"Аккаунт найден у пользователя {user_id}, телефон: {account.get('phone')}")
                     try:
-                        session_name = account["session_file"]
-                        session_string = account.get("session_string", "")
-                        logger.info(f"Создание клиента Telegram, сессия: {session_name}")
-                        client = await create_telegram_client(session_string, int(account["api_id"]), account["api_hash"], account.get("proxy"))
+                        session_path = account["session_file"]
+                        logger.info(f"Создание клиента Telegram, сессия: {session_path}")
+                        client = await create_telegram_client(session_path, int(account["api_id"]), account["api_hash"], account.get("proxy"))
                         
                         if account.get("proxy"):
                             logger.info(f"Устанавливаем прокси: {account['proxy']}")
@@ -786,28 +783,42 @@ async def verify_telegram_code(request: Request):
                             account["status"] = "active"
                             save_users(users_data)
                             # Сохраняем строку сессии после успешного подключения
-                            session_string = client.session.save()
-                            account["session_string"] = session_string
+                            session_path = client.session.save()
+                            account["session_file"] = session_path
                             logger.info("Обновлена строка сессии после авторизации")
                             return {"account_id": account_id, "requires_2fa": False}
                         
+                        # Определяем, какой phone_code_hash использовать
+                        phone_code_hash = client_phone_code_hash
+                        if not phone_code_hash:
+                            phone_code_hash = account.get("phone_code_hash")
+                            
+                        if not phone_code_hash:
+                            logger.error("Отсутствует phone_code_hash для авторизации")
+                            raise HTTPException(400, "Отсутствует код авторизации. Сначала запросите код.")
+                            
+                        logger.info(f"Используем phone_code_hash: {phone_code_hash}")
+                            
                         # Пытаемся авторизоваться с кодом
                         try:
                             logger.info(f"Вход с кодом авторизации: {code}")
                             result = await client.sign_in(
                                 account["phone"], 
                                 code,
-                                phone_code_hash=account.get("phone_code_hash")
+                                phone_code_hash=phone_code_hash
                             )
                             
                             # Успешная авторизация
                             logger.info("Успешная авторизация!")
                             await client.disconnect()
                             account["status"] = "active"
+                            # Удаляем phone_code_hash после успешной авторизации
+                            if "phone_code_hash" in account:
+                                del account["phone_code_hash"]
                             save_users(users_data)
                             # Сохраняем строку сессии после успешной авторизации
-                            session_string = client.session.save()
-                            account["session_string"] = session_string
+                            session_path = client.session.save()
+                            account["session_file"] = session_path
                             logger.info("Обновлена строка сессии после авторизации")
                             return {"account_id": account_id, "requires_2fa": False}
                         except PhoneCodeInvalidError:
@@ -857,9 +868,9 @@ async def verify_telegram_2fa(request: Request):
                 if account.get("id") == account_id:
                     # Нашли аккаунт
                     try:
-                        session_name = account["session_file"]
-                        session_string = account.get("session_string", "")
-                        client = await create_telegram_client(session_string, int(account["api_id"]), account["api_hash"], account.get("proxy"))
+                        session_path = account["session_file"]
+                        logger.info(f"Создание клиента Telegram, сессия: {session_path}")
+                        client = await create_telegram_client(session_path, int(account["api_id"]), account["api_hash"], account.get("proxy"))
                         
                         if account.get("proxy"):
                             client.set_proxy(account["proxy"])
@@ -873,8 +884,8 @@ async def verify_telegram_2fa(request: Request):
                         save_users(users_data)
                         
                         # Сохраняем строку сессии после успешной 2FA авторизации
-                        session_string = client.session.save()
-                        account["session_string"] = session_string
+                        session_path = client.session.save()
+                        account["session_file"] = session_path
                         logger.info("Обновлена строка сессии после 2FA авторизации")
                         
                         return {"status": "success"}
@@ -922,13 +933,13 @@ async def delete_telegram_account_endpoint(request: Request, phone: str):
         raise HTTPException(404, "Аккаунт с указанным номером телефона не найден")
     
     # Удаляем файл сессии, если он есть
-    session_name = account_data.get("session_file")
-    if session_name:
-        session_path = f"{session_name}.session"
+    session_path = account_data.get("session_file")
+    if session_path:
+        session_path = f"{session_path}.session"
         if os.path.exists(session_path):
             os.remove(session_path)
         # Проверяем, пуста ли директория пользователя, и если да, удаляем её
-        user_dir = os.path.dirname(session_name)
+        user_dir = os.path.dirname(session_path)
         if os.path.exists(user_dir) and not os.listdir(user_dir):
             os.rmdir(user_dir)
             logger.info(f"Удалена пустая директория: {user_dir}")
@@ -1060,11 +1071,11 @@ async def regenerate_api_key(user_id: str, request: Request):
     return {"api_key": new_api_key, "status": "success"}
 
 # Функция для создания Telegram клиента
-async def create_telegram_client(session_name, api_id, api_hash, proxy=None):
-    """Создает и настраивает клиент Telegram с StringSession"""
-    # Используем StringSession вместо файловой сессии
+async def create_telegram_client(session_path, api_id, api_hash, proxy=None):
+    """Создает и настраивает клиент Telegram с файловой сессией"""
+    # Используем файловую сессию вместо StringSession
     client = TelegramClient(
-        StringSession(session_name if session_name else ""),
+        session_path,  # Путь к файлу сессии
         api_id,
         api_hash
     )
@@ -1073,6 +1084,233 @@ async def create_telegram_client(session_name, api_id, api_hash, proxy=None):
         client.set_proxy(proxy)
         
     return client
+
+@app.post("/api/telegram/check-connection")
+async def check_telegram_connection(request: Request):
+    """Проверяет соединение Telegram аккаунта с серверами."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    admin_key = auth_header.split(' ')[1]
+    
+    # Проверяем админ-ключ
+    if not await verify_admin_key(admin_key):
+        raise HTTPException(401, "Неверный админ-ключ")
+    
+    data = await request.json()
+    account_id = data.get('account_id')
+    
+    if not account_id:
+        raise HTTPException(400, "ID аккаунта не указан")
+    
+    # Загружаем пользователей
+    users_data = load_users()
+    
+    # Ищем аккаунт по ID
+    found = False
+    
+    for user_id, user_info in users_data.items():
+        if "telegram_accounts" in user_info:
+            for account in user_info["telegram_accounts"]:
+                if account.get("id") == account_id:
+                    # Нашли аккаунт
+                    found = True
+                    try:
+                        # Создаем клиент
+                        session_path = account.get("session_file")
+                        client = await create_telegram_client(session_path, int(account["api_id"]), account["api_hash"], account.get("proxy"))
+                        
+                        # Подключаемся
+                        await client.connect()
+                        
+                        # Проверяем авторизацию
+                        is_authorized = await client.is_user_authorized()
+                        
+                        # Если авторизованы, запрашиваем информацию о себе
+                        connection_details = {}
+                        if is_authorized:
+                            try:
+                                me = await client.get_me()
+                                connection_details = {
+                                    "id": me.id,
+                                    "username": me.username,
+                                    "first_name": me.first_name,
+                                    "last_name": me.last_name,
+                                    "phone": me.phone
+                                }
+                            except Exception as e:
+                                logger.error(f"Ошибка при получении данных пользователя: {str(e)}")
+                                connection_details = {"error": str(e)}
+                        
+                        # Отключаемся
+                        await client.disconnect()
+                        
+                        # Если статус аккаунта не соответствует результату проверки, обновляем его
+                        if is_authorized and account["status"] != "active":
+                            account["status"] = "active"
+                            save_users(users_data)
+                            logger.info(f"Статус аккаунта {account_id} обновлен на 'active'")
+                        elif not is_authorized and account["status"] == "active":
+                            account["status"] = "pending"
+                            save_users(users_data)
+                            logger.info(f"Статус аккаунта {account_id} обновлен на 'pending'")
+                        
+                        return {
+                            "account_id": account_id,
+                            "is_connected": True,
+                            "is_authorized": is_authorized,
+                            "details": connection_details
+                        }
+                    except Exception as e:
+                        logger.error(f"Ошибка при проверке соединения: {str(e)}")
+                        
+                        # Обновляем статус при ошибке
+                        if account["status"] == "active":
+                            account["status"] = "error"
+                            account["error"] = str(e)
+                            save_users(users_data)
+                            logger.info(f"Статус аккаунта {account_id} обновлен на 'error'")
+                        
+                        return {
+                            "account_id": account_id,
+                            "is_connected": False,
+                            "error": str(e)
+                        }
+    
+    if not found:
+        raise HTTPException(404, "Аккаунт не найден")
+
+@app.post("/api/telegram/send-code")
+async def send_telegram_code(request: Request):
+    """Отправляет код авторизации на существующий аккаунт Telegram."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    admin_key = auth_header.split(' ')[1]
+    
+    # Проверяем админ-ключ
+    if not await verify_admin_key(admin_key):
+        raise HTTPException(401, "Неверный админ-ключ")
+    
+    data = await request.json()
+    account_id = data.get('account_id')
+    
+    if not account_id:
+        raise HTTPException(400, "ID аккаунта не указан")
+    
+    # Загружаем пользователей
+    users_data = load_users()
+    
+    # Ищем аккаунт по ID
+    found = False
+    
+    for user_id, user_info in users_data.items():
+        if "telegram_accounts" in user_info:
+            for account in user_info["telegram_accounts"]:
+                if account.get("id") == account_id:
+                    # Нашли аккаунт
+                    found = True
+                    try:
+                        # Создаем клиент
+                        session_path = account.get("session_file")
+                        logger.info(f"Создаем клиент с сессией {session_path}")
+                        client = await create_telegram_client(session_path, int(account["api_id"]), account["api_hash"], account.get("proxy"))
+                        
+                        # Подключаемся
+                        logger.info(f"Подключаемся к серверам Telegram")
+                        await client.connect()
+                        
+                        # Отправляем запрос на код авторизации
+                        phone = account["phone"]
+                        logger.info(f"Отправка запроса на код авторизации для номера {phone}")
+                        
+                        try:
+                            result = await client.send_code_request(phone)
+                            logger.info(f"Запрос на код авторизации успешно отправлен")
+                            
+                            # Получаем и сохраняем phone_code_hash
+                            phone_code_hash = result.phone_code_hash
+                            logger.info(f"Получен phone_code_hash: {phone_code_hash}")
+                            
+                            # Обновляем phone_code_hash в данных аккаунта
+                            account["phone_code_hash"] = phone_code_hash
+                            save_users(users_data)
+                            
+                            # Отключаемся
+                            await client.disconnect()
+                            
+                            return {
+                                "success": True,
+                                "account_id": account_id,
+                                "phone": phone,
+                                "phone_code_hash": phone_code_hash
+                            }
+                        except AuthRestartError as restart_error:
+                            # Обрабатываем ошибку AuthRestartError - переподключаемся и пробуем снова
+                            logger.warning(f"Получена ошибка авторизации, перезапускаем процесс: {str(restart_error)}")
+                            
+                            # Отключаемся, если соединение еще активно
+                            try:
+                                await client.disconnect()
+                            except:
+                                pass
+                                
+                            # Удалим файл сессии и создадим новый клиент
+                            session_file = f"{session_path}.session"
+                            if os.path.exists(session_file):
+                                try:
+                                    os.remove(session_file)
+                                    logger.info(f"Удален старый файл сессии: {session_file}")
+                                except:
+                                    logger.warning(f"Не удалось удалить файл сессии: {session_file}")
+                            
+                            # Создаем новый клиент с чистой сессией
+                            logger.info("Создаем новый клиент после ошибки авторизации")
+                            client = await create_telegram_client(session_path, int(account["api_id"]), account["api_hash"], account.get("proxy"))
+                            
+                            # Подключаемся снова
+                            logger.info("Повторное подключение к Telegram")
+                            await client.connect()
+                            
+                            # Пробуем отправить запрос на код еще раз
+                            logger.info(f"Повторная отправка запроса на код для {phone}")
+                            result = await client.send_code_request(phone)
+                            logger.info(f"Повторный запрос на код успешно отправлен")
+                            
+                            # Получаем и сохраняем phone_code_hash
+                            phone_code_hash = result.phone_code_hash
+                            logger.info(f"Получен новый phone_code_hash: {phone_code_hash}")
+                            
+                            # Обновляем phone_code_hash в данных аккаунта
+                            account["phone_code_hash"] = phone_code_hash
+                            save_users(users_data)
+                            
+                            # Отключаемся
+                            await client.disconnect()
+                            
+                            return {
+                                "success": True,
+                                "account_id": account_id,
+                                "phone": phone,
+                                "phone_code_hash": phone_code_hash,
+                                "restarted": True
+                            }
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке кода авторизации: {str(e)}")
+                        # Убедимся, что клиент отключен в случае ошибки
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+                            
+                        return {
+                            "success": False,
+                            "error": str(e)
+                        }
+    
+    if not found:
+        raise HTTPException(404, "Аккаунт не найден")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))

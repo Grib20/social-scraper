@@ -3,6 +3,9 @@ let currentUser;
 // Переменные для хранения информации об аккаунте Telegram в процессе авторизации
 let currentTelegramAccountId = null;
 
+// Глобальная переменная для хранения phone_code_hash
+let currentPhoneCodeHash = null;
+
 // Функция для сохранения админ-ключа
 function saveAdminKey(adminKey) {
     // Сохраняем в localStorage
@@ -130,17 +133,28 @@ async function displayUsers() {
                 console.log('User data:', user); // Логирование данных для отладки
                 
                 const telegramAccountsHtml = user.telegram_accounts ? user.telegram_accounts.map(account => `
-                    <div class="account-item">
+                    <div class="account-item" data-account-id="${account.id}">
                         <div class="account-info">
                             <i class="fab fa-telegram"></i>
                             <span>${account.phone || 'Неизвестный'}</span>
-                            <span class="account-status ${account.status === 'active' ? 'status-active' : 'status-pending'}">
-                                ${account.status === 'active' ? 'Активен' : 'Ожидает авторизации'}
+                            <span class="account-status ${account.status === 'active' ? 'status-active' : account.status === 'error' ? 'status-error' : 'status-pending'}" 
+                                  title="${account.error || ''}">
+                                ${account.status === 'active' ? 'Активен' : account.status === 'error' ? 'Ошибка' : 'Ожидает авторизации'}
                             </span>
                         </div>
-                        <button onclick="deleteTelegramAccount('${user.id}', '${account.phone}')" class="delete-account-btn">
-                            <i class="fas fa-trash-alt"></i>
-                        </button>
+                        <div class="account-actions">
+                            <button onclick="checkTelegramConnection('${user.id}', '${account.id}')" class="check-connection-btn" title="Проверить подключение">
+                                <i class="fas fa-sync-alt"></i>
+                            </button>
+                            ${account.status !== 'active' ? `
+                            <button onclick="reauthorizeTelegramAccount('${user.id}', '${account.id}', '${account.phone}')" class="reauth-btn" title="Повторная авторизация">
+                                <i class="fas fa-key"></i>
+                            </button>
+                            ` : ''}
+                            <button onclick="deleteTelegramAccount('${user.id}', '${account.phone}')" class="delete-account-btn" title="Удалить аккаунт">
+                                <i class="fas fa-trash-alt"></i>
+                            </button>
+                        </div>
                     </div>
                 `).join('') : '';
                 
@@ -487,6 +501,57 @@ document.getElementById('addTelegramForm').addEventListener('submit', async (e) 
     }
 });
 
+// Функция для повторной авторизации аккаунта Telegram
+function reauthorizeTelegramAccount(userId, accountId, phone) {
+    // Сохраняем ID аккаунта для использования в других функциях
+    currentTelegramAccountId = accountId;
+    currentPhoneCodeHash = null; // Сбрасываем хеш кода
+    
+    // Открываем модальное окно и показываем форму аутентификации
+    const modal = document.getElementById('telegramModal');
+    modal.style.display = 'block';
+    
+    // Скрываем основную форму добавления и показываем блок авторизации
+    document.getElementById('addTelegramForm').style.display = 'none';
+    document.getElementById('telegramAuthBlock').style.display = 'block';
+    document.getElementById('authStatus').textContent = `Введите код подтверждения, отправленный на номер ${phone}`;
+    
+    // Отправляем запрос на код авторизации
+    const adminKey = getAdminKey();
+    if (adminKey) {
+        // Показываем индикатор загрузки в модальном окне
+        document.getElementById('authStatus').innerHTML = '<i class="fas fa-spinner fa-spin"></i> Отправка запроса на код авторизации...';
+        
+        fetch('/api/telegram/send-code', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${adminKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                account_id: accountId
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                document.getElementById('authStatus').textContent = `Код отправлен на номер ${phone}. Введите его ниже:`;
+                // Сохраняем phone_code_hash
+                if (data.phone_code_hash) {
+                    currentPhoneCodeHash = data.phone_code_hash;
+                    console.log('Получен phone_code_hash:', currentPhoneCodeHash);
+                }
+            } else {
+                document.getElementById('authStatus').textContent = `Ошибка: ${data.error || 'Не удалось отправить код'}`;
+            }
+        })
+        .catch(error => {
+            console.error('Ошибка при отправке запроса на код:', error);
+            document.getElementById('authStatus').textContent = 'Произошла ошибка при отправке запроса на код авторизации.';
+        });
+    }
+}
+
 // Обработчик кнопки подтверждения кода авторизации
 document.getElementById('submitAuthCode').addEventListener('click', async () => {
     const authCode = document.getElementById('auth_code').value.trim();
@@ -512,16 +577,24 @@ document.getElementById('submitAuthCode').addEventListener('click', async () => 
     submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Проверка...';
     
     try {
+        const payload = {
+            account_id: currentTelegramAccountId,
+            code: authCode
+        };
+        
+        // Если есть phone_code_hash, добавляем его в запрос
+        if (currentPhoneCodeHash) {
+            payload.phone_code_hash = currentPhoneCodeHash;
+            console.log('Отправляем phone_code_hash:', currentPhoneCodeHash);
+        }
+        
         const response = await fetch('/api/telegram/verify-code', {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${adminKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-                account_id: currentTelegramAccountId,
-                code: authCode
-            })
+            body: JSON.stringify(payload)
         });
         
         // Восстанавливаем кнопку
@@ -546,8 +619,44 @@ document.getElementById('submitAuthCode').addEventListener('click', async () => 
         } else {
             // Ошибка при проверке кода
             const error = await response.json();
-            statusElement.textContent = `Ошибка: ${error.detail || 'Неверный код авторизации'}`;
-            showNotification(`Ошибка: ${error.detail || 'Неверный код авторизации'}`, 'error');
+            const errorText = error.detail || 'Неверный код авторизации';
+            
+            // Проверяем сообщение об ошибке на истечение кода
+            if (errorText.includes('expired') || errorText.includes('Отсутствует код авторизации')) {
+                statusElement.textContent = 'Код истек или не был запрошен. Запрашиваем новый код...';
+                
+                // Автоматически запрашиваем новый код
+                try {
+                    const currentAccount = await getCurrentAccountInfo(currentTelegramAccountId);
+                    if (currentAccount && currentAccount.phone) {
+                        const sendCodeResult = await resendAuthorizationCode(currentTelegramAccountId);
+                        if (sendCodeResult.success) {
+                            statusElement.textContent = `Новый код отправлен на номер ${currentAccount.phone}. Введите его ниже:`;
+                            document.getElementById('auth_code').value = '';
+                            document.getElementById('auth_code').focus();
+                            
+                            // Сохраняем новый phone_code_hash
+                            if (sendCodeResult.phone_code_hash) {
+                                currentPhoneCodeHash = sendCodeResult.phone_code_hash;
+                                console.log('Получен новый phone_code_hash:', currentPhoneCodeHash);
+                            }
+                        } else {
+                            statusElement.textContent = `Ошибка: ${sendCodeResult.error || 'Не удалось отправить новый код'}`;
+                            showNotification(`Ошибка: ${sendCodeResult.error || 'Не удалось отправить новый код'}`, 'error');
+                        }
+                    } else {
+                        statusElement.textContent = 'Ошибка: Не удалось получить информацию об аккаунте';
+                        showNotification('Ошибка: Не удалось получить информацию об аккаунте', 'error');
+                    }
+                } catch (resendError) {
+                    console.error('Ошибка при отправке нового кода:', resendError);
+                    statusElement.textContent = 'Произошла ошибка при отправке нового кода';
+                    showNotification('Произошла ошибка при отправке нового кода', 'error');
+                }
+            } else {
+                statusElement.textContent = `Ошибка: ${errorText}`;
+                showNotification(`Ошибка: ${errorText}`, 'error');
+            }
         }
     } catch (error) {
         console.error('Ошибка при проверке кода авторизации:', error);
@@ -870,4 +979,125 @@ document.getElementById('addVkForm').addEventListener('submit', async (e) => {
         submitButton.disabled = false;
         submitButton.innerHTML = originalButtonText;
     }
-}); 
+});
+
+// Функция для проверки соединения с Telegram
+async function checkTelegramConnection(userId, accountId) {
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return;
+    }
+
+    // Показываем индикатор загрузки
+    const statusElement = document.querySelector(`[data-account-id="${accountId}"] .account-status`);
+    if (statusElement) {
+        const originalStatus = statusElement.innerHTML;
+        statusElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Проверка...';
+        
+        try {
+            const response = await fetch('/api/telegram/check-connection', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${adminKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    account_id: accountId
+                })
+            });
+
+            if (response.ok) {
+                const result = await response.json();
+                
+                if (result.is_connected && result.is_authorized) {
+                    showNotification('Подключение установлено успешно', 'success');
+                    statusElement.innerHTML = `<span class="status-active">Активен</span>`;
+                    statusElement.title = `Имя: ${result.details.first_name || ''} ${result.details.last_name || ''}\nUsername: ${result.details.username || 'Нет'}\nID: ${result.details.id || ''}`;
+                } else if (result.is_connected && !result.is_authorized) {
+                    showNotification('Подключение есть, но требуется авторизация', 'warning');
+                    statusElement.innerHTML = `<span class="status-pending">Требуется авторизация</span>`;
+                } else {
+                    showNotification(`Ошибка подключения: ${result.error || 'Неизвестная ошибка'}`, 'error');
+                    statusElement.innerHTML = `<span class="status-error">Ошибка</span>`;
+                    statusElement.title = result.error || 'Неизвестная ошибка';
+                }
+            } else {
+                const errorData = await response.json();
+                showNotification(`Ошибка: ${errorData.detail || 'Не удалось проверить подключение'}`, 'error');
+                statusElement.innerHTML = originalStatus;
+            }
+        } catch (error) {
+            console.error('Ошибка при проверке подключения:', error);
+            showNotification('Произошла ошибка при проверке подключения', 'error');
+            statusElement.innerHTML = originalStatus;
+        }
+    }
+}
+
+// Функция для получения информации о текущем аккаунте
+async function getCurrentAccountInfo(accountId) {
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return null;
+    }
+    
+    try {
+        const response = await fetch('/admin/users', {
+            headers: {
+                'X-Admin-Key': adminKey
+            }
+        });
+        
+        if (response.ok) {
+            const users = await response.json();
+            for (const user of users) {
+                if (user.telegram_accounts) {
+                    for (const account of user.telegram_accounts) {
+                        if (account.id === accountId) {
+                            return account;
+                        }
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Ошибка при получении информации об аккаунте:', error);
+    }
+    
+    return null;
+}
+
+// Функция для повторной отправки кода авторизации
+async function resendAuthorizationCode(accountId) {
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return { success: false, error: 'Необходима авторизация' };
+    }
+    
+    try {
+        const response = await fetch('/api/telegram/send-code', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${adminKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                account_id: accountId
+            })
+        });
+        
+        if (response.ok) {
+            const result = await response.json();
+            return { success: true, ...result };
+        } else {
+            const error = await response.json();
+            return { success: false, error: error.detail || 'Не удалось отправить код' };
+        }
+    } catch (error) {
+        console.error('Ошибка при отправке кода:', error);
+        return { success: false, error: 'Ошибка при отправке запроса' };
+    }
+} 
