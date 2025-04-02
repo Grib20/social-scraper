@@ -197,11 +197,13 @@ async def get_all_users() -> List[Dict]:
     return [
         {
             "api_key": api_key,
-            "username": user_data["username"],
-            "created_at": user_data["created_at"],
-            "last_used": user_data["last_used"],
+            "username": user_data.get("username", "Неизвестно"),
+            "password": user_data.get("password", ""),
+            "created_at": user_data.get("created_at", ""),
+            "last_used": user_data.get("last_used"),
             "telegram_accounts": user_data.get("telegram_accounts", []),
-            "vk_accounts": user_data.get("vk_accounts", [])
+            "vk_accounts": user_data.get("vk_accounts", []),
+            "vk_token": user_data.get("vk_token")
         }
         for api_key, user_data in users.items()
     ]

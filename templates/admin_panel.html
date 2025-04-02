@@ -266,6 +266,49 @@
         display: flex;
         gap: 10px;
     }
+    .accounts-info {
+        margin-top: 15px;
+        border-top: 1px solid #eee;
+        padding-top: 15px;
+    }
+
+    .accounts-info h4 {
+        color: #333;
+        margin: 10px 0;
+        font-size: 16px;
+    }
+
+    .accounts-info ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+    }
+
+    .accounts-info li {
+        background: #f8f9fa;
+        padding: 10px;
+        margin-bottom: 10px;
+        border-radius: 4px;
+        border: 1px solid #ddd;
+    }
+
+    .btn-sm {
+        padding: 4px 8px;
+        font-size: 12px;
+        margin-top: 5px;
+    }
+
+    .no-users {
+        text-align: center;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 8px;
+        color: #666;
+    }
+
+    .telegram-accounts, .vk-accounts {
+        margin-bottom: 20px;
+    }
 </style>
 {% endblock %}
 
@@ -655,9 +698,14 @@
 
     function displayUsers(users) {
         const container = document.getElementById('usersList');
+        if (!users || users.length === 0) {
+            container.innerHTML = '<div class="no-users">Нет зарегистрированных пользователей</div>';
+            return;
+        }
+
         container.innerHTML = users.map(user => `
             <div class="user-card">
-                <h3>${user.username}</h3>
+                <h3>${user.username || 'Неизвестно'}</h3>
                 <div class="user-info">
                     <p><strong>API ключ:</strong> 
                         <span class="api-key">
@@ -665,15 +713,46 @@
                             <button class="copy-btn" onclick="showApiKey('${user.api_key}')">Показать</button>
                         </span>
                     </p>
-                    <p><strong>Создан:</strong> ${new Date(user.created_at).toLocaleString()}</p>
+                    <p><strong>Создан:</strong> ${user.created_at ? new Date(user.created_at).toLocaleString() : 'Не указано'}</p>
                     <p><strong>Последнее использование:</strong> ${user.last_used ? new Date(user.last_used).toLocaleString() : 'Нет'}</p>
-                    <p><strong>Telegram аккаунтов:</strong> ${user.telegram_accounts.length}</p>
-                    <p><strong>VK аккаунтов:</strong> ${user.vk_accounts.length}</p>
+                    <p><strong>VK токен:</strong> ${user.vk_token ? 'Установлен' : 'Не установлен'}</p>
+                    <div class="accounts-info">
+                        <div class="telegram-accounts">
+                            <h4>Telegram аккаунты (${user.telegram_accounts.length}):</h4>
+                            ${user.telegram_accounts.length > 0 ? `
+                                <ul>
+                                    ${user.telegram_accounts.map(acc => `
+                                        <li>
+                                            Телефон: ${acc.phone}<br>
+                                            Статус: ${acc.status || 'Активен'}<br>
+                                            ${acc.proxy ? `Прокси: ${acc.proxy}<br>` : ''}
+                                            <button class="btn btn-danger btn-sm" onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')">Удалить</button>
+                                        </li>
+                                    `).join('')}
+                                </ul>
+                            ` : '<p>Нет аккаунтов</p>'}
+                        </div>
+                        <div class="vk-accounts">
+                            <h4>VK аккаунты (${user.vk_accounts.length}):</h4>
+                            ${user.vk_accounts.length > 0 ? `
+                                <ul>
+                                    ${user.vk_accounts.map(acc => `
+                                        <li>
+                                            Токен: ${acc.token.substring(0, 8)}...<br>
+                                            Статус: ${acc.status || 'Активен'}<br>
+                                            ${acc.proxy ? `Прокси: ${acc.proxy}<br>` : ''}
+                                            <button class="btn btn-danger btn-sm" onclick="deleteVkAccount('${user.api_key}', '${acc.id}')">Удалить</button>
+                                        </li>
+                                    `).join('')}
+                                </ul>
+                            ` : '<p>Нет аккаунтов</p>'}
+                        </div>
+                    </div>
                 </div>
                 <div class="user-actions">
                     <button class="btn btn-primary" onclick="showTelegramModal('${user.api_key}')">Добавить Telegram</button>
                     <button class="btn btn-primary" onclick="showVkModal('${user.api_key}')">Добавить VK</button>
-                    <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить</button>
+                    <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить пользователя</button>
                 </div>
             </div>
         `).join('');
