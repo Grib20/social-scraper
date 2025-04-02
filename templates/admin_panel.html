@@ -309,6 +309,50 @@
     .telegram-accounts, .vk-accounts {
         margin-bottom: 20px;
     }
+
+    .account-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+    }
+
+    .account-details {
+        font-size: 14px;
+        color: #666;
+        margin-bottom: 10px;
+    }
+
+    .account-details p {
+        margin: 5px 0;
+    }
+
+    .status {
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: bold;
+    }
+
+    .status-active {
+        background-color: #28a745;
+        color: white;
+    }
+
+    .status-degraded {
+        background-color: #ffc107;
+        color: black;
+    }
+
+    .status-cooldown {
+        background-color: #dc3545;
+        color: white;
+    }
+
+    .account-phone, .account-token {
+        font-weight: bold;
+        color: #333;
+    }
 </style>
 {% endblock %}
 
@@ -696,79 +740,94 @@
         }
     }
 
+    function getStatusText(status) {
+        switch(status) {
+            case 'active':
+                return 'Активный';
+            case 'degraded':
+                return 'Ограничен';
+            case 'cooldown':
+                return 'Охлаждение';
+            default:
+                return 'Неизвестно';
+        }
+    }
+
     function displayUsers(users) {
-        const container = document.getElementById('usersList');
-        if (!users || users.length === 0) {
-            container.innerHTML = '<div class="no-users">Нет зарегистрированных пользователей</div>';
+        const userList = document.getElementById('usersList');
+        userList.innerHTML = '';
+
+        if (Object.keys(users).length === 0) {
+            userList.innerHTML = '<p>Нет зарегистрированных пользователей</p>';
             return;
         }
 
-        container.innerHTML = users.map(user => `
-            <div class="user-card">
-                <h3>${user.username || 'Неизвестно'}</h3>
+        for (const [apiKey, userData] of Object.entries(users)) {
+            const userDiv = document.createElement('div');
+            userDiv.className = 'user-card';
+            
+            const username = userData.username || 'Неизвестно';
+            const createdAt = userData.created_at ? new Date(userData.created_at).toLocaleString() : 'Неизвестно';
+            const lastUsed = userData.last_used ? new Date(userData.last_used).toLocaleString() : 'Никогда';
+            
+            userDiv.innerHTML = `
+                <h3>${username}</h3>
                 <div class="user-info">
                     <p><strong>API ключ:</strong> 
                         <span class="api-key">
-                            ${user.api_key.substring(0, 8)}...
-                            <button class="copy-btn" onclick="showApiKey('${user.api_key}')">Показать</button>
+                            ${apiKey.substring(0, 8)}...
+                            <button class="copy-btn" onclick="showApiKey('${apiKey}')">Показать</button>
                         </span>
                     </p>
-                    <p><strong>Создан:</strong> ${user.created_at ? new Date(user.created_at).toLocaleString() : 'Не указано'}</p>
-                    <p><strong>Последнее использование:</strong> ${user.last_used ? new Date(user.last_used).toLocaleString() : 'Нет'}</p>
-                    <p><strong>VK токен:</strong> ${user.vk_token ? 'Установлен' : 'Не установлен'}</p>
+                    <p><strong>Создан:</strong> ${createdAt}</p>
+                    <p><strong>Последнее использование:</strong> ${lastUsed}</p>
+                    
                     <div class="accounts-info">
                         <div class="telegram-accounts">
-                            <h4>Telegram аккаунты (${user.telegram_accounts.length}):</h4>
-                            ${user.telegram_accounts.length > 0 ? `
-                                <ul>
-                                    ${user.telegram_accounts.map(acc => `
-                                        <li>
-                                            Телефон: ${acc.phone}<br>
-                                            Статус: ${acc.status || 'Активен'}<br>
-                                            ${acc.proxy ? `Прокси: ${acc.proxy}<br>` : ''}
-                                            <button class="btn btn-danger btn-sm" onclick="deleteTelegramAccount('${user.api_key}', '${acc.id}')">Удалить</button>
-                                        </li>
-                                    `).join('')}
-                                </ul>
-                            ` : '<p>Нет аккаунтов</p>'}
+                            <div class="account-header">
+                                <h4>Telegram аккаунты (${userData.telegram_accounts ? Object.keys(userData.telegram_accounts).length : 0})</h4>
+                                <button onclick="addTelegramAccount('${apiKey}')">Добавить аккаунт</button>
+                            </div>
+                            ${userData.telegram_accounts ? Object.entries(userData.telegram_accounts).map(([accountId, account]) => `
+                                <div class="account-details">
+                                    <div class="account-header">
+                                        <span class="account-phone">${account.phone}</span>
+                                        <span class="status status-${account.status}">${getStatusText(account.status)}</span>
+                                    </div>
+                                    <p>Прокси: ${account.proxy || 'Нет'}</p>
+                                    <p>Запросов: ${account.requests_made || 0}</p>
+                                    <button onclick="deleteTelegramAccount('${apiKey}', '${accountId}')">Удалить</button>
+                                </div>
+                            `).join('') : '<p>Нет аккаунтов</p>'}
                         </div>
+                        
                         <div class="vk-accounts">
-                            <h4>VK аккаунты (${user.vk_accounts.length}):</h4>
-                            ${user.vk_accounts.length > 0 ? `
-                                <ul>
-                                    ${user.vk_accounts.map(acc => `
-                                        <li>
-                                            Токен: ${acc.token.substring(0, 8)}...<br>
-                                            Статус: ${acc.status || 'Активен'}<br>
-                                            ${acc.proxy ? `Прокси: ${acc.proxy}<br>` : ''}
-                                            <button class="btn btn-danger btn-sm" onclick="deleteVkAccount('${user.api_key}', '${acc.id}')">Удалить</button>
-                                        </li>
-                                    `).join('')}
-                                </ul>
-                            ` : '<p>Нет аккаунтов</p>'}
+                            <div class="account-header">
+                                <h4>VK аккаунты (${userData.vk_accounts ? Object.keys(userData.vk_accounts).length : 0})</h4>
+                                <button onclick="addVkAccount('${apiKey}')">Добавить аккаунт</button>
+                            </div>
+                            ${userData.vk_accounts ? Object.entries(userData.vk_accounts).map(([accountId, account]) => `
+                                <div class="account-details">
+                                    <div class="account-header">
+                                        <span class="account-token">${account.token.substring(0, 10)}...</span>
+                                        <span class="status status-${account.status}">${getStatusText(account.status)}</span>
+                                    </div>
+                                    <p>Прокси: ${account.proxy || 'Нет'}</p>
+                                    <p>Запросов: ${account.requests_made || 0}</p>
+                                    <button onclick="deleteVkAccount('${apiKey}', '${accountId}')">Удалить</button>
+                                </div>
+                            `).join('') : '<p>Нет аккаунтов</p>'}
                         </div>
                     </div>
                 </div>
                 <div class="user-actions">
-                    <button class="btn btn-primary" onclick="showTelegramModal('${user.api_key}')">Добавить Telegram</button>
-                    <button class="btn btn-primary" onclick="showVkModal('${user.api_key}')">Добавить VK</button>
-                    <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить пользователя</button>
+                    <button class="btn btn-primary" onclick="showTelegramModal('${apiKey}')">Добавить Telegram</button>
+                    <button class="btn btn-primary" onclick="showVkModal('${apiKey}')">Добавить VK</button>
+                    <button class="btn btn-danger" onclick="deleteUser('${apiKey}')">Удалить пользователя</button>
                 </div>
-            </div>
-        `).join('');
-    }
-
-    // Вспомогательная функция для определения класса статуса
-    function getStatusClass(status) {
-        switch (status) {
-            case 'active':
-                return 'status-active';
-            case 'degraded':
-                return 'status-degraded';
-            case 'cooldown':
-                return 'status-cooldown';
-            default:
-                return '';
+            `;
+            
+            userList.appendChild(userDiv);
         }
     }
 
