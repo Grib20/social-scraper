@@ -212,34 +212,39 @@ async def admin_update_vk_token(api_key: str, vk_token: str):
 @app.post("/register")
 async def register(request: Request):
     """Регистрирует нового пользователя."""
-    admin_key = request.headers.get("X-Admin-Key")
-    if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
-        raise HTTPException(401, "Неверный админ-ключ")
-    
-    data = await request.json()
-    username = data.get("username")
-    password = data.get("password")
-    
-    if not username or not password:
-        raise HTTPException(400, "Имя пользователя и пароль обязательны")
-    
-    api_key = str(uuid.uuid4())
-    users = load_users()
-    
-    if api_key in users:
-        raise HTTPException(400, "Ошибка генерации API ключа")
-    
-    users[api_key] = {
-        "username": username,
-        "password": password,
-        "created_at": datetime.now().isoformat(),
-        "last_used": None,
-        "telegram_accounts": [],
-        "vk_accounts": []
-    }
-    
-    save_users(users)
-    return {"api_key": api_key, "message": "Пользователь успешно зарегистрирован"}
+    try:
+        admin_key = request.headers.get("X-Admin-Key")
+        if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
+            raise HTTPException(status_code=401, detail="Неверный админ-ключ")
+        
+        data = await request.json()
+        username = data.get("username")
+        password = data.get("password")
+        
+        if not username or not password:
+            raise HTTPException(status_code=400, detail="Имя пользователя и пароль обязательны")
+        
+        api_key = str(uuid.uuid4())
+        users = load_users()
+        
+        if api_key in users:
+            raise HTTPException(status_code=400, detail="Ошибка генерации API ключа")
+        
+        users[api_key] = {
+            "username": username,
+            "password": password,
+            "created_at": datetime.now().isoformat(),
+            "last_used": None,
+            "telegram_accounts": [],
+            "vk_accounts": []
+        }
+        
+        save_users(users)
+        return {"api_key": api_key, "message": "Пользователь успешно зарегистрирован"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/set-vk-token")
 async def set_token(request: Request, data: dict):

@@ -484,10 +484,11 @@
                 showApiKey(data.api_key);
                 await loadUsers();
             } else {
-                resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail}</div>`;
+                resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail || 'Неизвестная ошибка'}</div>`;
             }
         } catch (error) {
-            resultDiv.innerHTML = `<div class="error">Ошибка: ${error.message}</div>`;
+            console.error('Ошибка регистрации:', error);
+            resultDiv.innerHTML = '<div class="error">Ошибка при регистрации пользователя</div>';
         }
     }
 
