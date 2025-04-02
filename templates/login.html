@@ -98,9 +98,25 @@
             });
 
             if (response.ok) {
-                // Сохраняем ключ и перенаправляем на админ-панель
+                // Сохраняем ключ
                 localStorage.setItem('adminKey', adminKey);
-                window.location.href = `${BASE_URL}/admin`;
+                
+                // Делаем запрос на /admin с админ-ключом
+                const adminResponse = await fetch(`${BASE_URL}/admin`, {
+                    headers: {
+                        'X-Admin-Key': adminKey
+                    }
+                });
+                
+                if (adminResponse.ok) {
+                    // Получаем HTML страницы
+                    const html = await adminResponse.text();
+                    // Заменяем содержимое текущей страницы
+                    document.documentElement.innerHTML = html;
+                } else {
+                    document.getElementById('loginResult').innerHTML = 
+                        '<div class="error">Ошибка доступа к админ-панели</div>';
+                }
             } else {
                 document.getElementById('loginResult').innerHTML = 
                     '<div class="error">Неверный админ-ключ</div>';
