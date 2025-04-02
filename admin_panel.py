@@ -148,41 +148,63 @@ async def delete_vk_account(api_key: str, account_id: str) -> bool:
     return True
 
 # Функции для работы с пользователями
+async def register_user(username: str, password: str) -> str:
+    """Регистрирует нового пользователя."""
+    api_key = str(uuid.uuid4())
+    users = load_users()
+    
+    if api_key in users:
+        raise HTTPException(400, "Ошибка генерации API ключа")
+    
+    users[api_key] = {
+        "username": username,
+        "password": password,
+        "created_at": datetime.now().isoformat(),
+        "last_used": None,
+        "telegram_accounts": [],
+        "vk_accounts": []
+    }
+    
+    save_users(users)
+    return api_key
+
+async def get_user(api_key: str) -> Optional[Dict]:
+    """Получает информацию о пользователе."""
+    users = load_users()
+    if api_key not in users:
+        raise HTTPException(404, "Пользователь не найден")
+    return users[api_key]
+
+async def delete_user(api_key: str) -> bool:
+    """Удаляет пользователя."""
+    users = load_users()
+    if api_key not in users:
+        raise HTTPException(404, "Пользователь не найден")
+    
+    # Удаляем файлы сессий Telegram
+    user_data = users[api_key]
+    for account in user_data.get("telegram_accounts", []):
+        if account.get("session_file") and os.path.exists(account["session_file"]):
+            os.remove(account["session_file"])
+    
+    del users[api_key]
+    save_users(users)
+    return True
+
 async def get_all_users() -> List[Dict]:
     """Получает список всех пользователей."""
     users = load_users()
     return [
         {
             "api_key": api_key,
+            "username": user_data["username"],
+            "created_at": user_data["created_at"],
+            "last_used": user_data["last_used"],
             "telegram_accounts": user_data.get("telegram_accounts", []),
-            "vk_accounts": user_data.get("vk_accounts", []),
-            "created_at": user_data.get("created_at"),
-            "last_used": user_data.get("last_used")
+            "vk_accounts": user_data.get("vk_accounts", [])
         }
         for api_key, user_data in users.items()
     ]
-
-async def get_user(api_key: str) -> Optional[Dict]:
-    """Получает информацию о конкретном пользователе."""
-    users = load_users()
-    if api_key not in users:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    return {
-        "api_key": api_key,
-        "telegram_accounts": users[api_key].get("telegram_accounts", []),
-        "vk_accounts": users[api_key].get("vk_accounts", []),
-        "created_at": users[api_key].get("created_at"),
-        "last_used": users[api_key].get("last_used")
-    }
-
-async def delete_user(api_key: str) -> bool:
-    """Удаляет пользователя."""
-    users = load_users()
-    if api_key not in users:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    del users[api_key]
-    save_users(users)
-    return True
 
 async def get_system_stats() -> Dict:
     """Получает статистику системы."""

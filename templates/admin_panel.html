@@ -169,6 +169,86 @@
     .btn-add:hover {
         background-color: #218838;
     }
+
+    .users-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 20px;
+    }
+    .user-card {
+        background-color: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #ddd;
+    }
+    .user-card h3 {
+        margin-top: 0;
+        margin-bottom: 10px;
+        color: #333;
+    }
+    .user-info {
+        margin-bottom: 10px;
+    }
+    .user-info p {
+        margin: 5px 0;
+    }
+    .api-key {
+        background-color: #e9ecef;
+        padding: 8px;
+        border-radius: 4px;
+        font-family: monospace;
+        margin: 10px 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .copy-btn {
+        background-color: #28a745;
+        color: white;
+        border: none;
+        padding: 4px 8px;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+    .copy-btn:hover {
+        background-color: #218838;
+    }
+    .modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-color: rgba(0,0,0,0.5);
+        z-index: 1000;
+    }
+    .modal-content {
+        position: relative;
+        background-color: white;
+        margin: 15% auto;
+        padding: 20px;
+        width: 80%;
+        max-width: 500px;
+        border-radius: 8px;
+    }
+    .close {
+        position: absolute;
+        right: 20px;
+        top: 10px;
+        font-size: 28px;
+        cursor: pointer;
+    }
+    .error {
+        color: #dc3545;
+        margin-top: 10px;
+        text-align: center;
+    }
+    .success {
+        color: #28a745;
+        margin-top: 10px;
+        text-align: center;
+    }
 </style>
 {% endblock %}
 
@@ -203,8 +283,16 @@
                     <input type="text" id="telegramApiHash" placeholder="Введите API Hash">
                 </div>
                 <div class="form-group">
+                    <label>Номер телефона:</label>
+                    <input type="text" id="telegramPhone" required>
+                </div>
+                <div class="form-group">
                     <label>Прокси (опционально):</label>
                     <input type="text" id="telegramProxy" placeholder="socks5://user:pass@host:port">
+                </div>
+                <div class="form-group">
+                    <label>Файл сессии (опционально):</label>
+                    <input type="file" id="telegramSession" accept=".session">
                 </div>
                 <button class="btn btn-add" onclick="addTelegramAccount()">Добавить Telegram аккаунт</button>
             </div>
@@ -226,31 +314,78 @@
 
     <div class="section">
         <h2>Пользователи</h2>
-        <div id="usersList">
-            <table>
-                <thead>
-                    <tr>
-                        <th>API Ключ</th>
-                        <th>Создан</th>
-                        <th>Последняя активность</th>
-                        <th>Telegram аккаунты</th>
-                        <th>VK аккаунты</th>
-                        <th>Действия</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td colspan="6" style="text-align: center;">Загрузка...</td>
-                    </tr>
-                </tbody>
-            </table>
+        <div id="usersList" class="users-list">
+            <!-- Здесь будут отображаться пользователи -->
         </div>
+    </div>
+</div>
+
+<!-- Модальное окно для отображения API ключа -->
+<div id="apiKeyModal" class="modal">
+    <div class="modal-content">
+        <span class="close" onclick="closeApiKeyModal()">&times;</span>
+        <h2>API ключ пользователя</h2>
+        <div class="api-key">
+            <span id="apiKeyText"></span>
+            <button class="copy-btn" onclick="copyApiKey()">Копировать</button>
+        </div>
+        <button class="btn btn-primary" onclick="closeApiKeyModal()">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модальное окно для добавления Telegram аккаунта -->
+<div id="telegramModal" class="modal">
+    <div class="modal-content">
+        <span class="close" onclick="closeTelegramModal()">&times;</span>
+        <h2>Добавить Telegram аккаунт</h2>
+        <div class="form-group">
+            <label>API ID:</label>
+            <input type="text" id="telegramApiId" required>
+        </div>
+        <div class="form-group">
+            <label>API Hash:</label>
+            <input type="text" id="telegramApiHash" required>
+        </div>
+        <div class="form-group">
+            <label>Номер телефона:</label>
+            <input type="text" id="telegramPhone" required>
+        </div>
+        <div class="form-group">
+            <label>Прокси (опционально):</label>
+            <input type="text" id="telegramProxy" placeholder="socks5://user:pass@host:port">
+        </div>
+        <div class="form-group">
+            <label>Файл сессии (опционально):</label>
+            <input type="file" id="telegramSession" accept=".session">
+        </div>
+        <button class="btn btn-primary" onclick="addTelegramAccount()">Добавить</button>
+        <div id="telegramResult"></div>
+    </div>
+</div>
+
+<!-- Модальное окно для добавления VK аккаунта -->
+<div id="vkModal" class="modal">
+    <div class="modal-content">
+        <span class="close" onclick="closeVkModal()">&times;</span>
+        <h2>Добавить VK аккаунт</h2>
+        <div class="form-group">
+            <label>Access Token:</label>
+            <input type="text" id="vkToken" required>
+        </div>
+        <div class="form-group">
+            <label>Прокси (опционально):</label>
+            <input type="text" id="vkProxy" placeholder="socks5://user:pass@host:port">
+        </div>
+        <button class="btn btn-primary" onclick="addVkAccount()">Добавить</button>
+        <div id="vkResult"></div>
     </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
+    let currentUser = null;
+
     // Проверяем наличие админ-ключа при загрузке
     const adminKey = localStorage.getItem('adminKey');
     if (!adminKey) {
@@ -332,54 +467,33 @@
             }
 
             const users = await response.json();
-            let usersHtml = '';
-            
-            for (const user of users) {
-                const created = new Date(user.created_at).toLocaleString();
-                const lastActive = user.last_active ? new Date(user.last_active).toLocaleString() : 'Никогда';
-                
-                usersHtml += `
-                    <tr data-api-key="${user.api_key}" onclick="selectUser('${user.api_key}')">
-                        <td>${user.api_key}</td>
-                        <td>${created}</td>
-                        <td>${lastActive}</td>
-                        <td>
-                            ${user.telegram_accounts ? user.telegram_accounts.length : 0}
-                            <span class="status ${getStatusClass(user.telegram_status)}">
-                                ${user.telegram_status}
-                            </span>
-                        </td>
-                        <td>
-                            ${user.vk_accounts ? user.vk_accounts.length : 0}
-                            <span class="status ${getStatusClass(user.vk_status)}">
-                                ${user.vk_status}
-                            </span>
-                        </td>
-                        <td class="actions">
-                            <button class="btn btn-edit" onclick="editUser('${user.api_key}')">
-                                Редактировать
-                            </button>
-                            <button class="btn btn-delete" onclick="deleteUser('${user.api_key}')">
-                                Удалить
-                            </button>
-                        </td>
-                    </tr>
-                `;
-            }
-
-            document.querySelector('#usersList tbody').innerHTML = usersHtml || `
-                <tr>
-                    <td colspan="6" style="text-align: center;">Нет пользователей</td>
-                </tr>
-            `;
+            displayUsers(users);
         } catch (error) {
             console.error('Error loading users:', error);
-            document.querySelector('#usersList tbody').innerHTML = `
-                <tr>
-                    <td colspan="6" style="text-align: center;">Ошибка загрузки пользователей</td>
-                </tr>
+            document.querySelector('#usersList').innerHTML = `
+                <div class="error">Ошибка загрузки пользователей</div>
             `;
         }
+    }
+
+    function displayUsers(users) {
+        const container = document.getElementById('usersList');
+        container.innerHTML = users.map(user => `
+            <div class="user-card">
+                <h3>Пользователь</h3>
+                <div class="user-info">
+                    <p><strong>API ключ:</strong> ${user.api_key}</p>
+                    <p><strong>Создан:</strong> ${new Date(user.created_at).toLocaleString()}</p>
+                    <p><strong>Последнее использование:</strong> ${user.last_used ? new Date(user.last_used).toLocaleString() : 'Нет'}</p>
+                    <p><strong>Telegram аккаунтов:</strong> ${user.telegram_accounts.length}</p>
+                    <p><strong>VK аккаунтов:</strong> ${user.vk_accounts.length}</p>
+                </div>
+                <button class="btn btn-primary" onclick="showApiKey('${user.api_key}')">Показать API ключ</button>
+                <button class="btn btn-primary" onclick="showTelegramModal('${user.api_key}')">Добавить Telegram</button>
+                <button class="btn btn-primary" onclick="showVkModal('${user.api_key}')">Добавить VK</button>
+                <button class="btn btn-danger" onclick="deleteUser('${user.api_key}')">Удалить</button>
+            </div>
+        `).join('');
     }
 
     // Вспомогательная функция для определения класса статуса
@@ -433,44 +547,45 @@
     async function addTelegramAccount() {
         const apiId = document.getElementById('telegramApiId').value;
         const apiHash = document.getElementById('telegramApiHash').value;
+        const phone = document.getElementById('telegramPhone').value;
         const proxy = document.getElementById('telegramProxy').value;
+        const sessionFile = document.getElementById('telegramSession').files[0];
 
-        if (!apiId || !apiHash) {
-            alert('API ID и API Hash обязательны');
+        if (!apiId || !apiHash || !phone) {
+            document.getElementById('telegramResult').innerHTML = 
+                '<div class="error">Заполните обязательные поля</div>';
             return;
         }
 
+        const formData = new FormData();
+        formData.append('api_id', apiId);
+        formData.append('api_hash', apiHash);
+        formData.append('phone', phone);
+        if (proxy) formData.append('proxy', proxy);
+        if (sessionFile) formData.append('session_file', sessionFile);
+
         try {
-            const response = await fetch(`${BASE_URL}/admin/users/${selectedApiKey}/telegram-accounts`, {
+            const response = await fetch(`${BASE_URL}/admin/users/${currentUser}/telegram-accounts`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
                     'X-Admin-Key': adminKey
                 },
-                body: JSON.stringify({
-                    api_id: apiId,
-                    api_hash: apiHash,
-                    proxy: proxy || null
-                })
+                body: formData
             });
 
-            if (!response.ok) {
-                throw new Error('Ошибка добавления аккаунта');
+            if (response.ok) {
+                document.getElementById('telegramResult').innerHTML = 
+                    '<div class="success">Аккаунт успешно добавлен</div>';
+                closeTelegramModal();
+                loadUsers();
+            } else {
+                const error = await response.json();
+                document.getElementById('telegramResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.detail}</div>`;
             }
-
-            // Очищаем поля
-            document.getElementById('telegramApiId').value = '';
-            document.getElementById('telegramApiHash').value = '';
-            document.getElementById('telegramProxy').value = '';
-
-            // Обновляем данные
-            await loadSystemStats();
-            await loadUsers();
-
-            alert('Telegram аккаунт успешно добавлен');
         } catch (error) {
-            console.error('Error adding Telegram account:', error);
-            alert('Ошибка при добавлении Telegram аккаунта');
+            document.getElementById('telegramResult').innerHTML = 
+                `<div class="error">Ошибка: ${error.message}</div>`;
         }
     }
 
@@ -480,39 +595,37 @@
         const proxy = document.getElementById('vkProxy').value;
 
         if (!token) {
-            alert('Access Token обязателен');
+            document.getElementById('vkResult').innerHTML = 
+                '<div class="error">Введите токен VK</div>';
             return;
         }
 
         try {
-            const response = await fetch(`${BASE_URL}/admin/users/${selectedApiKey}/vk-accounts`, {
+            const response = await fetch(`${BASE_URL}/admin/users/${currentUser}/vk-accounts`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'X-Admin-Key': adminKey
+                    'X-Admin-Key': adminKey,
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
                     token: token,
-                    proxy: proxy || null
+                    proxy: proxy
                 })
             });
 
-            if (!response.ok) {
-                throw new Error('Ошибка добавления аккаунта');
+            if (response.ok) {
+                document.getElementById('vkResult').innerHTML = 
+                    '<div class="success">Аккаунт успешно добавлен</div>';
+                closeVkModal();
+                loadUsers();
+            } else {
+                const error = await response.json();
+                document.getElementById('vkResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.detail}</div>`;
             }
-
-            // Очищаем поля
-            document.getElementById('vkToken').value = '';
-            document.getElementById('vkProxy').value = '';
-
-            // Обновляем данные
-            await loadSystemStats();
-            await loadUsers();
-
-            alert('VK аккаунт успешно добавлен');
         } catch (error) {
-            console.error('Error adding VK account:', error);
-            alert('Ошибка при добавлении VK аккаунта');
+            document.getElementById('vkResult').innerHTML = 
+                `<div class="error">Ошибка: ${error.message}</div>`;
         }
     }
 
@@ -521,13 +634,49 @@
     function selectUser(apiKey) {
         selectedApiKey = apiKey;
         // Подсвечиваем выбранного пользователя
-        document.querySelectorAll('#usersList tr').forEach(tr => {
-            if (tr.dataset.apiKey === apiKey) {
-                tr.classList.add('selected');
+        document.querySelectorAll('#usersList .user-card').forEach(card => {
+            if (card.dataset.apiKey === apiKey) {
+                card.classList.add('selected');
             } else {
-                tr.classList.remove('selected');
+                card.classList.remove('selected');
             }
         });
+    }
+
+    function showApiKey(apiKey) {
+        document.getElementById('apiKeyText').textContent = apiKey;
+        document.getElementById('apiKeyModal').style.display = 'block';
+    }
+
+    function closeApiKeyModal() {
+        document.getElementById('apiKeyModal').style.display = 'none';
+    }
+
+    function copyApiKey() {
+        const apiKey = document.getElementById('apiKeyText').textContent;
+        navigator.clipboard.writeText(apiKey).then(() => {
+            alert('API ключ скопирован в буфер обмена');
+        });
+    }
+
+    function showTelegramModal(apiKey) {
+        currentUser = apiKey;
+        document.getElementById('telegramModal').style.display = 'block';
+    }
+
+    function closeTelegramModal() {
+        document.getElementById('telegramModal').style.display = 'none';
+        currentUser = null;
+    }
+
+    function showVkModal(apiKey) {
+        currentUser = apiKey;
+        document.getElementById('vkModal').style.display = 'block';
+    }
+
+    function closeVkModal() {
+        document.getElementById('vkModal').style.display = 'none';
+        currentUser = null;
     }
 
     // Загружаем данные при загрузке страницы
