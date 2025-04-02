@@ -172,6 +172,7 @@
     const adminKey = localStorage.getItem('adminKey');
     if (!adminKey) {
         window.location.href = `${BASE_URL}/login`;
+        return;
     }
 
     // Функция для выхода
@@ -347,10 +348,6 @@
 
     // Загружаем данные при загрузке страницы
     document.addEventListener('DOMContentLoaded', async () => {
-        if (!adminKey) {
-            window.location.href = `${BASE_URL}/login`;
-            return;
-        }
         await loadSystemStats();
         await loadUsers();
     });
