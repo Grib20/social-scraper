@@ -367,6 +367,38 @@
         font-weight: bold;
         color: #333;
     }
+
+    .modal-content .api-key {
+        display: flex;
+        align-items: center;
+        background-color: #f8f9fa;
+        padding: 10px;
+        margin: 15px 0;
+        border-radius: 4px;
+        border: 1px solid #ddd;
+    }
+
+    .modal-content .api-key span {
+        font-family: monospace;
+        font-size: 16px;
+        flex-grow: 1;
+        word-break: break-all;
+    }
+
+    .modal-content .copy-btn {
+        margin-left: 10px;
+        background-color: #28a745;
+        color: white;
+        border: none;
+        padding: 6px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+
+    .modal-content .btn-primary {
+        margin-top: 15px;
+        width: 100%;
+    }
 </style>
 {% endblock %}
 
@@ -577,12 +609,13 @@
             });
 
             const data = await response.json();
+            console.log('Registration response:', data); // Добавим для отладки
 
-            if (response.ok) {
+            if (response.ok && data.api_key) {
                 resultDiv.innerHTML = '<div class="success">Пользователь успешно зарегистрирован</div>';
                 document.getElementById('registerUsername').value = '';
                 document.getElementById('registerPassword').value = '';
-                showApiKey(data.api_key);
+                showFullApiKey(data.api_key);
                 await loadUsers();
             } else {
                 resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail || 'Неизвестная ошибка'}</div>`;
@@ -777,6 +810,7 @@
         }
 
         for (const [apiKey, userData] of Object.entries(users)) {
+            console.log('Processing user:', apiKey, userData); // Добавим для отладки
             const userDiv = document.createElement('div');
             userDiv.className = 'user-card';
             
@@ -790,7 +824,7 @@
                     <div class="api-key-container">
                         <p><strong>API ключ:</strong></p>
                         <div class="api-key">
-                            <input type="text" value="${apiKey.substring(0, 8)}..." readonly style="width: 80%; border: none; background: transparent;">
+                            <input type="text" value="${apiKey ? apiKey.substring(0, 8) + '...' : 'Ключ не найден'}" readonly style="width: 80%; border: none; background: transparent;">
                             <button class="copy-btn" onclick="showFullApiKey('${apiKey}')">Показать</button>
                         </div>
                     </div>
@@ -913,9 +947,16 @@
 
     function copyApiKey() {
         const apiKey = document.getElementById('apiKeyText').textContent;
-        navigator.clipboard.writeText(apiKey).then(() => {
-            alert('API ключ скопирован в буфер обмена');
-        });
+        if (apiKey && apiKey !== 'Ключ не найден') {
+            navigator.clipboard.writeText(apiKey).then(() => {
+                alert('API ключ скопирован в буфер обмена');
+            }).catch(err => {
+                console.error('Ошибка при копировании:', err);
+                alert('Не удалось скопировать API ключ');
+            });
+        } else {
+            alert('Нет доступного ключа для копирования');
+        }
     }
 
     function showTelegramModal(apiKey) {
@@ -941,7 +982,8 @@
     function showFullApiKey(apiKey) {
         const modal = document.getElementById('apiKeyModal');
         const apiKeyText = document.getElementById('apiKeyText');
-        apiKeyText.textContent = apiKey;
+        apiKeyText.textContent = apiKey || 'Ключ не найден';
+        console.log('Showing API key:', apiKey); // Добавим для отладки
         modal.style.display = 'block';
     }
 </script>
