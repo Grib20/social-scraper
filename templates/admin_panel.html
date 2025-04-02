@@ -804,17 +804,18 @@
         const userList = document.getElementById('usersList');
         userList.innerHTML = '';
 
-        if (Object.keys(users).length === 0) {
+        if (!users || users.length === 0) {
             userList.innerHTML = '<p>Нет зарегистрированных пользователей</p>';
             return;
         }
 
-        for (const [apiKey, userData] of Object.entries(users)) {
-            console.log('Processing user:', apiKey, userData); // Добавим для отладки
+        for (const userData of users) {
+            console.log('Processing user:', userData); // Для отладки
             const userDiv = document.createElement('div');
             userDiv.className = 'user-card';
             
             const username = userData.username || 'Неизвестно';
+            const apiKey = userData.api_key;
             const createdAt = userData.created_at ? new Date(userData.created_at).toLocaleString() : 'Неизвестно';
             const lastUsed = userData.last_used ? new Date(userData.last_used).toLocaleString() : 'Никогда';
             
@@ -834,10 +835,10 @@
                     <div class="accounts-info">
                         <div class="telegram-accounts">
                             <div class="account-header">
-                                <h4>Telegram аккаунты (${userData.telegram_accounts ? Object.keys(userData.telegram_accounts).length : 0})</h4>
-                                <button onclick="addTelegramAccount('${apiKey}')">Добавить аккаунт</button>
+                                <h4>Telegram аккаунты (${userData.telegram_accounts ? userData.telegram_accounts.length : 0})</h4>
+                                <button onclick="showTelegramModal('${apiKey}')">Добавить аккаунт</button>
                             </div>
-                            ${userData.telegram_accounts ? Object.entries(userData.telegram_accounts).map(([accountId, account]) => `
+                            ${userData.telegram_accounts && userData.telegram_accounts.length > 0 ? userData.telegram_accounts.map(account => `
                                 <div class="account-details">
                                     <div class="account-header">
                                         <span class="account-phone">${account.phone}</span>
@@ -845,17 +846,17 @@
                                     </div>
                                     <p>Прокси: ${account.proxy || 'Нет'}</p>
                                     <p>Запросов: ${account.requests_made || 0}</p>
-                                    <button onclick="deleteTelegramAccount('${apiKey}', '${accountId}')">Удалить</button>
+                                    <button onclick="deleteTelegramAccount('${apiKey}', '${account.id}')">Удалить</button>
                                 </div>
                             `).join('') : '<p>Нет аккаунтов</p>'}
                         </div>
                         
                         <div class="vk-accounts">
                             <div class="account-header">
-                                <h4>VK аккаунты (${userData.vk_accounts ? Object.keys(userData.vk_accounts).length : 0})</h4>
-                                <button onclick="addVkAccount('${apiKey}')">Добавить аккаунт</button>
+                                <h4>VK аккаунты (${userData.vk_accounts ? userData.vk_accounts.length : 0})</h4>
+                                <button onclick="showVkModal('${apiKey}')">Добавить аккаунт</button>
                             </div>
-                            ${userData.vk_accounts ? Object.entries(userData.vk_accounts).map(([accountId, account]) => `
+                            ${userData.vk_accounts && userData.vk_accounts.length > 0 ? userData.vk_accounts.map(account => `
                                 <div class="account-details">
                                     <div class="account-header">
                                         <span class="account-token">${account.token.substring(0, 10)}...</span>
@@ -863,7 +864,7 @@
                                     </div>
                                     <p>Прокси: ${account.proxy || 'Нет'}</p>
                                     <p>Запросов: ${account.requests_made || 0}</p>
-                                    <button onclick="deleteVkAccount('${apiKey}', '${accountId}')">Удалить</button>
+                                    <button onclick="deleteVkAccount('${apiKey}', '${account.id}')">Удалить</button>
                                 </div>
                             `).join('') : '<p>Нет аккаунтов</p>'}
                         </div>
