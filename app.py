@@ -374,6 +374,272 @@ async def get_vk_posts_by_period(
         posts = await vk.get_posts_by_period(group_ids, max_posts, days_back, min_views)
         return {"posts": posts}
 
+# Маршрут для страницы регистрации
+@app.get("/register")
+async def register_page(request: Request):
+    """Отображает страницу регистрации."""
+    return templates.TemplateResponse(
+        "register.html",
+        get_base_context(request)
+    )
+
+# Маршрут для страницы управления аккаунтами
+@app.get("/accounts")
+async def accounts_page(request: Request):
+    """Отображает страницу управления аккаунтами."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return templates.TemplateResponse(
+            "register.html",
+            get_base_context(request)
+        )
+    api_key = auth_header.split(' ')[1]
+    
+    # Проверяем валидность API ключа
+    if not await verify_api_key(api_key):
+        return templates.TemplateResponse(
+            "register.html",
+            get_base_context(request)
+        )
+    
+    return templates.TemplateResponse(
+        "accounts.html",
+        get_base_context(request)
+    )
+
+# Эндпоинты для работы с Telegram аккаунтами
+@app.post("/api/telegram/accounts")
+async def add_telegram_account(request: Request):
+    """Добавляет новый Telegram аккаунт."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    form_data = await request.form()
+    api_id = form_data.get('api_id')
+    api_hash = form_data.get('api_hash')
+    phone = form_data.get('phone')
+    proxy = form_data.get('proxy')
+    session_file = form_data.get('session_file')
+    
+    if not api_id or not api_hash or not phone:
+        raise HTTPException(400, "Обязательные поля не заполнены")
+    
+    # Создаем новый аккаунт
+    account_data = {
+        "api_id": api_id,
+        "api_hash": api_hash,
+        "phone": phone,
+        "proxy": proxy,
+        "status": "pending"
+    }
+    
+    if session_file:
+        # Сохраняем файл сессии
+        session_path = f"sessions/{api_key}_{phone}.session"
+        with open(session_path, "wb") as f:
+            f.write(await session_file.read())
+        account_data["session_file"] = session_path
+    
+    account_id = str(uuid.uuid4())
+    account_data["id"] = account_id
+    
+    # Добавляем аккаунт в базу данных
+    await add_telegram_account(api_key, account_data)
+    
+    # Проверяем авторизацию
+    if not session_file:
+        return {
+            "account_id": account_id,
+            "requires_auth": True
+        }
+    
+    return {
+        "account_id": account_id,
+        "requires_auth": False
+    }
+
+@app.post("/api/telegram/verify-code")
+async def verify_telegram_code(request: Request):
+    """Проверяет код авторизации Telegram."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    data = await request.json()
+    account_id = data.get('account_id')
+    code = data.get('code')
+    
+    if not account_id or not code:
+        raise HTTPException(400, "Не указаны необходимые параметры")
+    
+    # Получаем данные аккаунта
+    account = await get_telegram_account(api_key, account_id)
+    if not account:
+        raise HTTPException(404, "Аккаунт не найден")
+    
+    # Проверяем код
+    try:
+        client = TelegramClient(
+            account["session_file"],
+            account["api_id"],
+            account["api_hash"]
+        )
+        if account.get("proxy"):
+            client.set_proxy(account["proxy"])
+        
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.send_code_request(account["phone"])
+            await client.sign_in(account["phone"], code)
+            
+            # Проверяем, требуется ли 2FA
+            if await client.is_user_authorized():
+                await client.disconnect()
+                return {
+                    "account_id": account_id,
+                    "requires_2fa": False
+                }
+            else:
+                await client.disconnect()
+                return {
+                    "account_id": account_id,
+                    "requires_2fa": True
+                }
+    except Exception as e:
+        raise HTTPException(400, f"Ошибка авторизации: {str(e)}")
+
+@app.post("/api/telegram/verify-2fa")
+async def verify_telegram_2fa(request: Request):
+    """Проверяет пароль 2FA для Telegram."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    data = await request.json()
+    account_id = data.get('account_id')
+    password = data.get('password')
+    
+    if not account_id or not password:
+        raise HTTPException(400, "Не указаны необходимые параметры")
+    
+    # Получаем данные аккаунта
+    account = await get_telegram_account(api_key, account_id)
+    if not account:
+        raise HTTPException(404, "Аккаунт не найден")
+    
+    # Проверяем пароль 2FA
+    try:
+        client = TelegramClient(
+            account["session_file"],
+            account["api_id"],
+            account["api_hash"]
+        )
+        if account.get("proxy"):
+            client.set_proxy(account["proxy"])
+        
+        await client.connect()
+        await client.sign_in(password=password)
+        await client.disconnect()
+        
+        # Обновляем статус аккаунта
+        await update_telegram_account(api_key, account_id, {"status": "active"})
+        
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(400, f"Ошибка авторизации: {str(e)}")
+
+@app.delete("/api/telegram/accounts/{account_id}")
+async def delete_telegram_account_endpoint(request: Request, account_id: str):
+    """Удаляет Telegram аккаунт."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    # Получаем данные аккаунта
+    account = await get_telegram_account(api_key, account_id)
+    if not account:
+        raise HTTPException(404, "Аккаунт не найден")
+    
+    # Удаляем файл сессии, если он есть
+    if account.get("session_file") and os.path.exists(account["session_file"]):
+        os.remove(account["session_file"])
+    
+    # Удаляем аккаунт из базы данных
+    await delete_telegram_account(api_key, account_id)
+    
+    return {"status": "success"}
+
+# Эндпоинты для работы с VK аккаунтами
+@app.post("/api/vk/accounts")
+async def add_vk_account_endpoint(request: Request):
+    """Добавляет новый VK аккаунт."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    data = await request.json()
+    token = data.get('token')
+    proxy = data.get('proxy')
+    
+    if not token:
+        raise HTTPException(400, "Токен VK обязателен")
+    
+    # Создаем новый аккаунт
+    account_data = {
+        "token": token,
+        "proxy": proxy,
+        "status": "active"
+    }
+    
+    account_id = str(uuid.uuid4())
+    account_data["id"] = account_id
+    
+    # Добавляем аккаунт в базу данных
+    await add_vk_account(api_key, account_data)
+    
+    return {
+        "account_id": account_id,
+        "status": "success"
+    }
+
+@app.delete("/api/vk/accounts/{account_id}")
+async def delete_vk_account_endpoint(request: Request, account_id: str):
+    """Удаляет VK аккаунт."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    # Удаляем аккаунт из базы данных
+    await delete_vk_account(api_key, account_id)
+    
+    return {"status": "success"}
+
+# Эндпоинт для получения статуса аккаунтов
+@app.get("/api/accounts/status")
+async def get_accounts_status(request: Request):
+    """Получает статус всех аккаунтов пользователя."""
+    auth_header = request.headers.get('authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        raise HTTPException(401, "API ключ обязателен")
+    api_key = auth_header.split(' ')[1]
+    
+    # Получаем данные пользователя
+    user_data = await get_user(api_key)
+    if not user_data:
+        raise HTTPException(404, "Пользователь не найден")
+    
+    return {
+        "telegram_accounts": user_data.get("telegram_accounts", []),
+        "vk_accounts": user_data.get("vk_accounts", [])
+    }
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))
     uvicorn.run(app, host="0.0.0.0", port=port)

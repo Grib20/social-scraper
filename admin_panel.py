@@ -320,4 +320,28 @@ async def get_account_status(api_key: str) -> Dict:
         "vk_accounts": vk_accounts,
         "created_at": user_data.get("created_at"),
         "last_used": user_data.get("last_used")
-    } 
+    }
+
+async def get_telegram_account(api_key: str, account_id: str) -> Optional[Dict]:
+    """Получает информацию о конкретном Telegram аккаунте."""
+    users = load_users()
+    if api_key not in users or "telegram_accounts" not in users[api_key]:
+        return None
+    
+    for account in users[api_key]["telegram_accounts"]:
+        if account.get("id") == account_id:
+            return account
+    
+    return None
+
+async def get_vk_account(api_key: str, account_id: str) -> Optional[Dict]:
+    """Получает информацию о конкретном VK аккаунте."""
+    users = load_users()
+    if api_key not in users or "vk_accounts" not in users[api_key]:
+        return None
+    
+    for account in users[api_key]["vk_accounts"]:
+        if account.get("id") == account_id:
+            return account
+    
+    return None 
