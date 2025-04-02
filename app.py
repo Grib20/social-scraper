@@ -94,14 +94,10 @@ async def admin_panel(request: Request):
 # Маршрут для проверки админ-ключа
 @app.post("/admin/validate")
 async def validate_admin_key(request: Request):
-    """Проверяет валидность админ-ключа."""
-    admin_key = request.headers.get("X-Admin-Key")
-    if not admin_key:
-        raise HTTPException(status_code=401, detail="Admin key is required")
-    
-    if admin_key != os.getenv("ADMIN_KEY"):
+    """Валидация админ-ключа"""
+    admin_key = request.headers.get('X-Admin-Key')
+    if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
         raise HTTPException(status_code=401, detail="Invalid admin key")
-    
     return {"status": "ok"}
 
 async def auth_middleware(request: Request, platform: str):

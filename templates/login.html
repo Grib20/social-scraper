@@ -80,13 +80,6 @@
 
 {% block scripts %}
 <script>
-    // Проверяем, есть ли уже сохраненный админ-ключ
-    const adminKey = localStorage.getItem('adminKey');
-    if (adminKey) {
-        // Если ключ есть, проверяем его валидность
-        validateAndRedirect();
-    }
-
     async function login() {
         const adminKey = document.getElementById('adminKey').value;
         if (!adminKey) {
@@ -115,31 +108,6 @@
         } catch (error) {
             document.getElementById('loginResult').innerHTML = 
                 `<div class="error">Ошибка: ${error.message}</div>`;
-        }
-    }
-
-    async function validateAndRedirect() {
-        const adminKey = localStorage.getItem('adminKey');
-        if (!adminKey) return;
-
-        try {
-            const response = await fetch(`${BASE_URL}/admin/validate`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Admin-Key': adminKey
-                }
-            });
-
-            if (response.ok) {
-                window.location.href = `${BASE_URL}/admin`;
-            } else {
-                // Если ключ недействителен, удаляем его
-                localStorage.removeItem('adminKey');
-            }
-        } catch (error) {
-            console.error('Error validating admin key:', error);
-            localStorage.removeItem('adminKey');
         }
     }
 
