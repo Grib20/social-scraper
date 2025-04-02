@@ -81,27 +81,16 @@ async def login(request: Request):
 
 # Маршрут для админ-панели
 @app.get("/admin")
-async def admin_panel(request: Request):
+async def admin_panel():
     """Отображает админ-панель."""
-    admin_key = request.headers.get("X-Admin-Key")
-    if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
-        return templates.TemplateResponse(
-            "login.html",
-            get_base_context(request)
-        )
-    
-    return templates.TemplateResponse(
-        "admin_panel.html",
-        get_base_context(request)
-    )
+    return templates.TemplateResponse("admin_panel.html", {"request": {}, "BASE_URL": os.getenv("BASE_URL")})
 
-# Маршрут для проверки админ-ключа
 @app.post("/admin/validate")
 async def validate_admin_key(request: Request):
-    """Валидация админ-ключа"""
-    admin_key = request.headers.get('X-Admin-Key')
+    """Проверяет валидность админ-ключа."""
+    admin_key = request.headers.get("X-Admin-Key")
     if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
-        raise HTTPException(status_code=401, detail="Invalid admin key")
+        raise HTTPException(401, "Неверный админ-ключ")
     return {"status": "ok"}
 
 async def auth_middleware(request: Request, platform: str):
@@ -184,15 +173,25 @@ async def admin_delete_vk_account(api_key: str, account_id: str):
     return await delete_vk_account(api_key, account_id)
 
 # Админ-эндпоинты
-@app.get("/admin/stats", dependencies=[Security(verify_admin_key)])
-async def admin_stats():
+@app.get("/admin/stats")
+async def get_admin_stats(request: Request):
     """Получает статистику системы."""
-    return await get_system_stats()
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
+        raise HTTPException(401, "Неверный админ-ключ")
+    
+    stats = await get_system_stats()
+    return stats
 
-@app.get("/admin/users", dependencies=[Security(verify_admin_key)])
-async def admin_users():
+@app.get("/admin/users")
+async def get_users(request: Request):
     """Получает список всех пользователей."""
-    return await get_all_users()
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key or admin_key != os.getenv("ADMIN_KEY"):
+        raise HTTPException(401, "Неверный админ-ключ")
+    
+    users = await get_all_users()
+    return users
 
 @app.get("/admin/users/{api_key}", dependencies=[Security(verify_admin_key)])
 async def admin_user(api_key: str):

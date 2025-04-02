@@ -423,7 +423,158 @@
     const adminKey = localStorage.getItem('adminKey');
     if (!adminKey) {
         window.location.href = `${BASE_URL}/login`;
-        return;
+    }
+
+    // Загружаем данные при загрузке страницы
+    document.addEventListener('DOMContentLoaded', async () => {
+        try {
+            // Проверяем валидность админ-ключа
+            const validateResponse = await fetch(`${BASE_URL}/admin/validate`, {
+                method: 'POST',
+                headers: {
+                    'X-Admin-Key': adminKey
+                }
+            });
+
+            if (!validateResponse.ok) {
+                localStorage.removeItem('adminKey');
+                window.location.href = `${BASE_URL}/login`;
+                return;
+            }
+
+            // Загружаем данные
+            await Promise.all([
+                loadSystemStats(),
+                loadUsers()
+            ]);
+        } catch (error) {
+            console.error('Ошибка инициализации:', error);
+            localStorage.removeItem('adminKey');
+            window.location.href = `${BASE_URL}/login`;
+        }
+    });
+
+    // Функция для регистрации пользователя
+    async function registerUser() {
+        const username = document.getElementById('registerUsername').value;
+        const password = document.getElementById('registerPassword').value;
+        const resultDiv = document.getElementById('registerResult');
+
+        if (!username || !password) {
+            resultDiv.innerHTML = '<div class="error">Заполните все поля</div>';
+            return;
+        }
+
+        try {
+            const response = await fetch(`${BASE_URL}/register`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Key': adminKey
+                },
+                body: JSON.stringify({ username, password })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                resultDiv.innerHTML = '<div class="success">Пользователь успешно зарегистрирован</div>';
+                document.getElementById('registerUsername').value = '';
+                document.getElementById('registerPassword').value = '';
+                showApiKey(data.api_key);
+                await loadUsers();
+            } else {
+                resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail}</div>`;
+            }
+        } catch (error) {
+            resultDiv.innerHTML = `<div class="error">Ошибка: ${error.message}</div>`;
+        }
+    }
+
+    // Функция для добавления Telegram аккаунта
+    async function addTelegramAccount() {
+        const apiId = document.getElementById('telegramApiId').value;
+        const apiHash = document.getElementById('telegramApiHash').value;
+        const phone = document.getElementById('telegramPhone').value;
+        const proxy = document.getElementById('telegramProxy').value;
+        const sessionFile = document.getElementById('telegramSession').files[0];
+
+        if (!apiId || !apiHash || !phone) {
+            document.getElementById('telegramResult').innerHTML = 
+                '<div class="error">Заполните обязательные поля</div>';
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('api_id', apiId);
+        formData.append('api_hash', apiHash);
+        formData.append('phone', phone);
+        if (proxy) formData.append('proxy', proxy);
+        if (sessionFile) formData.append('session_file', sessionFile);
+
+        try {
+            const response = await fetch(`${BASE_URL}/admin/users/${currentUser}/telegram`, {
+                method: 'POST',
+                headers: {
+                    'X-Admin-Key': adminKey
+                },
+                body: formData
+            });
+
+            if (response.ok) {
+                document.getElementById('telegramResult').innerHTML = 
+                    '<div class="success">Аккаунт успешно добавлен</div>';
+                closeTelegramModal();
+                await loadUsers();
+            } else {
+                const error = await response.json();
+                document.getElementById('telegramResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.detail}</div>`;
+            }
+        } catch (error) {
+            document.getElementById('telegramResult').innerHTML = 
+                `<div class="error">Ошибка: ${error.message}</div>`;
+        }
+    }
+
+    // Функция для добавления VK аккаунта
+    async function addVkAccount() {
+        const token = document.getElementById('vkToken').value;
+        const proxy = document.getElementById('vkProxy').value;
+
+        if (!token) {
+            document.getElementById('vkResult').innerHTML = 
+                '<div class="error">Введите токен VK</div>';
+            return;
+        }
+
+        try {
+            const response = await fetch(`${BASE_URL}/admin/users/${currentUser}/vk`, {
+                method: 'POST',
+                headers: {
+                    'X-Admin-Key': adminKey,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    token: token,
+                    proxy: proxy
+                })
+            });
+
+            if (response.ok) {
+                document.getElementById('vkResult').innerHTML = 
+                    '<div class="success">Аккаунт успешно добавлен</div>';
+                closeVkModal();
+                await loadUsers();
+            } else {
+                const error = await response.json();
+                document.getElementById('vkResult').innerHTML = 
+                    `<div class="error">Ошибка: ${error.detail}</div>`;
+            }
+        } catch (error) {
+            document.getElementById('vkResult').innerHTML = 
+                `<div class="error">Ошибка: ${error.message}</div>`;
+        }
     }
 
     // Функция для выхода
@@ -574,92 +725,6 @@
         alert('Редактирование пользователя будет добавлено позже');
     }
 
-    // Функция для добавления Telegram аккаунта
-    async function addTelegramAccount() {
-        const apiId = document.getElementById('telegramApiId').value;
-        const apiHash = document.getElementById('telegramApiHash').value;
-        const phone = document.getElementById('telegramPhone').value;
-        const proxy = document.getElementById('telegramProxy').value;
-        const sessionFile = document.getElementById('telegramSession').files[0];
-
-        if (!apiId || !apiHash || !phone) {
-            document.getElementById('telegramResult').innerHTML = 
-                '<div class="error">Заполните обязательные поля</div>';
-            return;
-        }
-
-        const formData = new FormData();
-        formData.append('api_id', apiId);
-        formData.append('api_hash', apiHash);
-        formData.append('phone', phone);
-        if (proxy) formData.append('proxy', proxy);
-        if (sessionFile) formData.append('session_file', sessionFile);
-
-        try {
-            const response = await fetch(`${BASE_URL}/admin/users/${currentUser}/telegram-accounts`, {
-                method: 'POST',
-                headers: {
-                    'X-Admin-Key': adminKey
-                },
-                body: formData
-            });
-
-            if (response.ok) {
-                document.getElementById('telegramResult').innerHTML = 
-                    '<div class="success">Аккаунт успешно добавлен</div>';
-                closeTelegramModal();
-                loadUsers();
-            } else {
-                const error = await response.json();
-                document.getElementById('telegramResult').innerHTML = 
-                    `<div class="error">Ошибка: ${error.detail}</div>`;
-            }
-        } catch (error) {
-            document.getElementById('telegramResult').innerHTML = 
-                `<div class="error">Ошибка: ${error.message}</div>`;
-        }
-    }
-
-    // Функция для добавления VK аккаунта
-    async function addVkAccount() {
-        const token = document.getElementById('vkToken').value;
-        const proxy = document.getElementById('vkProxy').value;
-
-        if (!token) {
-            document.getElementById('vkResult').innerHTML = 
-                '<div class="error">Введите токен VK</div>';
-            return;
-        }
-
-        try {
-            const response = await fetch(`${BASE_URL}/admin/users/${currentUser}/vk-accounts`, {
-                method: 'POST',
-                headers: {
-                    'X-Admin-Key': adminKey,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    token: token,
-                    proxy: proxy
-                })
-            });
-
-            if (response.ok) {
-                document.getElementById('vkResult').innerHTML = 
-                    '<div class="success">Аккаунт успешно добавлен</div>';
-                closeVkModal();
-                loadUsers();
-            } else {
-                const error = await response.json();
-                document.getElementById('vkResult').innerHTML = 
-                    `<div class="error">Ошибка: ${error.detail}</div>`;
-            }
-        } catch (error) {
-            document.getElementById('vkResult').innerHTML = 
-                `<div class="error">Ошибка: ${error.message}</div>`;
-        }
-    }
-
     // Функция для выбора пользователя
     let selectedApiKey = null;
     function selectUser(apiKey) {
@@ -709,47 +774,5 @@
         document.getElementById('vkModal').style.display = 'none';
         currentUser = null;
     }
-
-    async function registerUser() {
-        const username = document.getElementById('registerUsername').value;
-        const password = document.getElementById('registerPassword').value;
-        const resultDiv = document.getElementById('registerResult');
-
-        if (!username || !password) {
-            resultDiv.innerHTML = '<div class="error">Заполните все поля</div>';
-            return;
-        }
-
-        try {
-            const response = await fetch(`${BASE_URL}/register`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Admin-Key': adminKey
-                },
-                body: JSON.stringify({ username, password })
-            });
-
-            const data = await response.json();
-
-            if (response.ok) {
-                resultDiv.innerHTML = '<div class="success">Пользователь успешно зарегистрирован</div>';
-                document.getElementById('registerUsername').value = '';
-                document.getElementById('registerPassword').value = '';
-                showApiKey(data.api_key);
-                loadUsers();
-            } else {
-                resultDiv.innerHTML = `<div class="error">Ошибка: ${data.detail}</div>`;
-            }
-        } catch (error) {
-            resultDiv.innerHTML = `<div class="error">Ошибка: ${error.message}</div>`;
-        }
-    }
-
-    // Загружаем данные при загрузке страницы
-    document.addEventListener('DOMContentLoaded', async () => {
-        await loadSystemStats();
-        await loadUsers();
-    });
 </script>
 {% endblock %} 
