@@ -103,20 +103,31 @@ class ClientPool:
             key=lambda acc: (self.usage_counts.get(acc['id'], 0), self.last_used.get(acc['id'], 0))
         )
         
-        selected_account = sorted_accounts[0]
-        account_id = selected_account['id']
+        # Пробуем каждый аккаунт по очереди, пока не найдем работающий
+        for selected_account in sorted_accounts:
+            account_id = selected_account['id']
+            
+            # Получаем или создаем клиента
+            client = self.get_client(account_id)
+            if not client:
+                client = self.create_client(selected_account)
+                
+                # Если не удалось создать клиента, пробуем следующий аккаунт
+                if not client:
+                    logger.error(f"Не удалось создать клиента для аккаунта {account_id}")
+                    continue
+                    
+                self.add_client(account_id, client)
+            
+            # Увеличиваем счетчик использования и обновляем время
+            self.usage_counts[account_id] = self.usage_counts.get(account_id, 0) + 1
+            self.last_used[account_id] = time.time()
+            
+            return client, account_id
         
-        # Увеличиваем счетчик использования и обновляем время
-        self.usage_counts[account_id] = self.usage_counts.get(account_id, 0) + 1
-        self.last_used[account_id] = time.time()
-        
-        # Получаем или создаем клиента
-        client = self.get_client(account_id)
-        if not client:
-            client = self.create_client(selected_account)
-            self.add_client(account_id, client)
-        
-        return client, account_id
+        # Если ни один аккаунт не подошел
+        logger.error("Не найден подходящий аккаунт")
+        return None, None
     
     def create_client(self, account):
         """Создает нового клиента для аккаунта."""
@@ -129,28 +140,73 @@ class VKClientPool(ClientPool):
     def create_client(self, account):
         """Создает нового клиента VK."""
         from vk_utils import VKClient
+        
+        account_id = account.get('id', 'неизвестный')
         token = account.get('token')
-        # Проверяем, не является ли токен зашифрованным
-        if token and len(token) > 100:  # Примерный признак зашифрованного токена
-            from user_manager import cipher
-            try:
-                token = cipher.decrypt(token.encode()).decode()
-            except Exception as e:
-                logger.error(f"Ошибка при расшифровке токена VK: {e}")
-                
-        return VKClient(token, account.get('proxy'), account['id'])
+        user_api_key = account.get('user_api_key')
+        
+        logger.info(f"Создание VK клиента для аккаунта {account_id}")
+        
+        if not token:
+            logger.error(f"Токен VK отсутствует для аккаунта {account_id}")
+            return None
+            
+        if not isinstance(token, str):
+            logger.error(f"Токен VK не является строкой для аккаунта {account_id}")
+            return None
+        
+        # Проверяем валидность токена VK
+        if not token.startswith('vk1.a.'):
+            logger.error(f"Токен VK имеет неверный формат для аккаунта {account_id}")
+            return None
+        
+        # Создаем клиент только если токен валидный
+        try:
+            client = VKClient(token, account.get('proxy'), account_id, user_api_key)
+            logger.info(f"VK клиент успешно создан для аккаунта {account_id}")
+            return client
+        except Exception as e:
+            logger.error(f"Ошибка при создании клиента VK: {str(e)}")
+            return None
     
     def get_active_clients(self, api_key):
         """Получает активные клиенты VK на основе активных аккаунтов."""
         from user_manager import get_active_accounts
+        logger.info(f"Получение активных аккаунтов VK для API ключа {api_key}")
         active_accounts = get_active_accounts(api_key, "vk")
         
-        # Проверяем, все ли активные аккаунты имеют клиентов
-        for account in active_accounts:
-            if account['id'] not in self.clients:
-                self.add_client(account['id'], self.create_client(account))
+        if not active_accounts:
+            logger.error(f"Нет активных VK аккаунтов для пользователя с API ключом {api_key}")
+            return []
         
-        return active_accounts
+        logger.info(f"Получено {len(active_accounts)} активных аккаунтов VK")
+        
+        # Проверяем валидность полученных аккаунтов
+        valid_accounts = []
+        for account in active_accounts:
+            account_id = account.get('id', 'неизвестный')
+            if not account.get('token'):
+                logger.error(f"Аккаунт {account_id} не имеет токена")
+                continue
+                
+            token_start = account.get('token', '')[:10] + '...' if account.get('token') else 'None'
+            logger.info(f"Проверка аккаунта {account_id} с токеном {token_start}")
+                
+            # Сразу попробуем создать клиента для проверки валидности токена
+            client = self.create_client(account)
+            if client:
+                logger.info(f"Клиент для аккаунта {account_id} успешно создан")
+                self.add_client(account['id'], client)  # Добавляем клиента в пул
+                valid_accounts.append(account)  # Добавляем аккаунт в список валидных
+            else:
+                logger.error(f"Не удалось создать клиента для аккаунта {account_id} - токен невалидный")
+        
+        if not valid_accounts:
+            logger.error(f"Нет валидных VK аккаунтов для пользователя с API ключом {api_key}")
+            return []
+        
+        logger.info(f"После валидации осталось {len(valid_accounts)} аккаунтов VK")
+        return valid_accounts
 
 
 class TelegramClientPool(ClientPool):
@@ -238,29 +294,43 @@ async def auth_middleware(request: Request, platform: str):
     if not verify_api_key(api_key):
         raise HTTPException(401, "Неверный API ключ")
     
-    # Обновляем время последнего использования
-    update_user_last_used(api_key)
-    
-    # В зависимости от платформы, получаем соответствующий клиент
     if platform == 'vk':
+        logger.info(f"Получение активных VK аккаунтов для пользователя с API ключом {api_key}")
         active_accounts = vk_pool.get_active_clients(api_key)
-        client, account_id = vk_pool.select_next_client(active_accounts)
-        if not client:
-            raise HTTPException(429, "Все аккаунты VK достигли лимита запросов")
+        logger.info(f"Получено {len(active_accounts) if active_accounts else 0} активных VK аккаунтов")
         
+        for idx, account in enumerate(active_accounts if active_accounts else []):
+            token_start = account.get('token', '')[:10] + '...' if account.get('token') else 'None'
+            logger.info(f"Аккаунт {idx+1}: ID={account.get('id')}, токен={token_start}")
+        
+        if not active_accounts:
+            logger.error(f"Нет активных аккаунтов VK для пользователя с API ключом {api_key}")
+            raise HTTPException(429, "Нет доступных аккаунтов VK. Добавьте аккаунт ВКонтакте в личном кабинете.")
+            
+        client, account_id = vk_pool.select_next_client(active_accounts)
+        logger.info(f"Выбран клиент для аккаунта {account_id}")
+        
+        if not client:
+            logger.error(f"Не удалось создать клиент VK для пользователя с API ключом {api_key}")
+            raise HTTPException(429, "Не удалось инициализировать клиент VK. Проверьте валидность токена в личном кабинете.")
+        
+        logger.info(f"Используется VK аккаунт {account_id}")
         update_account_usage(api_key, account_id, "vk")
         return client
     
     elif platform == 'telegram':
         client, account_id = await telegram_pool.select_next_client(api_key)
         if not client:
-            raise HTTPException(429, "Все аккаунты Telegram достигли лимита запросов")
+            logger.error(f"Не удалось создать клиент Telegram для пользователя с API ключом {api_key}")
+            raise HTTPException(429, "Не удалось инициализировать клиент Telegram. Добавьте аккаунт Telegram в личном кабинете.")
         
+        logger.info(f"Используется Telegram аккаунт {account_id}")
         update_account_usage(api_key, account_id, "telegram")
         return client
     
     else:
-        raise HTTPException(400, "Неизвестная платформа")
+        logger.error(f"Запрос к неизвестной платформе: {platform}")
+        raise HTTPException(400, f"Неизвестная платформа: {platform}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -655,20 +725,84 @@ async def set_token(request: Request, data: dict):
 
 @app.post("/find-groups")
 async def find_groups(request: Request, data: dict):
-    platform = data.get('platform', 'telegram')
-    keywords = data.get('keywords', [])
-    if not keywords:
-        raise HTTPException(400, "Ключевые слова обязательны")
+    """Поиск групп по ключевым словам."""
+    api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
+    if not api_key:
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            api_key = auth_header.split(' ')[1]
+        else:
+            raise HTTPException(401, "API ключ обязателен")
     
-    min_members = data.get('min_members', 1000 if platform == 'vk' else 100000)
-    max_groups = data.get('max_groups', 10 if platform == 'vk' else 20)
-
-    if platform == 'telegram':
-        client = await auth_middleware(request, 'telegram')
-        return await find_channels(client, keywords, min_members, max_groups)
-    elif platform == 'vk':
+    if not verify_api_key(api_key):
+        raise HTTPException(401, "Неверный API ключ")
+    
+    platform = data.get('platform', 'vk')
+    keywords = data.get('keywords', [])
+    
+    # Получаем параметры из запроса
+    min_members = data.get('min_members', 10000)
+    if platform == 'vk':
+        min_members = data.get('minMembers', min_members)  # Поддержка формата JS-версии
+    
+    max_groups = data.get('max_groups', 20)
+    if platform == 'vk':
+        max_groups = data.get('maxGroups', max_groups)  # Поддержка формата JS-версии
+    
+    logger.info(f"Поиск групп с параметрами: platform={platform}, keywords={keywords}, min_members={min_members}, max_groups={max_groups}")
+    
+    if platform == 'vk':
+        logger.info("Вызов auth_middleware для получения VK клиента")
         vk = await auth_middleware(request, 'vk')
-        return await find_vk_groups(vk, keywords, min_members, max_groups)
+        
+        # Проверка клиента
+        if not vk:
+            logger.error("VK клиент не инициализирован, auth_middleware вернул None")
+            raise HTTPException(500, "Не удалось получить VK клиент")
+            
+        token_start = vk.access_token[:10] + "..." if vk.access_token and len(vk.access_token) > 10 else vk.access_token
+        logger.info(f"Получен VK клиент с токеном {token_start}")
+        
+        from vk_utils import find_vk_groups
+        
+        # Прямой вызов поиска групп
+        logger.info(f"Вызов find_vk_groups с keywords={keywords}, min_members={min_members}, max_count={max_groups}")
+        groups = await find_vk_groups(vk, keywords, min_members=min_members, max_count=max_groups)
+        
+        logger.info(f"Найдено {len(groups)} групп")
+        
+        # Переформатируем результат в JS-совместимый формат, если это необходимо
+        result = []
+        for group in groups:
+            # Используем существующие поля с правильными именами
+            result.append({
+                "id": group.get("id", "").replace("-", "") if "id" in group else group.get("id", ""),
+                "name": group.get("name", ""),
+                "members": group.get("members", group.get("members_count", 0)),
+                "is_closed": group.get("is_closed", 0)
+            })
+        
+        logger.info(f"Результат переформатирован в JS-совместимый формат")
+        return result
+    elif platform == 'telegram':
+        # Обработка для платформы Telegram
+        logger.info("Вызов auth_middleware для получения Telegram клиента")
+        client = await auth_middleware(request, 'telegram')
+        
+        if not client:
+            logger.error("Telegram клиент не инициализирован, auth_middleware вернул None")
+            raise HTTPException(500, "Не удалось получить Telegram клиент")
+        
+        from telegram_utils import find_channels
+        
+        # Вызов функции поиска каналов
+        logger.info(f"Вызов find_channels с keywords={keywords}, min_members={min_members}, max_channels={max_groups}")
+        channels = await find_channels(client, keywords, min_members=min_members, max_channels=max_groups)
+        
+        logger.info(f"Найдено {len(channels)} каналов Telegram")
+        return channels
+    
+    # Для неподдерживаемых платформ
     raise HTTPException(400, "Платформа не поддерживается")
 
 @app.post("/trending-posts")
@@ -692,22 +826,86 @@ async def trending_posts(request: Request, data: dict):
 
 @app.post("/posts")
 async def get_posts(request: Request, data: dict):
-    platform = data.get('platform', 'telegram')
-    group_ids = data.get('group_ids', [])
-    if not group_ids:
-        raise HTTPException(400, "ID групп обязательны")
+    """Получение постов из групп по ключевым словам."""
+    api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
+    if not api_key:
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            api_key = auth_header.split(' ')[1]
+        else:
+            raise HTTPException(401, "API ключ обязателен")
     
-    keywords = data.get('keywords')
+    if not verify_api_key(api_key):
+        raise HTTPException(401, "Неверный API ключ")
+        
+    platform = data.get('platform', 'vk')
+    
+    # Поддержка обоих форматов (JS и Python)
+    group_keywords = data.get('group_keywords', data.get('groupKeywords', []))
+    search_keywords = data.get('search_keywords', data.get('searchKeywords', None))
     count = data.get('count', 10)
-    min_views = data.get('min_views', 1000)
-    days_back = data.get('days_back', 3 if platform == 'telegram' else 7)
-
-    if platform == 'telegram':
-        client = await auth_middleware(request, 'telegram')
-        return await get_posts_in_channels(client, group_ids, keywords, count, min_views, days_back)
-    elif platform == 'vk':
+    min_views = data.get('min_views', data.get('minViews', 1000))
+    days_back = data.get('days_back', data.get('daysBack', 7))
+    max_groups = data.get('max_groups', data.get('maxGroups', 10))
+    max_posts_per_group = data.get('max_posts_per_group', data.get('maxPostsPerGroup', 300))
+    group_ids = data.get('group_ids', data.get('groupIds', None))
+    
+    logger.info(f"Получение постов с параметрами: platform={platform}, group_keywords={group_keywords}, search_keywords={search_keywords}")
+    
+    if platform == 'vk':
         vk = await auth_middleware(request, 'vk')
-        return await get_vk_posts_in_groups(vk, group_ids, keywords, count, min_views, days_back)
+        if not vk:
+            raise HTTPException(500, "Не удалось получить VK клиент")
+            
+        from vk_utils import find_vk_groups, get_vk_posts, get_vk_posts_in_groups
+        
+        try:
+            # Если переданы group_ids, используем их, иначе ищем группы по ключевым словам
+            if group_ids:
+                # Форматируем group_ids в нужный формат
+                formatted_group_ids = []
+                for gid in group_ids:
+                    gid_str = str(gid)
+                    if not gid_str.startswith('-'):
+                        gid_str = f"-{gid_str}"
+                    formatted_group_ids.append(gid_str)
+                
+                # Получаем посты напрямую из групп
+                posts = await get_vk_posts_in_groups(
+                    vk, 
+                    formatted_group_ids, 
+                    search_keywords, 
+                    count, 
+                    min_views, 
+                    days_back, 
+                    max_posts_per_group
+                )
+            else:
+                # Получаем посты через поиск групп
+                posts = await get_vk_posts(
+                    vk, 
+                    group_keywords, 
+                    search_keywords, 
+                    count, 
+                    min_views, 
+                    days_back, 
+                    max_groups, 
+                    max_posts_per_group
+                )
+            
+            # Если запрос был в формате JS-версии, форматируем ответ соответствующим образом
+            if 'groupKeywords' in data and group_keywords:
+                # Возвращаем результат в формате JS-версии {keyword: posts[]}
+                return {group_keywords[0] if isinstance(group_keywords, list) else group_keywords: posts}
+            
+            return posts
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Ошибка при получении постов: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(500, f"Ошибка при получении постов: {str(e)}")
+            
     raise HTTPException(400, "Платформа не поддерживается")
 
 @app.post("/posts-by-keywords")
@@ -1601,9 +1799,8 @@ async def check_vk_account_status(request: Request, account_id: str):
     
     # Находим аккаунт по ID
     from user_manager import get_db_connection, cipher
-    import vk_api
-    from vk_api.exceptions import ApiError
     from datetime import datetime
+    from vk_utils import VKClient
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1628,67 +1825,92 @@ async def check_vk_account_status(request: Request, account_id: str):
     
     try:
         # Расшифровываем токен
-        token = cipher.decrypt(encrypted_token.encode()).decode()
-        logger.info(f"Токен VK успешно расшифрован")
+        try:
+            token = cipher.decrypt(encrypted_token.encode()).decode()
+            logger.info(f"Токен VK успешно расшифрован")
+        except Exception as decrypt_error:
+            import traceback
+            error_details = str(decrypt_error)
+            tb = traceback.format_exc()
+            logger.error(f"Ошибка при расшифровке токена VK для аккаунта {account_id}: {error_details}")
+            logger.error(f"Трассировка: {tb}")
+            
+            # Если токен выглядит как валидный, используем его напрямую
+            if encrypted_token.startswith('vk1.a.'):
+                logger.info(f"Пробуем использовать токен напрямую для аккаунта {account_id}")
+                token = encrypted_token
+            else:
+                raise decrypt_error
         
-        # Создаем сессию VK API
-        session = vk_api.VkApi(token=token)
-        vk = session.get_api()
+        # Используем асинхронный VKClient
+        async with VKClient(token, account_dict.get("proxy")) as vk:
+            # Проверяем валидность токена, запрашивая информацию о пользователе
+            result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
+            
+            if not result or "response" not in result or not result["response"]:
+                raise Exception("Ошибка при получении информации о пользователе")
+            
+            user_info = result["response"][0]
+            
+            # Если запрос выполнен успешно, токен действителен
+            status = "active"
+            logger.info(f"Токен VK действителен, пользователь: {user_info}")
+            
+            # Обновляем статус и информацию о пользователе в базе данных
+            cursor.execute('''
+                UPDATE vk_accounts
+                SET status = ?, 
+                    user_id = ?, 
+                    user_name = ?,
+                    error_message = NULL,
+                    error_code = NULL,
+                    last_checked_at = ?
+                WHERE id = ?
+            ''', (
+                status, 
+                user_info.get('id'), 
+                f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip(),
+                last_checked_at,
+                account_id
+            ))
+            conn.commit()
+            logger.info(f"Статус аккаунта обновлен на '{status}'")
+            
+            conn.close()
+            return {
+                "account_id": account_id,
+                "status": status,
+                "user_info": user_info
+            }
+    except Exception as e:
+        logger.error(f"Ошибка при проверке токена VK: {str(e)}")
         
-        # Проверяем валидность токена, запрашивая информацию о пользователе
-        user_info = vk.users.get(fields='photo_50,screen_name')[0]
-        
-        # Если запрос выполнен успешно, токен действителен
-        status = "active"
-        logger.info(f"Токен VK действителен, пользователь: {user_info}")
-        
-        # Обновляем статус и информацию о пользователе в базе данных
-        cursor.execute('''
-            UPDATE vk_accounts
-            SET status = ?, 
-                user_id = ?, 
-                user_name = ?,
-                error_message = NULL,
-                error_code = NULL,
-                last_checked_at = ?
-            WHERE id = ?
-        ''', (
-            status, 
-            user_info.get('id'), 
-            f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip(),
-            last_checked_at,
-            account_id
-        ))
-        conn.commit()
-        logger.info(f"Статус аккаунта обновлен на '{status}'")
-        
-        conn.close()
-        return {
-            "account_id": account_id,
-            "status": status,
-            "user_info": user_info
-        }
-    except ApiError as e:
-        logger.error(f"Ошибка VK API при проверке токена: {str(e)}")
-        
-        # Определяем тип ошибки
+        # Определяем тип ошибки по сообщению
         error_message = str(e)
-        error_code = getattr(e, 'code', 0)
-        status = "invalid"
+        error_code = 0
+        status = "error"
         
-        if error_code == 5:  # Токен недействителен
+        # Пытаемся извлечь код ошибки из сообщения
+        if "error_code" in error_message:
+            try:
+                error_code = int(error_message.split("error_code")[1].split(":")[1].strip().split(",")[0])
+            except:
+                pass
+        
+        # Устанавливаем статус в зависимости от кода ошибки
+        if "Токен недействителен" in error_message or "access_token has expired" in error_message or error_code == 5:
             status = "invalid"
             error_message = "Недействительный токен или истек срок действия"
-        elif error_code == 27:  # Ключ доступа сообщества недействителен
+        elif "Ключ доступа сообщества недействителен" in error_message or error_code == 27:
             status = "invalid"
             error_message = "Ключ доступа сообщества недействителен"
-        elif error_code == 38:  # Пользователь заблокирован
+        elif "Пользователь заблокирован" in error_message or error_code == 38:
             status = "banned"
             error_message = "Пользователь заблокирован"
-        elif error_code == 29:  # Превышен лимит запросов
+        elif "Превышен лимит запросов" in error_message or error_code == 29:
             status = "rate_limited"
             error_message = "Превышен лимит запросов к API"
-        elif error_code == 17:  # Требуется валидация аккаунта
+        elif "Требуется валидация" in error_message or error_code == 17:
             status = "validation_required"
             error_message = "Требуется валидация аккаунта"
         
@@ -1710,26 +1932,6 @@ async def check_vk_account_status(request: Request, account_id: str):
             "status": status,
             "error": error_message,
             "error_code": error_code
-        }
-    except Exception as e:
-        logger.error(f"Ошибка при проверке статуса VK токена: {str(e)}")
-        
-        # Обновляем статус в базе данных с информацией об ошибке
-        error_message = str(e)
-        cursor.execute('''
-            UPDATE vk_accounts
-            SET status = 'error',
-                error_message = ?,
-                last_checked_at = ?
-            WHERE id = ?
-        ''', (error_message, last_checked_at, account_id))
-        conn.commit()
-        
-        conn.close()
-        return {
-            "account_id": account_id,
-            "status": "error",
-            "error": error_message
         }
 
 @app.on_event("shutdown")
@@ -2153,6 +2355,169 @@ async def api_media_upload(request: Request):
         
         logger.error(f"Ошибка при загрузке файла: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка при загрузке файла: {str(e)}")
+
+@app.get("/api/admin/test-vk-tokens")
+async def test_vk_tokens(request: Request):
+    """Тестирует расшифровку токенов VK для всех аккаунтов."""
+    # Проверяем админ-ключ
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key:
+        admin_key = request.cookies.get("admin_key")
+    
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    
+    try:
+        from user_manager import get_db_connection, cipher
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Получаем все VK аккаунты
+        cursor.execute("SELECT id, token, user_api_key FROM vk_accounts")
+        accounts = cursor.fetchall()
+        
+        results = []
+        for account in accounts:
+            account_id = account[0]
+            token = account[1]
+            user_api_key = account[2]
+            
+            result = {
+                "account_id": account_id,
+                "user_api_key": user_api_key,
+                "token_exists": token is not None,
+                "token_length": len(token) if token else 0,
+                "token_start": token[:10] + "..." if token and len(token) > 10 else token,
+                "decryption_success": False,
+                "decrypted_token_valid": False,
+                "error": None
+            }
+            
+            if token:
+                try:
+                    # Пытаемся расшифровать токен
+                    decrypted_token = cipher.decrypt(token.encode()).decode()
+                    result["decryption_success"] = True
+                    
+                    # Проверяем валидность расшифрованного токена
+                    if decrypted_token.startswith('vk1.a.'):
+                        result["decrypted_token_valid"] = True
+                        result["decrypted_token_start"] = decrypted_token[:10] + "..."
+                    else:
+                        result["decrypted_token_start"] = decrypted_token[:10] + "..."
+                except Exception as e:
+                    result["error"] = str(e)
+            
+            results.append(result)
+        
+        conn.close()
+        
+        # Проверяем настройки шифрования
+        from user_manager import ENCRYPTION_KEY
+        encryption_key_info = {
+            "length": len(ENCRYPTION_KEY),
+            "start": ENCRYPTION_KEY[:5].decode() + "..." if len(ENCRYPTION_KEY) > 5 else ENCRYPTION_KEY.decode()
+        }
+        
+        return {
+            "accounts_count": len(results),
+            "accounts": results,
+            "encryption_key_info": encryption_key_info
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"Ошибка при тестировании токенов VK: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при тестировании токенов VK: {str(e)}")
+
+@app.post("/bulk-posts")
+async def bulk_posts(request: Request, data: dict):
+    """Получение постов из групп по нескольким ключевым словам с возвратом сгруппированных результатов."""
+    api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
+    if not api_key:
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            api_key = auth_header.split(' ')[1]
+        else:
+            raise HTTPException(401, "API ключ обязателен")
+    
+    if not verify_api_key(api_key):
+        raise HTTPException(401, "Неверный API ключ")
+        
+    # Поддержка обоих форматов (JS и Python)
+    group_keywords = data.get('group_keywords', data.get('groupKeywords', []))
+    if not group_keywords or not isinstance(group_keywords, list):
+        raise HTTPException(400, "Ключевые слова для групп должны быть массивом (group_keywords или groupKeywords)")
+        
+    search_keywords = data.get('search_keywords', data.get('searchKeywords', None))
+    count = data.get('count', 10)
+    min_views = data.get('min_views', data.get('minViews', 1000))
+    days_back = data.get('days_back', data.get('daysBack', 7))
+    max_groups = data.get('max_groups', data.get('maxGroups', 10))
+    max_posts_per_group = data.get('max_posts_per_group', data.get('maxPostsPerGroup', 300))
+    group_ids = data.get('group_ids', data.get('groupIds', None))
+    
+    logger.info(f"Получение постов для нескольких ключевых слов: {group_keywords}, search_keywords={search_keywords}")
+    
+    # Получаем VK клиент
+    vk = await auth_middleware(request, 'vk')
+    if not vk:
+        raise HTTPException(500, "Не удалось получить VK клиент")
+        
+    from vk_utils import find_vk_groups, get_vk_posts, get_vk_posts_in_groups
+    
+    try:
+        result = {}
+        
+        # Если переданы идентификаторы групп, то используем их
+        if group_ids and isinstance(group_ids, list) and len(group_ids) > 0:
+            # Форматируем ID групп
+            formatted_group_ids = []
+            for gid in group_ids:
+                gid_str = str(gid)
+                if not gid_str.startswith('-'):
+                    gid_str = f"-{gid_str}"
+                formatted_group_ids.append(gid_str)
+                
+            # Получаем посты из указанных групп
+            posts = await get_vk_posts_in_groups(
+                vk, 
+                formatted_group_ids, 
+                search_keywords, 
+                count, 
+                min_views, 
+                days_back, 
+                max_posts_per_group
+            )
+            
+            # Используем первое ключевое слово как ключ
+            key = group_keywords[0] if group_keywords else "posts"
+            result[key] = posts
+        else:
+            # Для каждого ключевого слова получаем посты
+            for keyword in group_keywords:
+                # Получаем посты для текущего ключевого слова
+                posts = await get_vk_posts(
+                    vk, 
+                    [keyword], 
+                    search_keywords, 
+                    count, 
+                    min_views, 
+                    days_back, 
+                    max_groups, 
+                    max_posts_per_group
+                )
+                
+                # Добавляем результат в словарь с ключом = ключевому слову
+                result[keyword] = posts
+        
+        return result
+    
+    except Exception as e:
+        import traceback
+        logger.error(f"Ошибка при получении постов по нескольким ключевым словам: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(500, f"Ошибка при получении постов по нескольким ключевым словам: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))

@@ -10,6 +10,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from media_utils import get_media_info
 from user_manager import get_active_accounts, update_account_usage
+import math
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -39,16 +40,42 @@ class VKClient:
         self.degraded_mode = degraded
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
+        try:
+            logger.info(f"Инициализация VK клиента с токеном длиной {len(self.access_token) if self.access_token else 0} символов")
+            if self.session is None:
+                self.session = aiohttp.ClientSession()
+                logger.info(f"Создана новая HTTP сессия для VK клиента")
+            return self
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(f"Ошибка при инициализации VK клиента: {e}")
+            logger.error(f"Трассировка: {tb}")
+            # Создаем сессию даже в случае ошибки
+            if self.session is None:
+                self.session = aiohttp.ClientSession()
+            return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        try:
+            if self.session:
+                logger.info(f"Закрытие HTTP сессии для VK клиента")
+                await self.session.close()
+                self.session = None
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(f"Ошибка при закрытии HTTP сессии VK клиента: {e}")
+            logger.error(f"Трассировка: {tb}")
 
     async def _make_request(self, method: str, params: Dict) -> Dict:
         """Выполняет запрос к VK API с соблюдением задержек."""
         current_time = time.time()
+        
+        # Проверяем, что токен не пустой
+        if not self.access_token:
+            logger.error("Токен VK пуст или равен None")
+            return {}
         
         # Определяем задержки в зависимости от режима
         request_delay = DEGRADED_MODE_DELAY if self.degraded_mode else REQUEST_DELAY
@@ -70,19 +97,39 @@ class VKClient:
         else:
             self.last_group_request_time = current_time
 
-        params.update({
+        # Формируем параметры запроса с токеном
+        request_params = params.copy()  # Создаем копию, чтобы не изменять оригинальный словарь
+        request_params.update({
             "access_token": self.access_token,
             "v": self.version
         })
 
+        # Гарантируем, что сессия создана
+        if self.session is None:
+            logger.info("Сессия не была инициализирована, создаём новую сессию")
+            self.session = aiohttp.ClientSession()
+
         async with REQUEST_SEMAPHORE:
             try:
-                async with self.session.get(f"{self.base_url}/{method}", params=params, proxy=self.proxy) as response:
+                # Логируем запрос (без токена для безопасности)
+                log_params = {k: v for k, v in request_params.items() if k != "access_token"}
+                logger.info(f"Отправка запроса к VK API: {method} c параметрами {log_params}")
+                
+                async with self.session.get(f"{self.base_url}/{method}", params=request_params, proxy=self.proxy) as response:
                     if response.status != 200:
-                        logger.error(f"Ошибка при запросе к VK API: {response.status}")
+                        logger.error(f"Ошибка при запросе к VK API: статус {response.status}")
+                        try:
+                            error_text = await response.text()
+                            logger.error(f"Текст ошибки: {error_text}")
+                        except:
+                            pass
                         return {}
                     
-                    result = await response.json()
+                    try:
+                        result = await response.json()
+                    except Exception as e:
+                        logger.error(f"Ошибка при декодировании JSON ответа: {e}")
+                        return {}
                     
                     # Проверяем ошибки VK API
                     if "error" in result:
@@ -108,7 +155,10 @@ class VKClient:
                     
                     return result
             except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
                 logger.error(f"Ошибка при выполнении запроса к VK API: {e}")
+                logger.error(f"Трассировка: {tb}")
                 return {}
 
     async def _make_group_request(self, method: str, params: Dict) -> Dict:
@@ -117,7 +167,7 @@ class VKClient:
         await asyncio.sleep(group_delay)
         return await self._make_request(method, params)
 
-    async def find_groups(self, keywords: List[str], min_members: int = 100000, max_groups: int = 20) -> List[Dict]:
+    async def find_groups(self, keywords: List[str], min_members: int = 10000, max_groups: int = 20) -> List[Dict]:
         """Поиск групп по ключевым словам."""
         groups = []
         for keyword in keywords:
@@ -179,9 +229,14 @@ class VKClient:
                                 "likes": post.get("likes", {}).get("count", 0),
                                 "reposts": post.get("reposts", {}).get("count", 0),
                                 "comments": post.get("comments", {}).get("count", 0),
-                                "trend_score": (views * 2) + post.get("likes", {}).get("count", 0) + (post.get("comments", {}).get("count", 0) * 3),
+                                "group_members": await self._get_group_members_count(group_id),
                                 "media": []
                             }
+                            
+                            # Рассчитываем показатели вовлеченности по формуле из Telegram
+                            raw_engagement_score = views + (post_data["likes"] * 10) + (post_data["comments"] * 20) + (post_data["reposts"] * 50)
+                            group_members_for_calc = max(post_data["group_members"], 10) # Минимум 10 участников для логарифма
+                            post_data["trend_score"] = int(raw_engagement_score / math.log10(group_members_for_calc)) if raw_engagement_score > 0 else 0
                             
                             if "attachments" in post:
                                 for attachment in post["attachments"]:
@@ -297,9 +352,14 @@ class VKClient:
                             "likes": post.get("likes", {}).get("count", 0),
                             "reposts": post.get("reposts", {}).get("count", 0),
                             "comments": post.get("comments", {}).get("count", 0),
-                            "trend_score": (views * 2) + post.get("likes", {}).get("count", 0) + (post.get("comments", {}).get("count", 0) * 3),
+                            "group_members": await self._get_group_members_count(group_id),
                             "media": []
                         }
+                        
+                        # Рассчитываем показатели вовлеченности по формуле из Telegram
+                        raw_engagement_score = views + (post_data["likes"] * 10) + (post_data["comments"] * 20) + (post_data["reposts"] * 50)
+                        group_members_for_calc = max(post_data["group_members"], 10) # Минимум 10 участников для логарифма
+                        post_data["trend_score"] = int(raw_engagement_score / math.log10(group_members_for_calc)) if raw_engagement_score > 0 else 0
                         
                         if "attachments" in post:
                             for attachment in post["attachments"]:
@@ -314,69 +374,335 @@ class VKClient:
         
         return posts
 
-async def find_vk_groups(vk, keywords, min_members=1000, max_groups=10):
-    keywords = keywords if isinstance(keywords, list) else [keywords]
+    async def _get_group_members_count(self, group_id: int) -> int:
+        """Получает количество участников группы."""
+        try:
+            logger.info(f"Запрашиваем количество участников группы {group_id}")
+            result = await self._make_request("groups.getById", {
+                "group_id": group_id,
+                "fields": "members_count"
+            })
+            
+            if "response" in result and result["response"] and "members_count" in result["response"][0]:
+                members_count = result["response"][0]["members_count"]
+                logger.info(f"Получено количество участников группы {group_id}: {members_count}")
+                return members_count
+            else:
+                logger.warning(f"Не удалось получить количество участников группы {group_id}")
+                return 10000  # Возвращаем значение по умолчанию
+        except Exception as e:
+            logger.error(f"Ошибка при получении количества участников группы {group_id}: {e}")
+            return 10000  # Возвращаем значение по умолчанию в случае ошибки
+
+async def find_vk_groups(vk, keywords, min_members=10000, max_count=20):
+    """
+    Поиск групп ВКонтакте по ключевым словам.
+    
+    Args:
+        vk (VKClient): Инициализированный клиент VK
+        keywords (list): Список ключевых слов для поиска
+        min_members (int): Минимальное количество участников в группе
+        max_count (int): Максимальное количество групп для возврата
+        
+    Returns:
+        list: Отсортированный список уникальных групп, отвечающих критериям
+    """
+    # Проверяем, что клиент VK не None
+    if vk is None:
+        logger.error("VK клиент не инициализирован")
+        return []
+    
+    # Проверяем, что токен доступа не пустой
+    if not vk.access_token:
+        logger.error("Токен доступа VK пуст или недействителен")
+        return []
+    
+    # Преобразуем ключевые слова в список, если передана строка
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    
+    logger.info(f"Начинаем поиск групп по ключевым словам: {keywords}")
+    
     all_groups = []
+    
     for keyword in keywords:
-        async with REQUEST_SEMAPHORE:
-            try:
-                response = vk.api.groups.search(q=keyword, type='group', sort=6, count=100, fields='members_count')
-                groups = [
-                    {
-                        'id': f"-{group['id']}",
-                        'name': group['name'],
-                        'members': group['members_count'],
-                        'is_closed': group['is_closed']
-                    }
-                    for group in response['items']
-                    if 'members_count' in group and group['members_count'] >= min_members and not group['is_closed']
-                ]
-                all_groups.extend(groups)
-            except ApiError as e:
-                logger.error(f"Ошибка: {e}")
+        try:
+            logger.info(f"Поиск групп по ключевому слову: '{keyword}'")
+            
+            # Выполняем поиск групп через метод _make_request с сортировкой (sort=6)
+            response = await vk._make_request("groups.search", {
+                "q": keyword,
+                "type": "group",
+                "count": 100,
+                "sort": 6,  # Сортировка как в JS-версии
+                "fields": "members_count"
+            })
+            
+            if not response or "response" not in response or not response["response"].get("items"):
+                logger.warning(f"Не найдено групп по ключевому слову: '{keyword}'")
+                continue
+                
+            items = response["response"]["items"]
+            logger.info(f"Найдено {len(items)} групп по ключевому слову '{keyword}'")
+            
+            # Преобразуем группы в формат как в JS-версии
+            groups = []
+            for group in items:
+                groups.append({
+                    "id": f"-{group['id']}",
+                    "name": group.get("name", ""),
+                    "members": group.get("members_count", 0),
+                    "is_closed": group.get("is_closed", 1)
+                })
+            
+            all_groups.extend(groups)
+            # Добавляем задержку между запросами как в JS-версии
             await asyncio.sleep(0.5)
-    unique_groups = list({group['id']: group for group in all_groups}.values())
-    return sorted(unique_groups, key=lambda x: x['members'], reverse=True)[:max_groups]
+            
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(f"Ошибка при поиске групп по ключевому слову '{keyword}': {str(e)}")
+            logger.error(f"Трассировка: {tb}")
+    
+    # Делаем группы уникальными по ID, как в JS-версии
+    unique_groups = {}
+    for group in all_groups:
+        if group["id"] not in unique_groups:
+            unique_groups[group["id"]] = group
+    
+    # Фильтруем закрытые группы и по минимальному количеству участников
+    filtered_groups = [
+        group for group in unique_groups.values() 
+        if group["is_closed"] == 0 and group["members"] >= min_members
+    ]
+    
+    # Сортируем по количеству участников
+    sorted_groups = sorted(filtered_groups, key=lambda x: x["members"], reverse=True)
+    
+    logger.info(f"После фильтрации и сортировки осталось {len(sorted_groups)} групп")
+    
+    # Возвращаем только max_count групп
+    result = sorted_groups[:max_count]
+    logger.info(f"Возвращаются первые {len(result)} групп")
+    
+    # Добавим логирование для отладки
+    for i, group in enumerate(result):
+        logger.info(f"Группа {i+1}: ID={group['id']}, members={group['members']}")
+    
+    return result
 
 async def get_vk_posts_in_groups(vk, group_ids, keywords=None, count=10, min_views=1000, days_back=7, max_posts_per_group=300):
+    """
+    Получение постов из групп ВКонтакте.
+    
+    Args:
+        vk (VKClient): Инициализированный клиент VK
+        group_ids (list): Список ID групп
+        keywords (list, optional): Список ключевых слов для фильтрации постов
+        count (int): Общее количество постов для возврата
+        min_views (int): Минимальное количество просмотров поста
+        days_back (int): Количество дней назад для поиска
+        max_posts_per_group (int): Максимальное количество постов из одной группы
+        
+    Returns:
+        list: Отсортированный список постов, отвечающих критериям
+    """
+    # Проверки
+    if vk is None or not vk.access_token or not group_ids:
+        logger.error("VK клиент не инициализирован, токен пуст или не указаны ID групп")
+        return []
+    
+    # Приводим входные параметры к нужному типу
+    if isinstance(group_ids, str):
+        group_ids = [group_ids]
+    
+    if keywords and isinstance(keywords, str):
+        keywords = [keywords]
+    
+    logger.info(f"Поиск постов в группах {group_ids} за {days_back} дней{' по ключевым словам: ' + ', '.join(keywords) if keywords else ' (тренды)'}")
+    
+    # Рассчитываем timestamp для фильтрации по дате
     now = int(time.time())
     start_time = now - (days_back * 24 * 60 * 60)
+    
     all_posts = []
-    keywords = keywords if keywords is None or isinstance(keywords, list) else [keywords]
-
-    for group_id in group_ids:
-        async with REQUEST_SEMAPHORE:
+    
+    # Разбиваем на чанки для параллельного выполнения
+    chunk_size = 3
+    group_chunks = [group_ids[i:i+chunk_size] for i in range(0, len(group_ids), chunk_size)]
+    
+    for chunk in group_chunks:
+        tasks = []
+        
+        # Создаем задачи для каждой группы в чанке
+        for group_id in chunk:
+            async def get_posts_from_group(gid):
+                try:
+                    # Приводим ID группы к нужному формату
+                    gid_str = str(gid).replace('-', '')
+                    owner_id = -int(gid_str)
+                    
+                    offset = 0
+                    group_posts = []
+                    
+                    # Получаем посты порциями
+                    while offset < max_posts_per_group:
+                        response = await vk._make_request("wall.get", {
+                            "owner_id": owner_id,
+                            "count": 100,
+                            "offset": offset,
+                            "extended": 1
+                        })
+                        
+                        if not response or "response" not in response:
+                            logger.error(f"Ошибка получения постов из группы {gid}")
+                            break
+                        
+                        posts = response["response"]["items"]
+                        logger.info(f"Получено {len(posts)} постов из группы {gid}, offset: {offset}")
+                        
+                        if not posts:
+                            break
+                        
+                        # Фильтруем посты
+                        for post in posts:
+                            if post["date"] < start_time or post["date"] > now:
+                                continue
+                                
+                            views_count = post.get("views", {}).get("count", 0)
+                            if views_count < min_views:
+                                continue
+                                
+                            if keywords and not any(kw.lower() in post.get("text", "").lower() for kw in keywords):
+                                continue
+                                
+                            group_posts.append(post)
+                        
+                        offset += 100
+                        if len(posts) < 100:
+                            break
+                    
+                    return group_posts
+                except Exception as e:
+                    logger.error(f"Ошибка при получении постов из группы {gid}: {str(e)}")
+                    return []
+            
+            tasks.append(get_posts_from_group(group_id))
+        
+        # Запускаем задачи параллельно
+        results = await asyncio.gather(*tasks)
+        for posts in results:
+            all_posts.extend(posts)
+        
+        # Делаем паузу между чанками
+        await asyncio.sleep(0.333)
+    
+    # Делаем посты уникальными
+    unique_posts = []
+    seen_keys = set()
+    
+    for post in all_posts:
+        post_key = f"{post['owner_id']}_{post['id']}"
+        if post_key not in seen_keys:
+            seen_keys.add(post_key)
+            unique_posts.append(post)
+    
+    # Сортируем посты
+    sorted_posts = []
+    if keywords and len(keywords) > 0:
+        # По просмотрам при поиске по ключевым словам
+        sorted_posts = sorted(
+            unique_posts, 
+            key=lambda p: p.get("views", {}).get("count", 0), 
+            reverse=True
+        )[:count]
+    else:
+        # По "тренду" для обычного поиска
+        for post in unique_posts:
+            # Получаем количество участников группы
+            gid_str = str(post.get("owner_id", "0")).replace('-', '')
+            group_id = int(gid_str)
             try:
-                response = vk.api.wall.get(owner_id=group_id, count=100, extended=1)
-                posts = [
-                    {
-                        'text': post['text'] or '',
-                        'likes': post['likes']['count'],
-                        'reposts': post['reposts']['count'],
-                        'comments': post['comments']['count'] if 'comments' in post else 0,
-                        'views': post['views']['count'] if 'views' in post else post['likes']['count'],
-                        'date': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(post['date'])),
-                        'post_id': post['id'],
-                        'owner_id': group_id,
-                        'url': f"https://vk.com/wall{group_id}_{post['id']}",
-                        'trend_score': (post['views']['count'] if 'views' in post else 0) * 2 +
-                                       post['likes']['count'] +
-                                       (post['comments']['count'] if 'comments' in post else 0) * 3,
-                        'media': None  # Пока без медиа
-                    }
-                    for post in response['items']
-                    if post['date'] >= start_time and
-                       (post.get('views', {}).get('count', post['likes']['count']) >= min_views) and
-                       (not keywords or any(k.lower() in post['text'].lower() for k in keywords))
-                ]
-                all_posts.extend(posts)
-            except ApiError as e:
-                logger.error(f"Ошибка для {group_id}: {e}")
-            await asyncio.sleep(0.333)
-    unique_posts = list({f"{post['owner_id']}_{post['post_id']}": post for post in all_posts}.values())
-    return sorted(unique_posts, key=lambda x: x['trend_score'], reverse=True)[:count]
+                group_members = await vk._get_group_members_count(group_id)
+            except Exception as e:
+                logger.error(f"Ошибка при получении количества участников группы {group_id}: {e}")
+                group_members = 10000  # Значение по умолчанию
+            
+            # Рассчитываем показатели вовлеченности по формуле из Telegram
+            raw_engagement_score = (
+                post.get("views", {}).get("count", 0) + 
+                (post.get("likes", {}).get("count", 0) * 10) + 
+                (post.get("comments", {}).get("count", 0) * 20) + 
+                (post.get("reposts", {}).get("count", 0) * 50)
+            )
+            group_members_for_calc = max(group_members, 10)  # Минимум 10 участников для логарифма
+            post["trend_score"] = int(raw_engagement_score / math.log10(group_members_for_calc)) if raw_engagement_score > 0 else 0
+        sorted_posts = sorted(
+            unique_posts, 
+            key=lambda p: p.get("trend_score", 0), 
+            reverse=True
+        )[:count]
+    
+    # Преобразуем в нужный формат
+    result = []
+    for post in sorted_posts:
+        # Извлекаем медиа вложения
+        media_links = []
+        
+        if "attachments" in post:
+            for attachment in post["attachments"]:
+                if attachment["type"] == "photo":
+                    sizes = attachment["photo"]["sizes"]
+                    largest = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
+                    media_links.append(largest["url"])
+                elif attachment["type"] == "video":
+                    media_links.append(f"https://vk.com/video{post['owner_id']}_{attachment['video']['id']}")
+                elif attachment["type"] == "doc" and "url" in attachment["doc"]:
+                    media_links.append(attachment["doc"]["url"])
+        
+        # Формируем пост
+        formatted_post = {
+            "text": post.get("text", ""),
+            "likes": post.get("likes", {}).get("count", 0),
+            "reposts": post.get("reposts", {}).get("count", 0),
+            "comments": post.get("comments", {}).get("count", 0),
+            "views": post.get("views", {}).get("count", 0),
+            "date": datetime.fromtimestamp(post["date"]).isoformat(),
+            "post_id": post["id"],
+            "owner_id": post["owner_id"],
+            "url": f"https://vk.com/wall{post['owner_id']}_{post['id']}",
+            "trend_score": post.get("trend_score")
+        }
+        
+        if media_links:
+            formatted_post["media"] = media_links
+        
+        result.append(formatted_post)
+    
+    logger.info(f"Найдено {len(result)} постов, соответствующих критериям")
+    return result
 
 async def get_vk_posts(vk, group_keywords, search_keywords=None, count=10, min_views=1000, days_back=7, max_groups=10, max_posts_per_group=300):
-    groups = await find_vk_groups(vk, group_keywords, min_members=1000, max_groups=max_groups)
+    """Получение постов из групп по ключевым словам.
+    
+    Args:
+        vk: Клиент VK API
+        group_keywords: Ключевые слова для поиска групп
+        search_keywords: Ключевые слова для фильтрации постов
+        count: Максимальное количество постов для возврата
+        min_views: Минимальное количество просмотров
+        days_back: Количество дней назад для поиска постов
+        max_groups: Максимальное количество групп для поиска
+        max_posts_per_group: Максимальное количество постов от одной группы
+    
+    Returns:
+        List[Dict]: Список найденных постов
+    """
+    groups = await find_vk_groups(vk, group_keywords, min_members=1000, max_count=max_groups)
+    if not groups:
+        logger.warning("Не найдены группы по заданным ключевым словам")
+        return []
+        
     group_ids = [g['id'] for g in groups]
     return await get_vk_posts_in_groups(vk, group_ids, search_keywords, count, min_views, days_back, max_posts_per_group)

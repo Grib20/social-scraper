@@ -132,40 +132,57 @@ async def auth_telegram_2fa(client: TelegramClient, password: str) -> None:
 
 async def find_channels(client: TelegramClient, keywords: List[str], min_members: int = 100000, max_channels: int = 20) -> List[Dict]:
     """Находит каналы по ключевым словам."""
-    channels = []
+    # Используем словарь для хранения уникальных каналов по ID
+    unique_channels = {}
     wrapper = TelegramClientWrapper(client, client.session.filename)
     
     for keyword in keywords:
         try:
             async with REQUEST_SEMAPHORE:
-                # Используем правильный запрос для поиска контактов/каналов
-                result = await wrapper._make_request(functions.contacts.SearchRequest(
+                # Используем правильный способ вызова поиска контактов
+                # Вместо передачи класса SearchRequest, создаем его экземпляр
+                search_request = functions.contacts.SearchRequest(
                     q=keyword,
                     limit=100 # Искать среди 100 первых результатов
-                ))
+                )
+                
+                # Вызываем напрямую через клиент
+                result = await client(search_request)
                 
                 # Обрабатываем найденные чаты
                 for chat in result.chats:
-                    if len(channels) >= max_channels:
-                        break
-                        
                     # Ищем только каналы (не мегагруппы)
                     if isinstance(chat, types.Channel) and not chat.megagroup:
+                        # Прерываем, если уже нашли достаточно каналов
+                        if len(unique_channels) >= max_channels:
+                            break
+                            
+                        # Пропускаем, если канал уже был добавлен ранее
+                        if chat.id in unique_channels:
+                            logger.info(f"Канал {chat.title} (ID: {chat.id}) уже был добавлен по другому ключевому слову")
+                            continue
+                            
                         # Получаем полное инфо для проверки количества участников
                         try:
-                            full_chat = await wrapper._make_group_request(GetFullChannelRequest, chat)
+                            # Используем класс GetFullChannelRequest напрямую через клиент
+                            full_request = functions.channels.GetFullChannelRequest(
+                                channel=chat
+                            )
+                            full_chat = await client(full_request)
+                            
                             members_count = full_chat.full_chat.participants_count
                             if members_count >= min_members:
                                 channel_id = f'@{chat.username}' if chat.username else str(chat.id)
-                                channels.append({
+                                unique_channels[chat.id] = {
                                     "id": chat.id,
                                     "title": chat.title,
                                     "username": chat.username,
                                     "members_count": members_count,
                                     "description": full_chat.full_chat.about
-                                })
+                                }
                                 # Сохраняем в кэше количество участников канала
                                 channel_members_cache[channel_id] = members_count
+                                logger.info(f"Найден канал {chat.title} (ID: {chat.id}) по ключевому слову '{keyword}' с {members_count} участниками")
                         except FloodWaitError as flood_e:
                             logger.warning(f"Flood wait на {flood_e.seconds} секунд при получении информации о канале {getattr(chat, 'username', chat.id)}")
                             await asyncio.sleep(flood_e.seconds)
@@ -178,9 +195,13 @@ async def find_channels(client: TelegramClient, keywords: List[str], min_members
             logger.error(f"Ошибка при поиске каналов по ключевому слову {keyword}: {e}")
             continue
     
-    # Сортируем найденные каналы по количеству участников (по убыванию)
-    sorted_channels = sorted(channels, key=lambda x: x['members_count'], reverse=True)
+    # Преобразуем словарь в список
+    channels_list = list(unique_channels.values())
     
+    # Сортируем найденные каналы по количеству участников (по убыванию)
+    sorted_channels = sorted(channels_list, key=lambda x: x['members_count'], reverse=True)
+    
+    logger.info(f"Найдено {len(sorted_channels)} уникальных каналов Telegram")
     return sorted_channels
 
 async def get_album_messages(client, chat, main_message):

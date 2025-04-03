@@ -252,10 +252,35 @@ def add_vk_account(api_key: str, account_data: Dict) -> bool:
     if not get_user(api_key):
         return False
     
+    # Проверяем токен
+    token = account_data.get('token')
+    if not token or not isinstance(token, str):
+        logger.error(f"Невалидный токен VK: токен отсутствует или не является строкой")
+        return False
+    
+    # Если токен уже выглядит как зашифрованный, не шифруем его повторно
+    if len(token) > 100 and not token.startswith('vk1.a.'):
+        logger.warning(f"Токен VK уже, возможно, зашифрован. Длина: {len(token)}")
+    
+    if not token.startswith('vk1.a.'):
+        logger.error(f"Токен VK имеет неверный формат, должен начинаться с vk1.a.")
+        return False
+    
     # Используем ID из account_data, если он есть, иначе генерируем новый
     account_id = account_data.get('id') or str(uuid.uuid4())
     added_at = datetime.now().isoformat()
-    encrypted_token = cipher.encrypt(account_data['token'].encode()).decode()
+    
+    # Шифруем токен
+    try:
+        encrypted_token = cipher.encrypt(token.encode()).decode()
+        logger.info(f"Токен VK успешно зашифрован для аккаунта {account_id}")
+    except Exception as e:
+        import traceback
+        error_details = str(e)
+        tb = traceback.format_exc()
+        logger.error(f"Ошибка при шифровании токена VK: {error_details}")
+        logger.error(f"Трассировка: {tb}")
+        return False
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -314,6 +339,7 @@ def delete_vk_account(api_key: str, account_id: str) -> bool:
 
 def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
     """Получает список активных аккаунтов для платформы."""
+    logger.info(f"Выполняется get_active_accounts для платформы {platform} и api_key {api_key}")
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -333,11 +359,62 @@ def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
         ''', (api_key, MAX_REQUESTS_PER_ACCOUNT, MAX_ACTIVE_ACCOUNTS))
     
     accounts = [dict(acc) for acc in cursor.fetchall()]
+    logger.info(f"Получено {len(accounts)} аккаунтов из базы данных для платформы {platform}")
     
     # Расшифровываем VK токены
     if platform == 'vk':
+        valid_accounts = []
         for acc in accounts:
-            acc['token'] = cipher.decrypt(acc['token'].encode()).decode()
+            account_id = acc.get('id', 'неизвестный')
+            logger.info(f"Обработка аккаунта {account_id}")
+            
+            try:
+                if acc.get('token') and isinstance(acc['token'], str):
+                    token_preview = acc['token'][:10] + '...' if len(acc['token']) > 10 else acc['token']
+                    logger.info(f"Токен для аккаунта {account_id}: {token_preview}")
+                    
+                    # Если токен уже выглядит как нешифрованный
+                    if acc['token'].startswith('vk1.a.'):
+                        logger.info(f"Токен для аккаунта {account_id} уже расшифрован или не был зашифрован")
+                        valid_accounts.append(acc)
+                        continue
+                        
+                    try:
+                        encrypted_token = acc['token']
+                        logger.info(f"Попытка расшифровки токена для аккаунта {account_id}")
+                        decrypted_token = cipher.decrypt(encrypted_token.encode()).decode()
+                        
+                        # Проверяем, что расшифрованный токен валидный
+                        if decrypted_token and decrypted_token.startswith('vk1.a.'):
+                            decrypted_preview = decrypted_token[:10] + '...' if len(decrypted_token) > 10 else decrypted_token
+                            logger.info(f"Успешно расшифрован токен для аккаунта {account_id}: {decrypted_preview}")
+                            acc['token'] = decrypted_token
+                            valid_accounts.append(acc)
+                        else:
+                            decrypted_preview = decrypted_token[:10] + '...' if decrypted_token and len(decrypted_token) > 10 else decrypted_token
+                            logger.error(f"Расшифрованный токен невалидный для аккаунта {account_id}: {decrypted_preview}")
+                            # Токен невалидный, не добавляем аккаунт
+                    except Exception as e:
+                        import traceback
+                        error_details = str(e)
+                        tb = traceback.format_exc()
+                        logger.error(f"Ошибка при расшифровке токена VK для аккаунта {account_id}: {error_details}")
+                        logger.error(f"Трассировка: {tb}")
+                        # Ошибка расшифровки, не добавляем аккаунт
+                else:
+                    if not acc.get('token'):
+                        logger.error(f"Токен отсутствует для аккаунта {account_id}")
+                    elif not isinstance(acc['token'], str):
+                        logger.error(f"Токен не является строкой для аккаунта {account_id}")
+                    # Токен отсутствует или не является строкой, не добавляем аккаунт
+            except Exception as e:
+                import traceback
+                logger.error(f"Непредвиденная ошибка при обработке аккаунта {account_id}: {str(e)}")
+                logger.error(f"Трассировка: {traceback.format_exc()}")
+                # Непредвиденная ошибка, не добавляем аккаунт
+        
+        logger.info(f"После обработки токенов осталось {len(valid_accounts)} валидных аккаунтов VK")
+        accounts = valid_accounts
     
     conn.close()
     return accounts
@@ -405,7 +482,25 @@ def get_vk_token(api_key: str) -> Optional[str]:
     conn.close()
     
     if result and result['vk_token']:
-        return cipher.decrypt(result['vk_token'].encode()).decode()
+        try:
+            decrypted_token = cipher.decrypt(result['vk_token'].encode()).decode()
+            if decrypted_token.startswith('vk1.a.'):
+                return decrypted_token
+            else:
+                logger.error(f"Расшифрованный токен VK имеет неверный формат: {decrypted_token}")
+                return None
+        except Exception as e:
+            import traceback
+            error_details = str(e)
+            tb = traceback.format_exc()
+            logger.error(f"Ошибка при расшифровке токена VK для пользователя {api_key}: {error_details}")
+            logger.error(f"Трассировка: {tb}")
+            
+            # Если токен выглядит как валидный, пробуем вернуть его напрямую
+            if result['vk_token'].startswith('vk1.a.'):
+                logger.info(f"Пробуем использовать токен напрямую для пользователя {api_key}")
+                return result['vk_token']
+            return None
     return None
 
 def get_users_dict() -> Dict:

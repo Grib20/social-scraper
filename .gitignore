@@ -71,6 +71,7 @@ htmlcov/
 .tox/
 coverage.xml
 *.cover
+sql.py
 
 # Чувствительные данные
 credentials.json
