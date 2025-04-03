@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from media_utils import get_media_info
 from user_manager import get_active_accounts, update_account_usage
 import math
+import redis
+import json
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -20,6 +22,28 @@ REQUEST_SEMAPHORE = asyncio.Semaphore(2)  # Максимум 2 одноврем�
 REQUEST_DELAY = 0.1  # 100мс между запросами (10 запросов в секунду)
 GROUP_DELAY = 1.0  # 1 секунда между запросами к разным группам
 DEGRADED_MODE_DELAY = 0.5  # Задержка в режиме пониженной производительности (500мс)
+
+# TTL для кэша количества участников (1 час)
+GROUP_MEMBERS_CACHE_TTL = 3600
+
+# Инициализация Redis
+try:
+    REDIS_URL = os.getenv("REDIS_URL")
+    if REDIS_URL:
+        logger.info(f"Подключение к Redis по URL: {REDIS_URL.split('@')[0]}@...")
+        redis_client = redis.from_url(REDIS_URL)
+        # Проверка соединения
+        redis_client.ping()
+        logger.info("Успешное подключение к Redis")
+    else:
+        logger.warning("REDIS_URL не задан, использую локальный кэш")
+        redis_client = None
+except Exception as e:
+    logger.error(f"Ошибка подключения к Redis: {e}")
+    redis_client = None
+
+# Глобальный кэш для количества участников групп (используется как fallback)
+GROUP_MEMBERS_CACHE = {}
 
 class VKClient:
     def __init__(self, access_token: str, proxy: Optional[str] = None, account_id: Optional[str] = None, api_key: Optional[str] = None):
@@ -34,6 +58,7 @@ class VKClient:
         self.last_group_request_time = 0
         self.requests_count = 0
         self.degraded_mode = False
+        self.group_members_cache = {}  # Кэш для хранения количества участников групп
 
     def set_degraded_mode(self, degraded: bool):
         """Устанавливает режим пониженной производительности."""
@@ -375,7 +400,31 @@ class VKClient:
         return posts
 
     async def _get_group_members_count(self, group_id: int) -> int:
-        """Получает количество участников группы."""
+        """Получает количество участников группы с использованием Redis."""
+        # Формируем ключ для Redis
+        redis_key = f"vk:group:members:{group_id}"
+        
+        # Проверяем Redis, если доступен
+        if redis_client:
+            try:
+                cached_value = redis_client.get(redis_key)
+                if cached_value:
+                    members_count = int(cached_value)
+                    logger.info(f"Получено количество участников группы {group_id} из Redis: {members_count}")
+                    return members_count
+            except Exception as e:
+                logger.error(f"Ошибка при чтении из Redis: {e}")
+        
+        # Проверяем глобальный кэш в памяти как fallback
+        if group_id in GROUP_MEMBERS_CACHE:
+            logger.info(f"Получено количество участников группы {group_id} из глобального кэша: {GROUP_MEMBERS_CACHE[group_id]}")
+            return GROUP_MEMBERS_CACHE[group_id]
+            
+        # Затем локальный кэш экземпляра
+        if group_id in self.group_members_cache:
+            logger.info(f"Получено количество участников группы {group_id} из локального кэша: {self.group_members_cache[group_id]}")
+            return self.group_members_cache[group_id]
+            
         try:
             logger.info(f"Запрашиваем количество участников группы {group_id}")
             result = await self._make_request("groups.getById", {
@@ -386,6 +435,19 @@ class VKClient:
             if "response" in result and result["response"] and "members_count" in result["response"][0]:
                 members_count = result["response"][0]["members_count"]
                 logger.info(f"Получено количество участников группы {group_id}: {members_count}")
+                
+                # Сохраняем результат во всех кэшах
+                self.group_members_cache[group_id] = members_count
+                GROUP_MEMBERS_CACHE[group_id] = members_count
+                
+                # Сохраняем в Redis с TTL, если доступен
+                if redis_client:
+                    try:
+                        redis_client.setex(redis_key, GROUP_MEMBERS_CACHE_TTL, members_count)
+                        logger.info(f"Сохранено количество участников группы {group_id} в Redis с TTL {GROUP_MEMBERS_CACHE_TTL} сек")
+                    except Exception as e:
+                        logger.error(f"Ошибка при сохранении в Redis: {e}")
+                
                 return members_count
             else:
                 logger.warning(f"Не удалось получить количество участников группы {group_id}")
@@ -623,11 +685,33 @@ async def get_vk_posts_in_groups(vk, group_ids, keywords=None, count=10, min_vie
             # Получаем количество участников группы
             gid_str = str(post.get("owner_id", "0")).replace('-', '')
             group_id = int(gid_str)
-            try:
-                group_members = await vk._get_group_members_count(group_id)
-            except Exception as e:
-                logger.error(f"Ошибка при получении количества участников группы {group_id}: {e}")
-                group_members = 10000  # Значение по умолчанию
+            
+            # Проверяем Redis и кэши
+            redis_key = f"vk:group:members:{group_id}"
+            group_members = None
+            
+            # Проверяем Redis, если доступен
+            if redis_client:
+                try:
+                    cached_value = redis_client.get(redis_key)
+                    if cached_value:
+                        group_members = int(cached_value)
+                        logger.info(f"Использовано количество участников группы {group_id} из Redis: {group_members}")
+                except Exception as e:
+                    logger.error(f"Ошибка при чтении из Redis: {e}")
+            
+            # Проверяем глобальный кэш если Redis не сработал
+            if group_members is None and group_id in GROUP_MEMBERS_CACHE:
+                group_members = GROUP_MEMBERS_CACHE[group_id]
+                logger.info(f"Использовано количество участников группы {group_id} из глобального кэша: {group_members}")
+            
+            # Запрашиваем через API если нет в кэшах
+            if group_members is None:
+                try:
+                    group_members = await vk._get_group_members_count(group_id)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении количества участников группы {group_id}: {e}")
+                    group_members = 10000  # Значение по умолчанию
             
             # Рассчитываем показатели вовлеченности по формуле из Telegram
             raw_engagement_score = (
