@@ -5,7 +5,49 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Админ-панель</title>
     <link rel="stylesheet" href="/static/css/admin.css">
+    <link rel="stylesheet" href="/static/css/stats.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        /* Принудительные стили для исправления ширины карточки */
+        .users-grid {
+            display: block !important;
+            width: 90% !important;
+            max-width: 800px !important;
+            margin: 20px auto !important;
+            padding: 0 !important;
+        }
+        
+        .user-card {
+            width: 100% !important;
+            max-width: 800px !important;
+            min-width: auto !important;
+            background-color: var(--card-bg-color) !important;
+            border: 1px solid var(--border-color) !important;
+            border-radius: 10px !important;
+            padding: 25px !important;
+            margin-bottom: 30px !important;
+            box-shadow: var(--card-shadow) !important;
+        }
+        
+        .api-key-section {
+            background-color: var(--input-bg-color) !important;
+            border-radius: 8px !important;
+            padding: 15px !important;
+            margin-bottom: 20px !important;
+            border: 1px solid var(--border-color) !important;
+        }
+        
+        .account-item {
+            display: flex !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            padding: 12px 15px !important;
+            margin-bottom: 10px !important;
+            background-color: var(--input-bg-color) !important;
+            border-radius: 8px !important;
+            border: 1px solid var(--border-color) !important;
+        }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -16,14 +58,42 @@
             </div>
         </header>
         
-        <div class="actions">
-            <button onclick="showRegisterModal()"><i class="fas fa-user-plus"></i> Добавить пользователя</button>
-    </div>
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('users')">
+                <i class="fas fa-users"></i> Пользователи
+            </button>
+            <button class="tab-btn" onclick="switchTab('stats')">
+                <i class="fas fa-chart-bar"></i> Статистика аккаунтов
+            </button>
+        </div>
+        
+        <div id="usersTab" class="tab-content active">
+            <div class="actions">
+                <button onclick="showRegisterModal()" class="add-user-btn">
+                    <i class="fas fa-user-plus"></i> Добавить пользователя
+                </button>
+            </div>
 
-        <div id="usersContainer">
-            <div class="loading">
-                <i class="fas fa-spinner fa-spin"></i>
-                <p>Загрузка пользователей...</p>
+            <div id="usersContainer" class="users-grid">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    <p>Загрузка пользователей...</p>
+                </div>
+            </div>
+        </div>
+        
+        <div id="statsTab" class="tab-content">
+            <div class="actions">
+                <button onclick="displayAccountsStats()" class="refresh-stats-btn">
+                    <i class="fas fa-sync-alt"></i> Обновить статистику
+                </button>
+            </div>
+            <div id="accountsStatsContainer">
+                <!-- Здесь будет отображаться статистика аккаунтов -->
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    <p>Загрузка статистики аккаунтов...</p>
+                </div>
             </div>
         </div>
     </div>
@@ -51,54 +121,80 @@
     <div id="telegramModal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="closeModal('telegramModal')">&times;</span>
-            <h2><i class="fab fa-telegram"></i> Добавить Telegram аккаунт</h2>
+            <h3><i class="fab fa-telegram"></i> Добавить Telegram аккаунт</h3>
             <form id="addTelegramForm">
                 <div class="form-group">
                     <label for="api_id"><i class="fas fa-key"></i> API ID:</label>
-                    <input type="text" id="api_id" name="api_id" required>
+                    <input type="text" id="api_id" name="api_id" required placeholder="12345678">
+                    <small>Получите API ID и API Hash на <a href="https://my.telegram.org/apps" target="_blank">my.telegram.org/apps</a></small>
                 </div>
                 <div class="form-group">
                     <label for="api_hash"><i class="fas fa-hashtag"></i> API Hash:</label>
-                    <input type="text" id="api_hash" name="api_hash" required>
+                    <input type="text" id="api_hash" name="api_hash" required placeholder="a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6">
                 </div>
                 <div class="form-group">
                     <label for="phone"><i class="fas fa-phone"></i> Номер телефона:</label>
                     <input type="text" id="phone" name="phone" required placeholder="+79XXXXXXXXX">
-            </div>
+                    <small>Укажите номер телефона в международном формате</small>
+                </div>
                 <div class="form-group">
                     <label for="proxy"><i class="fas fa-network-wired"></i> Прокси (опционально):</label>
                     <input type="text" id="proxy" name="proxy" placeholder="socks5://user:pass@host:port">
+                    <small>Укажите прокси в формате socks5://user:pass@host:port</small>
                 </div>
-                <div class="form-group">
-                    <label for="session_file"><i class="fas fa-file"></i> Файл сессии (опционально):</label>
-                    <input type="file" id="session_file" name="session_file">
-                    <small>Загрузите файл .session, если уже авторизованы в этом аккаунте</small>
-                </div>
-                <button type="submit"><i class="fas fa-plus-circle"></i> Добавить</button>
+                <button type="submit"><i class="fas fa-plus-circle"></i> Добавить аккаунт</button>
             </form>
             
-            <!-- Блок для авторизации через код -->
-            <div id="telegramAuthBlock" style="display: none;">
-                <h3><i class="fas fa-shield-alt"></i> Авторизация аккаунта</h3>
-                <p>На указанный номер телефона отправлен код подтверждения. Введите его ниже:</p>
+            <!-- Форма для загрузки файла сессии -->
+            <div class="form-separator">
+                <span>или</span>
+            </div>
+            <form id="uploadSessionForm">
+                <h4><i class="fas fa-file-upload"></i> Загрузить существующую сессию</h4>
+                <div class="form-group">
+                    <label for="upload_api_id"><i class="fas fa-key"></i> API ID:</label>
+                    <input type="text" id="upload_api_id" name="api_id" required placeholder="12345678">
+                </div>
+                <div class="form-group">
+                    <label for="upload_api_hash"><i class="fas fa-hashtag"></i> API Hash:</label>
+                    <input type="text" id="upload_api_hash" name="api_hash" required placeholder="a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6">
+                </div>
+                <div class="form-group">
+                    <label for="upload_phone"><i class="fas fa-phone"></i> Номер телефона:</label>
+                    <input type="text" id="upload_phone" name="phone" required placeholder="+79XXXXXXXXX">
+                </div>
+                <div class="form-group">
+                    <label for="upload_proxy"><i class="fas fa-network-wired"></i> Прокси (опционально):</label>
+                    <input type="text" id="upload_proxy" name="proxy" placeholder="socks5://user:pass@host:port">
+                </div>
+                <div class="form-group">
+                    <label for="session_file"><i class="fas fa-file"></i> Файл сессии:</label>
+                    <input type="file" id="session_file" name="session_file" required>
+                    <small>Загрузите файл .session для авторизованного аккаунта</small>
+                </div>
+                <button type="submit"><i class="fas fa-upload"></i> Загрузить сессию</button>
+            </form>
+            
+            <!-- Блок для ввода кода авторизации -->
+            <div id="telegramAuthBlock" style="display:none;">
+                <h4><i class="fas fa-shield-alt"></i> Авторизация Telegram</h4>
+                <p id="authStatus">Введите код авторизации, отправленный на ваш телефон:</p>
                 <div class="form-group">
                     <label for="auth_code"><i class="fas fa-lock"></i> Код авторизации:</label>
                     <input type="text" id="auth_code" placeholder="12345">
                 </div>
-                <button id="submitAuthCode"><i class="fas fa-check-circle"></i> Подтвердить</button>
-                <p id="authStatus"></p>
+                <button id="submitAuthCode" class="auth-btn"><i class="fas fa-check"></i> Подтвердить код</button>
             </div>
             
-            <!-- Блок для 2FA -->
-            <div id="telegram2FABlock" style="display: none;">
-                <h3><i class="fas fa-shield-alt"></i> Двухфакторная аутентификация</h3>
-                <p>Для этого аккаунта настроена двухфакторная аутентификация. Введите пароль:</p>
+            <!-- Блок для ввода пароля двухфакторной аутентификации -->
+            <div id="telegram2FABlock" style="display:none;">
+                <h4><i class="fas fa-key"></i> Двухфакторная аутентификация</h4>
+                <p id="twoFAStatus">Введите пароль двухфакторной аутентификации:</p>
                 <div class="form-group">
-                    <label for="two_fa_password"><i class="fas fa-key"></i> Пароль 2FA:</label>
+                    <label for="two_fa_password"><i class="fas fa-lock"></i> Пароль 2FA:</label>
                     <input type="password" id="two_fa_password">
                 </div>
-                <button id="submit2FA"><i class="fas fa-check-circle"></i> Подтвердить</button>
-                <p id="twoFAStatus"></p>
+                <button id="submit2FA" class="auth-btn"><i class="fas fa-check"></i> Подтвердить пароль</button>
             </div>
         </div>
     </div>
@@ -107,16 +203,17 @@
     <div id="vkModal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="closeModal('vkModal')">&times;</span>
-            <h2><i class="fab fa-vk"></i> Добавить VK аккаунт</h2>
+            <h3><i class="fab fa-vk"></i> Добавить VK аккаунт</h3>
             <form id="addVkForm">
                 <div class="form-group">
                     <label for="token"><i class="fas fa-key"></i> API токен:</label>
                     <input type="text" id="token" name="token" required placeholder="vk1.a.XcvBnMasd...">
-                    <small>Токен можно получить в настройках приложения VK или через <a href="https://vkhost.github.io/" target="_blank">VK Host</a></small>
+                    <small>Токен можно получить в настройках приложения VK или через <a href="https://vkhost.github.io/" target="_blank">VKHost</a></small>
                 </div>
                 <div class="form-group">
-                    <label for="proxy"><i class="fas fa-network-wired"></i> Прокси (опционально):</label>
-                    <input type="text" id="proxy" name="proxy" placeholder="socks5://user:pass@host:port">
+                    <label for="vk_proxy"><i class="fas fa-network-wired"></i> Прокси (опционально):</label>
+                    <input type="text" id="vk_proxy" name="proxy" placeholder="socks5://user:pass@host:port">
+                    <small>Укажите прокси в формате socks5://user:pass@host:port или http://user:pass@host:port</small>
                 </div>
                 <button type="submit"><i class="fas fa-plus-circle"></i> Добавить</button>
             </form>
@@ -124,13 +221,147 @@
     </div>
 
     <script src="/static/js/admin.js"></script>
-<script>
+    <script>
         // Функция выхода
-    function logout() {
-        localStorage.removeItem('adminKey');
-            document.cookie = "admin_key=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-            window.location.href = '/login';
+        function logout() {
+            console.log('Выход из системы...');
+            
+            try {
+                // Удаляем админ-ключ из localStorage
+                localStorage.removeItem('adminKey');
+                console.log('Ключ удален из localStorage');
+                
+                // Удаляем куки admin_key
+                document.cookie = 'admin_key=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Strict';
+                console.log('Ключ удален из cookies');
+                
+                // Для надежности, перезаписываем куки ещё раз с другим путем
+                document.cookie = 'admin_key=; Path=/admin; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Strict';
+                
+                // Показываем сообщение и перенаправляем на страницу входа
+                alert('Вы успешно вышли из системы');
+                window.location.href = '/login';
+            } catch (error) {
+                console.error('Ошибка при выходе из системы:', error);
+                alert('Произошла ошибка при выходе из системы: ' + error.message);
+                // Всё равно перенаправляем на логин
+                window.location.href = '/login';
+            }
         }
-</script>
+        
+        // Функция для переключения вкладок
+        function switchTab(tabName) {
+            console.log('Переключение на вкладку:', tabName);
+            const tabs = document.querySelectorAll('.tab-content');
+            const buttons = document.querySelectorAll('.tab-btn');
+            
+            tabs.forEach(tab => tab.classList.remove('active'));
+            buttons.forEach(btn => btn.classList.remove('active'));
+            
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            document.querySelector(`.tab-btn[onclick="switchTab('${tabName}')"]`).classList.add('active');
+            
+            // Сохраняем активную вкладку
+            localStorage.setItem('activeTab', tabName);
+            
+            // Если переключаемся на вкладку статистики, загружаем её
+            if (tabName === 'stats') {
+                if (typeof displayAccountsStats === 'function') {
+                    displayAccountsStats();
+                } else {
+                    console.error('Функция displayAccountsStats не найдена!');
+                }
+            }
+        }
+        
+        // Принудительно инициализируем переключение вкладок при загрузке
+        document.addEventListener('DOMContentLoaded', function() {
+            // Получаем сохраненную вкладку или используем 'users' по умолчанию
+            const activeTab = localStorage.getItem('activeTab') || 'users';
+            
+            // Принудительно обновляем классы вкладок
+            document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            
+            // Активируем нужную вкладку
+            const tabElement = document.getElementById(activeTab + 'Tab');
+            if (tabElement) tabElement.classList.add('active');
+            
+            const btnElement = document.querySelector(`.tab-btn[onclick="switchTab('${activeTab}')"]`);
+            if (btnElement) btnElement.classList.add('active');
+            
+            // Если активная вкладка - статистика, загружаем данные
+            if (activeTab === 'stats') {
+                if (typeof displayAccountsStats === 'function') {
+                    setTimeout(displayAccountsStats, 500);
+                } else {
+                    console.error('Функция displayAccountsStats не найдена!');
+                }
+            }
+            
+            console.log('Инициализация вкладок завершена, активная вкладка:', activeTab);
+        });
+        
+        // Функции для работы с модальными окнами
+        function showRegisterModal() {
+            document.getElementById('registerModal').style.display = 'block';
+        }
+
+        function showTelegramModal(userId) {
+            currentUser = userId;
+            
+            // Устанавливаем ID пользователя в скрытое поле
+            const hiddenField = document.createElement('input');
+            hiddenField.type = 'hidden';
+            hiddenField.name = 'userId';
+            hiddenField.value = userId;
+            
+            const form = document.getElementById('addTelegramForm');
+            if (form) {
+                form.appendChild(hiddenField);
+            }
+            
+            // Сбрасываем состояние модального окна
+            resetTelegramModal();
+            
+            // Показываем модальное окно
+            document.getElementById('telegramModal').style.display = 'block';
+        }
+
+        function showVkModal(userId) {
+            currentUser = userId;
+            
+            // Устанавливаем ID пользователя в скрытое поле
+            const hiddenField = document.createElement('input');
+            hiddenField.type = 'hidden';
+            hiddenField.name = 'userId';
+            hiddenField.value = userId;
+            
+            const form = document.getElementById('addVkForm');
+            if (form) {
+                form.appendChild(hiddenField);
+            }
+            
+            // Сбрасываем форму
+            if (form) {
+                form.reset();
+            }
+            
+            // Показываем модальное окно
+            document.getElementById('vkModal').style.display = 'block';
+        }
+
+        function closeModal(modalId) {
+            const modal = document.getElementById(modalId);
+            if (modal) {
+                modal.style.display = 'none';
+            }
+            
+            // Сбрасываем состояние Telegram модального окна
+            if (modalId === 'telegramModal') {
+                resetTelegramModal();
+            }
+        }
+    </script>
 </body>
 </html> 

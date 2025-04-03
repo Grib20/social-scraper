@@ -5,32 +5,77 @@ let currentTelegramAccountId = null;
 
 // Функция для сохранения админ-ключа
 function saveAdminKey(adminKey) {
+    if (!adminKey) {
+        console.error('Попытка сохранить пустой admin-key');
+        return;
+    }
+    
+    try {
     // Сохраняем в localStorage
     localStorage.setItem('adminKey', adminKey);
     
     // Устанавливаем cookie на всякий случай
-    document.cookie = `admin_key=${adminKey}; path=/; expires=Fri, 31 Dec 9999 23:59:59 GMT`;
-    
-    console.log('AdminKey сохранен:', adminKey);
+        // Устанавливаем срок действия на 30 дней
+        const expirationDate = new Date();
+        expirationDate.setDate(expirationDate.getDate() + 30);
+        
+        document.cookie = `admin_key=${adminKey}; path=/; expires=${expirationDate.toUTCString()}; SameSite=Strict`;
+        
+        const maskedKey = adminKey.length > 4 ? 
+            adminKey.substring(0, 2) + '*'.repeat(adminKey.length - 4) + adminKey.substring(adminKey.length - 2) : 
+            '****';
+        console.log('AdminKey сохранен (маскированный):', maskedKey);
+        
+        // Проверяем, сохранился ли ключ
+        const savedKey = localStorage.getItem('adminKey');
+        if (savedKey === adminKey) {
+            console.log('Проверка: ключ успешно сохранен в localStorage');
+        } else {
+            console.error('Проверка: ключ НЕ сохранен в localStorage!');
+        }
+    } catch (err) {
+        console.error('Ошибка при сохранении админ-ключа:', err);
+    }
 }
 
 // Функция для получения админ-ключа
 function getAdminKey() {
+    console.log('Извлечение админ-ключа...');
+    
     // Сначала пробуем получить из localStorage
     let adminKey = localStorage.getItem('adminKey');
+    console.log('Ключ из localStorage:', adminKey ? 'найден' : 'не найден');
     
     // Если нет в localStorage, пробуем получить из cookie
     if (!adminKey) {
-        const cookieValue = document.cookie
-            .split('; ')
-            .find(row => row.startsWith('admin_key='));
-        if (cookieValue) {
-            adminKey = cookieValue.split('=')[1];
+        console.log('Попытка получить ключ из cookies...');
+        const cookies = document.cookie.split(';');
+        console.log('Все cookies:', cookies);
+        
+        for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i].trim();
+            if (cookie.startsWith('admin_key=')) {
+                adminKey = cookie.substring('admin_key='.length, cookie.length);
+                console.log('Найден ключ в cookie:', adminKey);
+                
             // Если нашли в cookie, сохраняем в localStorage
             if (adminKey) {
+                    console.log('Сохраняем ключ из cookie в localStorage');
                 localStorage.setItem('adminKey', adminKey);
+                }
+                break;
             }
         }
+    }
+    
+    // Если ключ найден, выводим замаскированную версию для безопасности
+    if (adminKey) {
+        const maskedKey = adminKey.length > 4 ? 
+            adminKey.substring(0, 2) + '*'.repeat(adminKey.length - 4) + adminKey.substring(adminKey.length - 2) : 
+            '****';
+        console.log('Итоговый ключ (маскированный):', maskedKey);
+    } else {
+        console.log('Ключ не найден ни в localStorage, ни в cookies');
     }
     
     return adminKey;
@@ -40,6 +85,7 @@ function getAdminKey() {
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('Страница загружена');
     
+    try {
     // Получаем админ-ключ из localStorage, cookie или URL параметра
     let adminKey = getAdminKey();
     
@@ -64,7 +110,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
 
-    try {
         console.log('Проверка валидности админ-ключа...');
         const response = await fetch('/admin/validate', {
             method: 'POST',
@@ -83,14 +128,50 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         console.log('Админ-ключ валиден, загрузка пользователей...');
+        // Принудительно сохраняем ключ снова после успешной валидации
+        saveAdminKey(adminKey);
+        
+        // Загружаем пользователей
         await displayUsers();
         
+        // Восстанавливаем активную вкладку, если она была сохранена
+        const activeTab = localStorage.getItem('activeTab') || 'users';
+        
+        // Проверяем существование функции switchTab
+        if (typeof window.switchTab === 'function') {
+            window.switchTab(activeTab);
+        } else {
+            console.log('Функция switchTab не найдена, используем встроенную версию');
+            // Ручное переключение
+            const tabs = document.querySelectorAll('.tab-content');
+            const buttons = document.querySelectorAll('.tab-btn');
+            
+            tabs.forEach(tab => tab.classList.remove('active'));
+            buttons.forEach(btn => btn.classList.remove('active'));
+            
+            const activeTabElement = document.getElementById(activeTab + 'Tab');
+            if (activeTabElement) activeTabElement.classList.add('active');
+            
+            const activeButton = document.querySelector(`.tab-btn[onclick="switchTab('${activeTab}')"]`);
+            if (activeButton) activeButton.classList.add('active');
+            
+            // Если переключаемся на вкладку статистики, загружаем её
+            if (activeTab === 'stats' && typeof displayAccountsStats === 'function') {
+                displayAccountsStats();
+            }
+        }
+        
         // Подключаем обработчик для формы добавления пользователя
-        document.getElementById('addUserForm').addEventListener('submit', registerUser);
+        const addUserForm = document.getElementById('addUserForm');
+        if (addUserForm) {
+            addUserForm.addEventListener('submit', registerUser);
+        }
     } catch (error) {
         console.error('Ошибка проверки авторизации:', error);
-        localStorage.removeItem('adminKey');
-        window.location.href = '/login';
+        // НЕ удаляем ключ, чтобы не потерять его при временных ошибках
+        // localStorage.removeItem('adminKey');
+        // Показываем сообщение об ошибке вместо перенаправления
+        alert('Ошибка при проверке авторизации: ' + error.message);
     }
 });
 
@@ -117,111 +198,268 @@ async function displayUsers() {
             }
         });
         
-        if (response.ok) {
-            const users = await response.json();
-            if (users.length === 0) {
-                usersContainer.innerHTML = '<p>Нет пользователей</p>';
-                return;
-            }
+        if (!response.ok) {
+            throw new Error(`Ошибка HTTP: ${response.status}`);
+        }
+        
+        const users = await response.json();
+        
+        if (users.length === 0) {
+            usersContainer.innerHTML = `
+                <div class="no-data">
+                    <i class="fas fa-users-slash"></i>
+                    <p>Пользователи не найдены</p>
+                </div>
+            `;
+            return;
+        }
+        
+        usersContainer.innerHTML = '';
+        
+        users.forEach(user => {
+            const userCard = document.createElement('div');
+            userCard.className = 'user-card';
             
-            let html = '';
+            // Создаем заголовок карточки с именем пользователя и кнопкой удаления
+            const userHeader = document.createElement('div');
+            userHeader.className = 'user-header';
             
-            users.forEach(user => {
-                console.log('User data:', user); // Логирование данных для отладки
-                
-                const telegramAccountsHtml = user.telegram_accounts ? user.telegram_accounts.map(account => `
-                    <div class="account-item">
-                        <div class="account-info">
-                            <i class="fab fa-telegram"></i>
-                            <span>${account.phone || 'Неизвестный'}</span>
-                            <span class="account-status ${account.status === 'active' ? 'status-active' : 'status-pending'}">
-                                ${account.status === 'active' ? 'Активен' : 'Ожидает авторизации'}
-                            </span>
-                        </div>
-                        <button onclick="deleteTelegramAccount('${user.id}', '${account.phone}')" class="delete-account-btn">
-                            <i class="fas fa-trash-alt"></i>
-                        </button>
-                    </div>
-                `).join('') : '';
-                
-                const vkAccountsHtml = user.vk_accounts ? user.vk_accounts.map(account => `
-                    <div class="account-item">
-                        <div class="account-info">
-                            <i class="fab fa-vk"></i>
-                            <span>Токен: ${maskToken(account.token || '')}</span>
-                            <span class="account-status ${account.status === 'active' ? 'status-active' : 'status-pending'}">
-                                ${account.status === 'active' ? 'Активен' : 'Ожидает авторизации'}
-                            </span>
-                        </div>
-                        <button onclick="deleteVkAccount('${user.id}', '${account.id}')" class="delete-account-btn">
-                            <i class="fas fa-trash-alt"></i>
-                        </button>
-                    </div>
-                `).join('') : '';
-                
-                html += `
-                    <div class="user-card">
-                        <div class="user-header">
-                            <h3><i class="fas fa-user"></i> ${user.username}</h3>
-                            <button onclick="deleteUser('${user.id}')" class="delete-user-btn">
-                                <i class="fas fa-trash-alt"></i>
-                            </button>
-                        </div>
-                        
-                        <div class="api-key-section">
-                            <div class="api-key-label">API Ключ:</div>
-                            <div class="api-key-container">
-                                <code>${user.api_key || 'Не установлен'}</code>
-                                <button onclick="copyToClipboard('${user.api_key}')" title="Копировать API ключ">
-                                    <i class="fas fa-copy"></i>
-                                </button>
-                                <button onclick="regenerateApiKey('${user.id}')" title="Перегенерировать API ключ">
-                                    <i class="fas fa-sync-alt"></i>
-                                </button>
-                            </div>
-                        </div>
-                        
-                        <div class="accounts-section">
-                            <div class="accounts-header">
-                                <h4>Аккаунты Telegram</h4>
-                                <button onclick="showTelegramModal('${user.id}')" class="add-account-btn">
-                                    <i class="fas fa-plus"></i> Добавить
-                                </button>
-                            </div>
-                            <div class="accounts-list">
-                                ${telegramAccountsHtml || '<p>Нет аккаунтов</p>'}
-                            </div>
-                            
-                            <div class="accounts-header">
-                                <h4>Аккаунты VK</h4>
-                                <button onclick="showVkModal('${user.id}')" class="add-account-btn">
-                                    <i class="fas fa-plus"></i> Добавить
-                                </button>
-                            </div>
-                            <div class="accounts-list">
-                                ${vkAccountsHtml || '<p>Нет аккаунтов</p>'}
-                            </div>
-                        </div>
+            const userName = document.createElement('h3');
+            userName.innerHTML = `<i class="fas fa-user"></i> ${user.username}`;
+            
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'delete-user-btn';
+            deleteButton.innerHTML = `<i class="fas fa-trash-alt"></i>`;
+            deleteButton.onclick = () => deleteUser(user.id);
+            
+            userHeader.appendChild(userName);
+            userHeader.appendChild(deleteButton);
+            userCard.appendChild(userHeader);
+            
+            // Создаем секцию с API ключом
+            const apiKeySection = document.createElement('div');
+            apiKeySection.className = 'api-key-section';
+            
+            const apiKeyLabel = document.createElement('div');
+            apiKeyLabel.className = 'api-key-label';
+            apiKeyLabel.textContent = 'API Ключ:';
+            
+            const apiKeyContainer = document.createElement('div');
+            apiKeyContainer.className = 'api-key-container';
+            
+            const apiKeyCode = document.createElement('code');
+            apiKeyCode.textContent = user.api_key;
+            
+            const apiKeyActions = document.createElement('div');
+            apiKeyActions.className = 'api-key-actions';
+            
+            const copyButton = document.createElement('button');
+            copyButton.innerHTML = `<i class="fas fa-copy"></i>`;
+            copyButton.onclick = () => copyToClipboard(user.api_key);
+            copyButton.title = 'Копировать';
+            
+            const regenerateButton = document.createElement('button');
+            regenerateButton.innerHTML = `<i class="fas fa-sync-alt"></i>`;
+            regenerateButton.onclick = () => regenerateApiKey(user.id);
+            regenerateButton.title = 'Сгенерировать новый ключ';
+            
+            apiKeyActions.appendChild(copyButton);
+            apiKeyActions.appendChild(regenerateButton);
+            
+            apiKeyContainer.appendChild(apiKeyCode);
+            apiKeyContainer.appendChild(apiKeyActions);
+            
+            apiKeySection.appendChild(apiKeyLabel);
+            apiKeySection.appendChild(apiKeyContainer);
+            
+            userCard.appendChild(apiKeySection);
+            
+            // Создаем секцию с аккаунтами Telegram
+            const telegramSection = document.createElement('div');
+            telegramSection.className = 'accounts-section';
+            
+            const telegramHeader = document.createElement('div');
+            telegramHeader.className = 'accounts-header';
+            
+            const telegramTitle = document.createElement('h4');
+            telegramTitle.innerHTML = `<i class="fab fa-telegram"></i> Telegram аккаунты`;
+            
+            const addTelegramButton = document.createElement('button');
+            addTelegramButton.className = 'add-account-btn';
+            addTelegramButton.innerHTML = `<i class="fas fa-plus"></i> Добавить`;
+            addTelegramButton.onclick = () => showTelegramModal(user.id);
+            
+            telegramHeader.appendChild(telegramTitle);
+            telegramHeader.appendChild(addTelegramButton);
+            
+            const telegramList = document.createElement('div');
+            telegramList.className = 'accounts-list';
+            
+            if (user.telegram_accounts && user.telegram_accounts.length > 0) {
+                user.telegram_accounts.forEach(account => {
+                    const telegramItem = createAccountItem(
+                        'telegram', 
+                        account.id, 
+                        user.id, 
+                        account.phone, 
+                        account.status, 
+                        account.is_active
+                    );
+                    telegramList.appendChild(telegramItem);
+                });
+            } else {
+                telegramList.innerHTML = `
+                    <div class="no-accounts">
+                        <p>Нет добавленных аккаунтов Telegram</p>
                     </div>
                 `;
-            });
+            }
             
-            usersContainer.innerHTML = html;
-        } else {
-            const error = await response.json();
-            usersContainer.innerHTML = `<p>Ошибка: ${error.detail || 'Не удалось загрузить пользователей'}</p>`;
-        }
+            telegramSection.appendChild(telegramHeader);
+            telegramSection.appendChild(telegramList);
+            
+            userCard.appendChild(telegramSection);
+            
+            // Создаем секцию с аккаунтами VK
+            const vkSection = document.createElement('div');
+            vkSection.className = 'accounts-section';
+            
+            const vkHeader = document.createElement('div');
+            vkHeader.className = 'accounts-header';
+            
+            const vkTitle = document.createElement('h4');
+            vkTitle.innerHTML = `<i class="fab fa-vk"></i> VK аккаунты`;
+            
+            const addVkButton = document.createElement('button');
+            addVkButton.className = 'add-account-btn';
+            addVkButton.innerHTML = `<i class="fas fa-plus"></i> Добавить`;
+            addVkButton.onclick = () => showVkModal(user.id);
+            
+            vkHeader.appendChild(vkTitle);
+            vkHeader.appendChild(addVkButton);
+            
+            const vkList = document.createElement('div');
+            vkList.className = 'accounts-list';
+            
+            if (user.vk_accounts && user.vk_accounts.length > 0) {
+                user.vk_accounts.forEach(account => {
+                    let displayName = account.user_name || "Токен: " + maskToken(account.token);
+                    const vkItem = createAccountItem(
+                        'vk', 
+                        account.id, 
+                        user.id, 
+                        displayName, 
+                        account.status, 
+                        account.is_active
+                    );
+                    vkList.appendChild(vkItem);
+                });
+            } else {
+                vkList.innerHTML = `
+                    <div class="no-accounts">
+                        <p>Нет добавленных аккаунтов VK</p>
+                    </div>
+                `;
+            }
+            
+            vkSection.appendChild(vkHeader);
+            vkSection.appendChild(vkList);
+            
+            userCard.appendChild(vkSection);
+            
+            usersContainer.appendChild(userCard);
+        });
     } catch (error) {
         console.error('Ошибка при загрузке пользователей:', error);
-        usersContainer.innerHTML = '<p>Произошла ошибка при загрузке пользователей</p>';
+        usersContainer.innerHTML = `
+            <div class="error-message">
+                <i class="fas fa-exclamation-triangle"></i>
+                <p>Ошибка при загрузке пользователей: ${error.message}</p>
+            </div>
+        `;
     }
 }
 
-// Функция для маскирования токена
+// Функция для маскирования токена (показывает только первые и последние 4 символа)
 function maskToken(token) {
-    if (!token) return '';
+    if (!token) return 'Нет токена';
     if (token.length <= 8) return token;
-    return token.substr(0, 4) + '...' + token.substr(-4);
+    
+    return token.substring(0, 4) + '...' + token.substring(token.length - 4);
+}
+
+// Функция для создания элемента аккаунта
+function createAccountItem(type, accountId, userId, displayName, status, isActive) {
+    const accountItem = document.createElement('div');
+    accountItem.className = 'account-item';
+    
+    const accountInfo = document.createElement('div');
+    accountInfo.className = 'account-info';
+    
+    const icon = document.createElement('i');
+    icon.className = type === 'telegram' ? 'fab fa-telegram' : 'fab fa-vk';
+    
+    const name = document.createElement('span');
+    name.textContent = displayName;
+    
+    const statusBadge = document.createElement('span');
+    statusBadge.className = `account-status status-${status.toLowerCase()}`;
+    statusBadge.textContent = getStatusText(status);
+    
+    accountInfo.appendChild(icon);
+    accountInfo.appendChild(name);
+    accountInfo.appendChild(statusBadge);
+    
+    const accountActions = document.createElement('div');
+    accountActions.className = 'account-actions';
+    
+    // Кнопка проверки статуса
+    const checkButton = document.createElement('button');
+    checkButton.className = 'check-status-btn';
+    checkButton.innerHTML = `<i class="fas fa-sync-alt"></i>`;
+    checkButton.title = 'Проверить статус';
+    checkButton.onclick = () => checkAccountStatus(type, accountId);
+    
+    // Кнопка переключения статуса активности
+    const toggleButton = document.createElement('button');
+    toggleButton.className = 'toggle-status-btn';
+    toggleButton.innerHTML = isActive 
+        ? `<i class="fas fa-toggle-on"></i>` 
+        : `<i class="fas fa-toggle-off"></i>`;
+    toggleButton.title = isActive ? 'Деактивировать' : 'Активировать';
+    toggleButton.onclick = () => toggleAccountStatus(type, accountId, !isActive);
+    
+    // Кнопка удаления
+    const deleteButton = document.createElement('button');
+    deleteButton.className = 'delete-account-btn';
+    deleteButton.innerHTML = `<i class="fas fa-trash-alt"></i>`;
+    deleteButton.title = 'Удалить';
+    deleteButton.onclick = () => deleteAccount(type, accountId, userId);
+    
+    accountActions.appendChild(checkButton);
+    accountActions.appendChild(toggleButton);
+    accountActions.appendChild(deleteButton);
+    
+    accountItem.appendChild(accountInfo);
+    accountItem.appendChild(accountActions);
+    
+    return accountItem;
+}
+
+// Функция для получения текстового представления статуса
+function getStatusText(status) {
+    const statusMap = {
+        'active': 'Активен',
+        'inactive': 'Неактивен',
+        'error': 'Ошибка',
+        'pending': 'В обработке',
+        'rate_limited': 'Ограничен',
+        'banned': 'Заблокирован',
+        'validation_required': 'Требуется валидация',
+        'unknown': 'Неизвестно'
+    };
+    
+    return statusMap[status.toLowerCase()] || status;
 }
 
 // Копировать в буфер обмена
@@ -271,9 +509,18 @@ function copyToClipboard(text) {
 function showNotification(message, type = 'info') {
     const notification = document.createElement('div');
     notification.className = `notification ${type}`;
+    
+    let iconClass = 'fa-info-circle';
+    if (type === 'success') iconClass = 'fa-check-circle';
+    else if (type === 'error') iconClass = 'fa-exclamation-circle';
+    else if (type === 'warning') iconClass = 'fa-exclamation-triangle';
+    
+    // Проверяем, содержит ли сообщение уже HTML-иконку
+    const hasIcon = message.includes('<i class="fas');
+    
     notification.innerHTML = `
         <div class="notification-content">
-            <i class="fas ${type === 'success' ? 'fa-check-circle' : type === 'error' ? 'fa-exclamation-circle' : 'fa-info-circle'}"></i>
+            ${hasIcon ? '' : `<i class="fas ${iconClass}"></i>`}
             <span>${message}</span>
         </div>
         <button class="close-notification">×</button>
@@ -289,7 +536,7 @@ function showNotification(message, type = 'info') {
     // Автоматически скрываем через 3 секунды
     const timeout = setTimeout(() => {
         closeNotification(notification);
-    }, 3000);
+    }, 3500);
     
     // Обработка закрытия уведомления
     const closeButton = notification.querySelector('.close-notification');
@@ -312,24 +559,79 @@ function closeNotification(notification) {
 // Функции для работы с модальными окнами
 function showRegisterModal() {
     document.getElementById('registerModal').style.display = 'block';
+    document.getElementById('username').focus();
 }
 
 function showTelegramModal(userId) {
     currentUser = userId;
+    
+    // Устанавливаем ID пользователя в скрытое поле
+    const hiddenField = document.createElement('input');
+    hiddenField.type = 'hidden';
+    hiddenField.name = 'userId';
+    hiddenField.value = userId;
+    
+    const form = document.getElementById('addTelegramForm');
+    if (form) {
+        // Удаляем старое поле userId, если оно есть
+        const oldField = form.querySelector('input[name="userId"]');
+        if (oldField) {
+            form.removeChild(oldField);
+        }
+        form.appendChild(hiddenField);
+    }
+    
+    // Сбрасываем состояние модального окна
+    resetTelegramModal();
+    
+    // Показываем модальное окно
     document.getElementById('telegramModal').style.display = 'block';
+    document.getElementById('api_id').focus();
 }
 
 function showVkModal(userId) {
     currentUser = userId;
+    
+    // Устанавливаем ID пользователя в скрытое поле
+    const hiddenField = document.createElement('input');
+    hiddenField.type = 'hidden';
+    hiddenField.name = 'userId';
+    hiddenField.value = userId;
+    
+    const form = document.getElementById('addVkForm');
+    if (form) {
+        // Удаляем старое поле userId, если оно есть
+        const oldField = form.querySelector('input[name="userId"]');
+        if (oldField) {
+            form.removeChild(oldField);
+        }
+        form.appendChild(hiddenField);
+    }
+    
+    // Сбрасываем форму
+    if (form) {
+        form.reset();
+    }
+    
+    // Показываем модальное окно
     document.getElementById('vkModal').style.display = 'block';
+    document.getElementById('token').focus();
 }
 
 function closeModal(modalId) {
-    document.getElementById(modalId).style.display = 'none';
+    const modal = document.getElementById(modalId);
+    if (modal) {
+        modal.style.display = 'none';
+    }
     
     // Сбрасываем состояние Telegram модального окна
     if (modalId === 'telegramModal') {
         resetTelegramModal();
+    }
+    
+    // Сбрасываем состояние VK модального окна
+    if (modalId === 'vkModal') {
+        resetVkModal();
     }
 }
 
@@ -624,17 +926,44 @@ document.getElementById('submit2FA').addEventListener('click', async () => {
     }
 });
 
-// Функция для сброса модального окна Telegram
+// Функция сброса состояния модального окна Telegram
 function resetTelegramModal() {
-    document.getElementById('addTelegramForm').reset();
-    document.getElementById('addTelegramForm').style.display = 'block';
-    document.getElementById('telegramAuthBlock').style.display = 'none';
-    document.getElementById('telegram2FABlock').style.display = 'none';
-    document.getElementById('authStatus').textContent = '';
-    document.getElementById('twoFAStatus').textContent = '';
-    document.getElementById('auth_code').value = '';
-    document.getElementById('two_fa_password').value = '';
-    currentTelegramAccountId = null;
+    // Сбрасываем форму добавления Telegram
+    const addTelegramForm = document.getElementById('addTelegramForm');
+    if (addTelegramForm) {
+        addTelegramForm.reset();
+    }
+    
+    // Сбрасываем форму загрузки сессии
+    const uploadSessionForm = document.getElementById('uploadSessionForm');
+    if (uploadSessionForm) {
+        uploadSessionForm.reset();
+    }
+    
+    // Скрываем блок авторизации
+    const authBlock = document.getElementById('telegramAuthBlock');
+    if (authBlock) {
+        authBlock.style.display = 'none';
+    }
+    
+    // Скрываем блок 2FA
+    const twoFABlock = document.getElementById('telegram2FABlock');
+    if (twoFABlock) {
+        twoFABlock.style.display = 'none';
+    }
+    
+    console.log('Состояние модального окна Telegram сброшено');
+}
+
+// Функция сброса VK модального окна
+function resetVkModal() {
+    console.log('Сброс состояния модального окна VK');
+    
+    // Сбрасываем форму
+    const form = document.getElementById('addVkForm');
+    if (form) {
+        form.reset();
+    }
 }
 
 // Функция удаления аккаунтов
@@ -871,3 +1200,606 @@ document.getElementById('addVkForm').addEventListener('submit', async (e) => {
         submitButton.innerHTML = originalButtonText;
     }
 }); 
+
+// Функция для проверки статуса аккаунта Telegram
+async function checkTelegramStatus(accountId) {
+    if (!accountId) return;
+    
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return;
+    }
+    
+    // Показываем индикатор в кнопке
+    const statusButton = document.querySelector(`button[data-check-status="${accountId}"]`);
+    if (statusButton) {
+        const originalText = statusButton.innerHTML;
+        statusButton.disabled = true;
+        statusButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+        
+        try {
+            const response = await fetch(`/api/telegram/accounts/${accountId}/status`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${adminKey}`,
+                    'X-User-Id': statusButton.getAttribute('data-user-id')
+                }
+            });
+            
+            statusButton.disabled = false;
+            statusButton.innerHTML = originalText;
+            
+            if (response.ok) {
+                const result = await response.json();
+                const statusIndicator = document.querySelector(`[data-account-status="${accountId}"]`);
+                
+                if (statusIndicator) {
+                    if (result.is_authorized) {
+                        statusIndicator.className = 'account-status status-active';
+                        statusIndicator.innerHTML = '<i class="fas fa-check-circle"></i> Активен';
+                        showNotification('<i class="fas fa-check-circle"></i> Аккаунт авторизован и активен', 'success');
+                    } else {
+                        statusIndicator.className = 'account-status status-pending';
+                        statusIndicator.innerHTML = '<i class="fas fa-clock"></i> Ожидает авторизации';
+                        showNotification('<i class="fas fa-exclamation-triangle"></i> Аккаунт требует авторизации', 'warning');
+                    }
+                    
+                    // Обновляем кнопку для повторной авторизации
+                    const authButton = document.querySelector(`button[data-resend-code="${accountId}"]`);
+                    if (authButton) {
+                        authButton.disabled = result.is_authorized;
+                    }
+                }
+            } else {
+                const error = await response.json();
+                showNotification(`<i class="fas fa-exclamation-circle"></i> Ошибка при проверке статуса: ${error.detail || 'Неизвестная ошибка'}`, 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка при проверке статуса аккаунта:', error);
+            showNotification('<i class="fas fa-exclamation-circle"></i> Произошла ошибка при проверке статуса аккаунта', 'error');
+            
+            statusButton.disabled = false;
+            statusButton.innerHTML = originalText;
+        }
+    }
+}
+
+// Функция для повторной отправки кода авторизации
+async function resendTelegramCode(accountId) {
+    if (!accountId) return;
+    
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return;
+    }
+    
+    // Показываем индикатор в кнопке
+    const authButton = document.querySelector(`button[data-resend-code="${accountId}"]`);
+    if (authButton) {
+        const originalText = authButton.innerHTML;
+        authButton.disabled = true;
+        authButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+        
+        try {
+            const response = await fetch(`/api/telegram/accounts/${accountId}/resend-code`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${adminKey}`,
+                    'X-User-Id': authButton.getAttribute('data-user-id')
+                }
+            });
+            
+            authButton.disabled = false;
+            authButton.innerHTML = originalText;
+            
+            if (response.ok) {
+                const result = await response.json();
+                
+                if (result.requires_auth) {
+                    // Открываем модальное окно для ввода кода
+                    showTelegramAuthModal(accountId);
+                    showNotification('<i class="fas fa-paper-plane"></i> Код авторизации отправлен на ваш телефон', 'info');
+                } else {
+                    showNotification('<i class="fas fa-check-circle"></i> ' + (result.message || 'Аккаунт уже авторизован'), 'success');
+                    await displayUsers(); // Обновляем список пользователей
+                }
+            } else {
+                const error = await response.json();
+                showNotification(`<i class="fas fa-exclamation-circle"></i> Ошибка при отправке кода: ${error.detail || 'Неизвестная ошибка'}`, 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка при отправке кода авторизации:', error);
+            showNotification('<i class="fas fa-exclamation-circle"></i> Произошла ошибка при отправке кода авторизации', 'error');
+            
+            authButton.disabled = false;
+            authButton.innerHTML = originalText;
+        }
+    }
+}
+
+// Функция для открытия модального окна авторизации аккаунта
+function showTelegramAuthModal(accountId) {
+    currentTelegramAccountId = accountId;
+    
+    // Открываем модальное окно авторизации
+    document.getElementById('telegramModal').style.display = 'block';
+    document.getElementById('addTelegramForm').style.display = 'none';
+    document.getElementById('telegramAuthBlock').style.display = 'block';
+    document.getElementById('telegram2FABlock').style.display = 'none';
+    document.getElementById('authStatus').textContent = 'Ожидание ввода кода...';
+    
+    // Очищаем поле ввода кода
+    document.getElementById('auth_code').value = '';
+}
+
+// Обработчик формы загрузки файла сессии
+document.getElementById('uploadSessionForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return;
+    }
+    
+    // Показываем индикатор загрузки
+    const submitButton = e.target.querySelector('button[type="submit"]');
+    const originalButtonText = submitButton.innerHTML;
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Загрузка...';
+    
+    try {
+        const response = await fetch('/api/telegram/upload-session', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${adminKey}`,
+                'X-User-Id': currentUser
+            },
+            body: formData
+        });
+        
+        submitButton.disabled = false;
+        submitButton.innerHTML = originalButtonText;
+        
+        if (response.ok) {
+            const result = await response.json();
+            showNotification(`Файл сессии загружен. Статус: ${result.is_authorized ? 'Авторизован' : 'Требуется авторизация'}`, 'success');
+            closeModal('telegramModal');
+            await displayUsers();
+        } else {
+            const error = await response.json();
+            showNotification(`Ошибка: ${error.detail || 'Не удалось загрузить файл сессии'}`, 'error');
+        }
+    } catch (error) {
+        console.error('Ошибка при загрузке файла сессии:', error);
+        showNotification('Произошла ошибка при загрузке файла сессии', 'error');
+        
+        submitButton.disabled = false;
+        submitButton.innerHTML = originalButtonText;
+    }
+});
+
+// Функция для проверки статуса токена VK
+async function checkVkStatus(accountId) {
+    if (!accountId) return;
+    
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        window.location.href = '/login';
+        return;
+    }
+    
+    // Показываем индикатор в кнопке
+    const statusButton = document.querySelector(`button[data-check-vk-status="${accountId}"]`);
+    if (statusButton) {
+        const originalText = statusButton.innerHTML;
+        statusButton.disabled = true;
+        statusButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+        
+        try {
+            const response = await fetch(`/api/vk/accounts/${accountId}/status`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${adminKey}`,
+                    'X-User-Id': statusButton.getAttribute('data-user-id')
+                }
+            });
+            
+            statusButton.disabled = false;
+            statusButton.innerHTML = originalText;
+            
+            if (response.ok) {
+                const result = await response.json();
+                const statusIndicator = document.querySelector(`[data-vk-account-status="${accountId}"]`);
+                
+                if (statusIndicator) {
+                    updateVkStatusIndicator(statusIndicator, result.status);
+                    
+                    // Обработка различных статусов
+                    switch (result.status) {
+                        case 'active':
+                            showNotification('<i class="fas fa-check-circle"></i> Токен VK активен и работает', 'success');
+                            break;
+                        case 'banned':
+                            showNotification('<i class="fas fa-ban"></i> Токен VK заблокирован', 'error');
+                            break;
+                        case 'invalid':
+                            showNotification('<i class="fas fa-exclamation-triangle"></i> Токен VK недействителен', 'error');
+                            break;
+                        case 'expired':
+                            showNotification('<i class="fas fa-clock"></i> Срок действия токена VK истек', 'warning');
+                            break;
+                        default:
+                            showNotification('<i class="fas fa-question-circle"></i> Неизвестный статус токена VK', 'warning');
+                    }
+                }
+            } else {
+                const error = await response.json();
+                showNotification(`<i class="fas fa-exclamation-circle"></i> Ошибка при проверке статуса: ${error.detail || 'Неизвестная ошибка'}`, 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка при проверке статуса токена VK:', error);
+            showNotification('<i class="fas fa-exclamation-circle"></i> Произошла ошибка при проверке статуса токена', 'error');
+            
+            statusButton.disabled = false;
+            statusButton.innerHTML = originalText;
+        }
+    }
+}
+
+// Функция для обновления индикатора статуса VK
+function updateVkStatusIndicator(statusIndicator, status) {
+    statusIndicator.className = 'account-status';
+    
+    switch (status) {
+        case 'active':
+            statusIndicator.classList.add('status-active');
+            statusIndicator.innerHTML = '<i class="fas fa-check-circle"></i> Активен';
+            break;
+        case 'banned':
+            statusIndicator.classList.add('status-error');
+            statusIndicator.innerHTML = '<i class="fas fa-ban"></i> Заблокирован';
+            break;
+        case 'invalid':
+            statusIndicator.classList.add('status-error');
+            statusIndicator.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Недействителен';
+            break;
+        case 'expired':
+            statusIndicator.classList.add('status-warning');
+            statusIndicator.innerHTML = '<i class="fas fa-clock"></i> Истек срок';
+            break;
+        default:
+            statusIndicator.classList.add('status-pending');
+            statusIndicator.innerHTML = '<i class="fas fa-question-circle"></i> Неизвестно';
+    }
+}
+
+// Функция для получения HTML статуса VK аккаунта
+function getVkStatusHTML(status) {
+    switch (status) {
+        case 'active':
+            return '<i class="fas fa-check-circle"></i> Активен';
+        case 'banned':
+            return '<i class="fas fa-ban"></i> Заблокирован';
+        case 'invalid':
+            return '<i class="fas fa-exclamation-triangle"></i> Недействителен';
+        case 'expired':
+            return '<i class="fas fa-clock"></i> Истек срок';
+        default:
+            return '<i class="fas fa-question-circle"></i> Требует проверки';
+    }
+}
+
+/**
+ * Отображает статистику аккаунтов
+ */
+async function displayAccountsStats() {
+    console.log('Загрузка статистики аккаунтов...');
+    
+    // Добавляем анимацию для кнопки обновления
+    const refreshBtn = document.querySelector('.refresh-stats-btn');
+    if (refreshBtn) {
+        const icon = refreshBtn.querySelector('i');
+        if (icon) {
+            icon.classList.add('fa-spin');
+            refreshBtn.disabled = true;
+        }
+    }
+    
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        console.error('Админ-ключ не найден');
+        
+        // Останавливаем анимацию
+        if (refreshBtn) {
+            const icon = refreshBtn.querySelector('i');
+            if (icon) {
+                icon.classList.remove('fa-spin');
+                refreshBtn.disabled = false;
+            }
+        }
+        
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/admin/accounts/stats', {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-KEY': adminKey
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Ошибка HTTP: ${response.status}`);
+        }
+
+        const statsData = await response.json();
+        console.log('Получены данные статистики:', statsData);
+        
+        const statsContainer = document.getElementById('accountsStatsContainer');
+        if (!statsContainer) {
+            console.error('Не найден контейнер для статистики');
+            return;
+        }
+        
+        statsContainer.innerHTML = ''; // Очищаем контейнер
+        
+        // Добавляем подраздел для статистики VK
+        if (statsData.vk && statsData.vk.length > 0) {
+            const vkSection = document.createElement('div');
+            vkSection.className = 'stats-section';
+            
+            const vkHeader = document.createElement('h2');
+            vkHeader.innerHTML = '<i class="fab fa-vk"></i> Статистика VK аккаунтов';
+            vkSection.appendChild(vkHeader);
+            
+            const vkTable = createAccountsStatsTable(statsData.vk, 'vk');
+            vkSection.appendChild(vkTable);
+            
+            statsContainer.appendChild(vkSection);
+        } else {
+            const noVkData = document.createElement('div');
+            noVkData.className = 'stats-section';
+            noVkData.innerHTML = '<h2><i class="fab fa-vk"></i> Статистика VK аккаунтов</h2><p>Нет данных о VK аккаунтах</p>';
+            statsContainer.appendChild(noVkData);
+        }
+        
+        // Добавляем подраздел для статистики Telegram
+        if (statsData.telegram && statsData.telegram.length > 0) {
+            const tgSection = document.createElement('div');
+            tgSection.className = 'stats-section';
+            
+            const tgHeader = document.createElement('h2');
+            tgHeader.innerHTML = '<i class="fab fa-telegram-plane"></i> Статистика Telegram аккаунтов';
+            tgSection.appendChild(tgHeader);
+            
+            const tgTable = createAccountsStatsTable(statsData.telegram, 'telegram');
+            tgSection.appendChild(tgTable);
+            
+            statsContainer.appendChild(tgSection);
+        } else {
+            const noTgData = document.createElement('div');
+            noTgData.className = 'stats-section';
+            noTgData.innerHTML = '<h2><i class="fab fa-telegram-plane"></i> Статистика Telegram аккаунтов</h2><p>Нет данных о Telegram аккаунтах</p>';
+            statsContainer.appendChild(noTgData);
+        }
+        
+        // После завершения загрузки
+        // Останавливаем анимацию
+        if (refreshBtn) {
+            const icon = refreshBtn.querySelector('i');
+            if (icon) {
+                icon.classList.remove('fa-spin');
+                refreshBtn.disabled = false;
+            }
+        }
+        
+    } catch (error) {
+        console.error('Ошибка при загрузке статистики аккаунтов:', error);
+        showNotification('Ошибка при загрузке статистики: ' + error.message, 'error');
+        
+        // Останавливаем анимацию в случае ошибки
+        if (refreshBtn) {
+            const icon = refreshBtn.querySelector('i');
+            if (icon) {
+                icon.classList.remove('fa-spin');
+                refreshBtn.disabled = false;
+            }
+        }
+    }
+}
+
+/**
+ * Создает таблицу статистики аккаунтов
+ * @param {Array} accounts - массив аккаунтов
+ * @param {String} platform - платформа (vk/telegram)
+ * @returns {HTMLElement} - таблица статистики
+ */
+function createAccountsStatsTable(accounts, platform) {
+    const table = document.createElement('table');
+    table.className = 'stats-table';
+    
+    // Создаем заголовок таблицы
+    const thead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    
+    const headers = [
+        'ID',
+        'Логин/Телефон',
+        'Лимиты запросов',
+        'Использовано',
+        '% использования',
+        'Последнее использование',
+        'Статус'
+    ];
+    
+    headers.forEach(headerText => {
+        const th = document.createElement('th');
+        th.textContent = headerText;
+        headerRow.appendChild(th);
+    });
+    
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+    
+    // Создаем тело таблицы
+    const tbody = document.createElement('tbody');
+    
+    accounts.forEach(account => {
+        const row = document.createElement('tr');
+        
+        // ID
+        const idCell = document.createElement('td');
+        idCell.textContent = account.id || '-';
+        row.appendChild(idCell);
+        
+        // Логин/Телефон
+        const loginCell = document.createElement('td');
+        loginCell.textContent = account.login || account.phone || '-';
+        row.appendChild(loginCell);
+        
+        // Лимиты запросов
+        const limitsCell = document.createElement('td');
+        limitsCell.textContent = account.request_limit || 'Не установлен';
+        row.appendChild(limitsCell);
+        
+        // Использовано
+        const usedCell = document.createElement('td');
+        usedCell.textContent = account.requests_made || '0';
+        row.appendChild(usedCell);
+        
+        // % использования
+        const percentCell = document.createElement('td');
+        if (account.request_limit) {
+            const percent = Math.round((account.requests_made || 0) / account.request_limit * 100);
+            percentCell.textContent = `${percent}%`;
+            
+            // Добавляем цветовое обозначение
+            if (percent > 90) {
+                percentCell.className = 'usage-critical';
+            } else if (percent > 70) {
+                percentCell.className = 'usage-warning';
+            } else {
+                percentCell.className = 'usage-normal';
+            }
+        } else {
+            percentCell.textContent = '-';
+        }
+        row.appendChild(percentCell);
+        
+        // Последнее использование
+        const lastUsedCell = document.createElement('td');
+        if (account.last_used) {
+            const lastUsed = new Date(account.last_used);
+            lastUsedCell.textContent = lastUsed.toLocaleString();
+        } else {
+            lastUsedCell.textContent = 'Никогда';
+        }
+        row.appendChild(lastUsedCell);
+        
+        // Статус
+        const statusCell = document.createElement('td');
+        const statusSpan = document.createElement('span');
+        statusSpan.className = 'account-status';
+        
+        if (account.active) {
+            statusSpan.textContent = 'Активен';
+            statusSpan.classList.add('status-active');
+        } else {
+            statusSpan.textContent = 'Неактивен';
+            statusSpan.classList.add('status-inactive');
+        }
+        
+        statusCell.appendChild(statusSpan);
+        
+        // Добавляем кнопку переключения статуса
+        const toggleBtn = document.createElement('button');
+        toggleBtn.className = 'toggle-status-btn';
+        toggleBtn.innerHTML = account.active ? 
+            '<i class="fas fa-toggle-on"></i>' : 
+            '<i class="fas fa-toggle-off"></i>';
+        
+        toggleBtn.addEventListener('click', () => {
+            toggleAccountStatus(account.id, platform, !account.active);
+        });
+        
+        statusCell.appendChild(toggleBtn);
+        row.appendChild(statusCell);
+        
+        tbody.appendChild(row);
+    });
+    
+    table.appendChild(tbody);
+    return table;
+}
+
+/**
+ * Переключает статус аккаунта (активен/неактивен)
+ * @param {String} accountId - ID аккаунта
+ * @param {String} platform - платформа (vk/telegram)
+ * @param {Boolean} newStatus - новый статус
+ */
+async function toggleAccountStatus(accountId, platform, newStatus) {
+    console.log(`Изменение статуса аккаунта ${accountId} (${platform}) на ${newStatus ? 'активен' : 'неактивен'}`);
+    
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        console.error('Админ-ключ не найден');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/admin/accounts/toggle_status', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-KEY': adminKey
+            },
+            body: JSON.stringify({
+                account_id: accountId,
+                platform: platform,
+                active: newStatus
+            })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Ошибка HTTP: ${response.status}`);
+        }
+        
+        const result = await response.json();
+        console.log('Результат изменения статуса:', result);
+        
+        // Перезагружаем статистику аккаунтов
+        displayAccountsStats();
+        
+        showNotification(
+            `Статус аккаунта ${accountId} изменен на ${newStatus ? 'активен' : 'неактивен'}`, 
+            'success'
+        );
+        
+    } catch (error) {
+        console.error('Ошибка при изменении статуса аккаунта:', error);
+        showNotification('Ошибка при изменении статуса: ' + error.message, 'error');
+    }
+}
+
+// Вспомогательная функция для получения читаемого статуса
+function getStatusLabel(status) {
+    const statuses = {
+        'active': 'Активен',
+        'pending': 'Ожидает авторизации',
+        'inactive': 'Неактивен',
+        'error': 'Ошибка',
+        'banned': 'Заблокирован',
+        'rate_limited': 'Лимит запросов',
+        'validation_required': 'Требуется валидация',
+        'invalid': 'Недействителен'
+    };
+    
+    return statuses[status] || status;
+} 

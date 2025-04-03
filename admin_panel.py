@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 from typing import Dict, List, Optional
 from fastapi import HTTPException, Security
@@ -7,40 +6,13 @@ from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from datetime import datetime
 import uuid
+import user_manager  # Импортируем модуль для работы с базой данных
 
 # Загружаем переменные окружения
 load_dotenv()
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
-
-# Путь к файлу с пользователями
-USERS_FILE = "users.json"
-
-# Максимальное количество запросов на аккаунт
-MAX_REQUESTS_PER_ACCOUNT = 1000
-
-# Загрузка пользователей из файла
-def load_users() -> Dict:
-    """Загружает пользователей из JSON файла."""
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке пользователей: {e}")
-            return {}
-    return {}
-
-# Сохранение пользователей в файл
-def save_users(users: Dict) -> None:
-    """Сохраняет пользователей в JSON файл."""
-    try:
-        with open(USERS_FILE, 'w') as f:
-            json.dump(users, f, indent=4)
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении пользователей: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка при сохранении данных")
 
 # Проверка админ-ключа
 ADMIN_KEY = os.getenv('ADMIN_KEY', 'your-secret-admin-key')
@@ -53,173 +25,238 @@ async def verify_admin_key(api_key: str) -> bool:
 # Функции для работы с аккаунтами Telegram
 async def add_telegram_account(user_id: str, account_data: Dict) -> bool:
     """Добавляет аккаунт Telegram для пользователя."""
-    users = load_users()
-    if user_id not in users:
+    # Проверяем, существует ли пользователь
+    user = user_manager.get_user(user_id)
+    if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    if "telegram_accounts" not in users[user_id]:
-        users[user_id]["telegram_accounts"] = []
-    
     # Проверяем наличие аккаунта с таким же номером телефона
-    for account in users[user_id]["telegram_accounts"]:
+    for account in user.get("telegram_accounts", []):
         if account["phone"] == account_data["phone"]:
             raise HTTPException(status_code=400, detail="Аккаунт с таким номером телефона уже существует")
     
-    # Добавляем информацию о запросах
-    account_data["requests_count"] = 0
-    account_data["last_request_time"] = None
-    account_data["added_at"] = datetime.now().isoformat()
-    
-    users[user_id]["telegram_accounts"].append(account_data)
-    save_users(users)
+    # Добавляем аккаунт через user_manager
+    success = user_manager.add_telegram_account(user_id, account_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Ошибка при добавлении аккаунта")
     return True
 
 async def update_telegram_account(user_id: str, account_id: str, account_data: Dict) -> bool:
     """Обновляет данные аккаунта Telegram."""
-    users = load_users()
-    if user_id not in users or "telegram_accounts" not in users[user_id]:
+    # Проверяем, существует ли пользователь и аккаунт
+    user = user_manager.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Ищем аккаунт
+    account_exists = False
+    for account in user.get("telegram_accounts", []):
+        if account.get("id") == account_id:
+            account_exists = True
+            break
+    
+    if not account_exists:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
     
-    for account in users[user_id]["telegram_accounts"]:
-        if account.get("id") == account_id:
-            account.update(account_data)
-            save_users(users)
-            return True
-    
-    raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    # Обновляем аккаунт через user_manager
+    success = user_manager.update_telegram_account(user_id, account_id, account_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Ошибка при обновлении аккаунта")
+    return True
 
 async def delete_telegram_account(user_id: str, account_id: str) -> bool:
     """Удаляет аккаунт Telegram."""
-    users = load_users()
-    if user_id not in users or "telegram_accounts" not in users[user_id]:
+    # Проверяем, существует ли пользователь
+    user = user_manager.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Проверяем существование аккаунта
+    account_exists = False
+    for account in user.get("telegram_accounts", []):
+        if account.get("id") == account_id:
+            account_exists = True
+            break
+    
+    if not account_exists:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
     
-    users[user_id]["telegram_accounts"] = [
-        acc for acc in users[user_id]["telegram_accounts"]
-        if acc.get("id") != account_id
-    ]
-    save_users(users)
+    # Удаляем аккаунт через user_manager
+    success = user_manager.delete_telegram_account(user_id, account_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Ошибка при удалении аккаунта")
     return True
 
 # Функции для работы с аккаунтами VK
 async def add_vk_account(api_key: str, account_data: Dict) -> bool:
     """Добавляет аккаунт VK для пользователя."""
-    users = load_users()
-    if api_key not in users:
+    # Проверяем, существует ли пользователь
+    user = user_manager.get_user(api_key)
+    if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    if "vk_accounts" not in users[api_key]:
-        users[api_key]["vk_accounts"] = []
-    
-    # Добавляем информацию о запросах
-    account_data["requests_count"] = 0
-    account_data["last_request_time"] = None
-    account_data["added_at"] = datetime.now().isoformat()
-    
-    users[api_key]["vk_accounts"].append(account_data)
-    save_users(users)
+    # Добавляем аккаунт через user_manager
+    success = user_manager.add_vk_account(api_key, account_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Ошибка при добавлении аккаунта")
     return True
 
 async def update_vk_account(api_key: str, account_id: str, account_data: Dict) -> bool:
     """Обновляет данные аккаунта VK."""
-    users = load_users()
-    if api_key not in users or "vk_accounts" not in users[api_key]:
+    # Проверяем, существует ли пользователь
+    user = user_manager.get_user(api_key)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Ищем аккаунт
+    account_exists = False
+    for account in user.get("vk_accounts", []):
+        if account.get("id") == account_id:
+            account_exists = True
+            break
+    
+    if not account_exists:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
     
-    for account in users[api_key]["vk_accounts"]:
-        if account.get("id") == account_id:
-            account.update(account_data)
-            save_users(users)
-            return True
-    
-    raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    # Обновляем аккаунт через user_manager
+    success = user_manager.update_vk_account(api_key, account_id, account_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Ошибка при обновлении аккаунта")
+    return True
 
 async def delete_vk_account(api_key: str, account_id: str) -> bool:
     """Удаляет аккаунт VK."""
-    users = load_users()
-    if api_key not in users or "vk_accounts" not in users[api_key]:
+    # Проверяем, существует ли пользователь
+    user = user_manager.get_user(api_key)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Проверяем существование аккаунта
+    account_exists = False
+    for account in user.get("vk_accounts", []):
+        if account.get("id") == account_id:
+            account_exists = True
+            break
+    
+    if not account_exists:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
     
-    users[api_key]["vk_accounts"] = [
-        acc for acc in users[api_key]["vk_accounts"]
-        if acc.get("id") != account_id
-    ]
-    save_users(users)
+    # Удаляем аккаунт через user_manager
+    success = user_manager.delete_vk_account(api_key, account_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Ошибка при удалении аккаунта")
     return True
 
 # Функции для работы с пользователями
 async def register_user(username: str, password: str) -> str:
     """Регистрирует нового пользователя."""
-    api_key = str(uuid.uuid4())
-    users = load_users()
-    
-    if api_key in users:
-        raise HTTPException(400, "Ошибка генерации API ключа")
-    
-    users[api_key] = {
-        "username": username,
-        "password": password,
-        "created_at": datetime.now().isoformat(),
-        "last_used": None,
-        "telegram_accounts": [],
-        "vk_accounts": []
-    }
-    
-    save_users(users)
+    # Регистрируем пользователя через user_manager
+    api_key = await user_manager.register_user(username, password)
     return api_key
 
 async def get_user(api_key: str) -> Optional[Dict]:
     """Получает информацию о пользователе."""
-    users = load_users()
-    if api_key not in users:
+    user = user_manager.get_user(api_key)
+    if not user:
         raise HTTPException(404, "Пользователь не найден")
-    return users[api_key]
+    return user
 
 async def delete_user(api_key: str) -> bool:
     """Удаляет пользователя."""
-    users = load_users()
-    if api_key not in users:
+    # Получаем данные пользователя, чтобы удалить файлы сессий
+    user = user_manager.get_user(api_key)
+    if not user:
         raise HTTPException(404, "Пользователь не найден")
     
     # Удаляем файлы сессий Telegram
-    user_data = users[api_key]
-    for account in user_data.get("telegram_accounts", []):
+    for account in user.get("telegram_accounts", []):
         if account.get("session_file") and os.path.exists(account["session_file"]):
-            os.remove(account["session_file"])
+            try:
+                os.remove(account["session_file"])
+            except Exception as e:
+                logger.error(f"Ошибка при удалении файла сессии {account['session_file']}: {e}")
     
-    del users[api_key]
-    save_users(users)
+    # Удаляем пользователя
+    from user_manager import get_db_connection
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Сначала удаляем все аккаунты пользователя
+    cursor.execute('DELETE FROM telegram_accounts WHERE user_api_key = ?', (api_key,))
+    cursor.execute('DELETE FROM vk_accounts WHERE user_api_key = ?', (api_key,))
+    
+    # Затем удаляем самого пользователя
+    cursor.execute('DELETE FROM users WHERE api_key = ?', (api_key,))
+    
+    conn.commit()
+    conn.close()
     return True
 
 async def get_all_users() -> List[Dict]:
     """Получает список всех пользователей."""
-    users = load_users()
-    return [
-        {
-            "api_key": api_key,
-            "username": user_data.get("username", "Неизвестно"),
-            "password": user_data.get("password", ""),
-            "created_at": user_data.get("created_at", ""),
-            "last_used": user_data.get("last_used"),
-            "telegram_accounts": user_data.get("telegram_accounts", []),
-            "vk_accounts": user_data.get("vk_accounts", []),
-            "vk_token": user_data.get("vk_token")
-        }
-        for api_key, user_data in users.items()
-    ]
+    from user_manager import get_db_connection
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM users')
+    users_rows = cursor.fetchall()
+    
+    users = []
+    
+    for user in users_rows:
+        user_dict = dict(user)
+        api_key = user_dict['api_key']
+        
+        # Получаем Telegram аккаунты
+        cursor.execute('SELECT * FROM telegram_accounts WHERE user_api_key = ?', (api_key,))
+        user_dict['telegram_accounts'] = [dict(acc) for acc in cursor.fetchall()]
+        
+        # Получаем VK аккаунты
+        cursor.execute('SELECT * FROM vk_accounts WHERE user_api_key = ?', (api_key,))
+        user_dict['vk_accounts'] = [dict(acc) for acc in cursor.fetchall()]
+        
+        # Расшифровываем VK токен, если он есть
+        if user_dict.get('vk_token'):
+            user_dict['vk_token'] = user_manager.cipher.decrypt(user_dict['vk_token'].encode()).decode()
+        
+        users.append(user_dict)
+    
+    conn.close()
+    return users
 
 async def get_system_stats() -> Dict:
     """Получает статистику системы."""
-    users = load_users()
-    total_telegram_accounts = sum(len(u.get("telegram_accounts", [])) for u in users.values())
-    total_vk_accounts = sum(len(u.get("vk_accounts", [])) for u in users.values())
+    from user_manager import get_db_connection
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Получаем количество пользователей
+    cursor.execute('SELECT COUNT(*) as count FROM users')
+    total_users = cursor.fetchone()['count']
+    
+    # Получаем количество аккаунтов Telegram
+    cursor.execute('SELECT COUNT(*) as count FROM telegram_accounts')
+    total_telegram_accounts = cursor.fetchone()['count']
+    
+    # Получаем количество аккаунтов VK
+    cursor.execute('SELECT COUNT(*) as count FROM vk_accounts')
+    total_vk_accounts = cursor.fetchone()['count']
+    
+    # Получаем последнего созданного пользователя
+    cursor.execute('SELECT MAX(created_at) as last_created FROM users')
+    last_created = cursor.fetchone()['last_created']
+    
+    conn.close()
     
     return {
-        "total_users": len(users),
+        "total_users": total_users,
         "total_telegram_accounts": total_telegram_accounts,
         "total_vk_accounts": total_vk_accounts,
-        "last_created_user": max((u.get("created_at") for u in users.values()), default=None)
+        "last_created_user": last_created
     }
+
+# Константы для ротации аккаунтов
+MAX_REQUESTS_PER_ACCOUNT = user_manager.MAX_REQUESTS_PER_ACCOUNT
 
 # Функции для ротации аккаунтов
 def get_next_available_account(accounts: List[Dict], platform: str) -> Optional[Dict]:
@@ -244,128 +281,73 @@ def get_next_available_account(accounts: List[Dict], platform: str) -> Optional[
 
 def update_account_usage(api_key: str, account_id: str, platform: str) -> bool:
     """Обновляет статистику использования аккаунта."""
-    users = load_users()
-    if api_key not in users:
-        return False
-    
-    accounts_key = f"{platform}_accounts"
-    if accounts_key not in users[api_key]:
-        return False
-    
-    for account in users[api_key][accounts_key]:
-        if account.get("id") == account_id:
-            account["requests_count"] = account.get("requests_count", 0) + 1
-            account["last_request_time"] = datetime.now().isoformat()
-            save_users(users)
-            return True
-    
-    return False
+    # Используем функцию из user_manager
+    return user_manager.update_account_usage(api_key, account_id, platform)
 
 async def update_user_vk_token(api_key: str, vk_token: str) -> bool:
     """Обновляет VK токен пользователя."""
-    users = load_users()
-    if api_key not in users:
+    success = user_manager.set_vk_token(api_key, vk_token)
+    if not success:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
-    
-    if "vk_accounts" not in users[api_key]:
-        users[api_key]["vk_accounts"] = []
-    
-    # Создаем новый аккаунт с токеном
-    account_data = {
-        "id": str(uuid.uuid4()),
-        "token": vk_token,
-        "requests_count": 0,
-        "last_request_time": None,
-        "added_at": datetime.now().isoformat()
-    }
-    
-    users[api_key]["vk_accounts"].append(account_data)
-    save_users(users)
     return True
 
 async def verify_api_key(api_key: str) -> bool:
-    """Проверяет валидность API ключа пользователя."""
-    users = load_users()
-    if api_key not in users:
-        raise HTTPException(
-            status_code=401,
-            detail="Неверный API ключ"
-        )
+    """Проверяет, существует ли пользователь с указанным API ключом."""
+    user = user_manager.get_user(api_key)
+    if not user:
+        return False
     
     # Обновляем время последнего использования
-    users[api_key]["last_used"] = datetime.now().isoformat()
-    save_users(users)
+    user_manager.update_user_last_used(api_key)
     return True
 
 async def get_account_status(api_key: str) -> Dict:
     """Получает статус аккаунтов пользователя."""
-    users = load_users()
-    if api_key not in users:
+    user = user_manager.get_user(api_key)
+    if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    user_data = users[api_key]
+    # Получаем статус аккаунтов Telegram
+    telegram_accounts = user.get('telegram_accounts', [])
+    telegram_status = {
+        "total": len(telegram_accounts),
+        "active": sum(1 for acc in telegram_accounts if acc.get('status') == 'active'),
+        "accounts": telegram_accounts
+    }
     
-    # Получаем статус Telegram аккаунтов
-    telegram_accounts = []
-    for account in user_data.get("telegram_accounts", []):
-        status = "active"
-        if account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT:
-            status = "cooldown"
-        elif account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT * 0.8:
-            status = "degraded"
-            
-        telegram_accounts.append({
-            "id": account.get("id"),
-            "status": status,
-            "requests_count": account.get("requests_count", 0),
-            "last_request_time": account.get("last_request_time"),
-            "added_at": account.get("added_at")
-        })
-    
-    # Получаем статус VK аккаунтов
-    vk_accounts = []
-    for account in user_data.get("vk_accounts", []):
-        status = "active"
-        if account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT:
-            status = "cooldown"
-        elif account.get("requests_count", 0) >= MAX_REQUESTS_PER_ACCOUNT * 0.8:
-            status = "degraded"
-            
-        vk_accounts.append({
-            "id": account.get("id"),
-            "status": status,
-            "requests_count": account.get("requests_count", 0),
-            "last_request_time": account.get("last_request_time"),
-            "added_at": account.get("added_at")
-        })
+    # Получаем статус аккаунтов VK
+    vk_accounts = user.get('vk_accounts', [])
+    vk_status = {
+        "total": len(vk_accounts),
+        "active": sum(1 for acc in vk_accounts if acc.get('status') == 'active'),
+        "accounts": vk_accounts
+    }
     
     return {
-        "telegram_accounts": telegram_accounts,
-        "vk_accounts": vk_accounts,
-        "created_at": user_data.get("created_at"),
-        "last_used": user_data.get("last_used")
+        "telegram": telegram_status,
+        "vk": vk_status
     }
 
 async def get_telegram_account(user_id: str, account_id: str) -> Optional[Dict]:
     """Получает данные аккаунта Telegram."""
-    users = load_users()
-    if user_id not in users or "telegram_accounts" not in users[user_id]:
-        return None
+    user = user_manager.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    for account in users[user_id]["telegram_accounts"]:
-        if account.get("id") == account_id:
+    for account in user.get('telegram_accounts', []):
+        if account.get('id') == account_id:
             return account
     
-    return None
+    raise HTTPException(status_code=404, detail="Аккаунт не найден")
 
 async def get_vk_account(api_key: str, account_id: str) -> Optional[Dict]:
-    """Получает информацию о конкретном VK аккаунте."""
-    users = load_users()
-    if api_key not in users or "vk_accounts" not in users[api_key]:
-        return None
+    """Получает данные аккаунта VK."""
+    user = user_manager.get_user(api_key)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    for account in users[api_key]["vk_accounts"]:
-        if account.get("id") == account_id:
+    for account in user.get('vk_accounts', []):
+        if account.get('id') == account_id:
             return account
     
-    return None 
+    raise HTTPException(status_code=404, detail="Аккаунт не найден") 

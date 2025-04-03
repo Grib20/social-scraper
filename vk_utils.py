@@ -21,10 +21,11 @@ GROUP_DELAY = 1.0  # 1 секунда между запросами к разн�
 DEGRADED_MODE_DELAY = 0.5  # Задержка в режиме пониженной производительности (500мс)
 
 class VKClient:
-    def __init__(self, access_token: str, proxy: Optional[str] = None, account_id: Optional[str] = None):
+    def __init__(self, access_token: str, proxy: Optional[str] = None, account_id: Optional[str] = None, api_key: Optional[str] = None):
         self.access_token = access_token
         self.proxy = proxy
         self.account_id = account_id
+        self.api_key = api_key
         self.session = None
         self.base_url = "https://api.vk.com/method"
         self.version = "5.131"
@@ -102,8 +103,8 @@ class VKClient:
                         return {}
                     
                     self.requests_count += 1
-                    if self.account_id:
-                        update_account_usage(self.account_id, "vk")
+                    if self.account_id and self.api_key:
+                        update_account_usage(self.api_key, self.account_id, "vk")
                     
                     return result
             except Exception as e:
@@ -227,7 +228,7 @@ class VKClient:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             
             # Получаем активные аккаунты
-            active_accounts = get_active_accounts(self.account_id, "vk")
+            active_accounts = get_active_accounts(self.api_key, "vk")
             if not active_accounts:
                 logger.warning("Нет доступных аккаунтов")
                 return []

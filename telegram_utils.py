@@ -26,9 +26,10 @@ GROUP_DELAY = 1.0  # 1 секунда между запросами к разн�
 channel_members_cache = {}
 
 class TelegramClientWrapper:
-    def __init__(self, client: TelegramClient, account_id: str):
+    def __init__(self, client: TelegramClient, account_id: str, api_key: Optional[str] = None):
         self.client = client
         self.account_id = account_id
+        self.api_key = api_key
         self.last_request_time = 0
         self.last_group_request_time = 0
         self.requests_count = 0
@@ -63,6 +64,14 @@ class TelegramClientWrapper:
             self.last_group_request_time = current_time
             
         self.requests_count += 1
+        
+        # Обновляем счетчик использования аккаунта
+        if self.account_id and self.api_key:
+            try:
+                update_account_usage(self.api_key, self.account_id, "telegram")
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении статистики использования: {e}")
+                
         return await self.client(*args, **kwargs)
 
     async def _make_group_request(self, *args, **kwargs):
@@ -236,15 +245,15 @@ async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str
     
     return sorted(posts, key=lambda x: x["views"], reverse=True)[:count]
 
-async def get_posts_by_period(client, group_ids: List[int], max_posts: int = 100, days_back: int = 7, min_views: int = 0) -> List[Dict]:
+async def get_posts_by_period(client, group_ids: List[int], max_posts: int = 100, days_back: int = 7, min_views: int = 0, api_key: str = None) -> List[Dict]:
     """Получение постов из групп за указанный период."""
     try:
         all_posts = []
         cutoff_date = datetime.now() - timedelta(days=days_back)
-        wrapper = TelegramClientWrapper(client, client.session.filename)
+        wrapper = TelegramClientWrapper(client, client.session.filename, api_key)
         
         # Получаем активные аккаунты
-        active_accounts = get_active_accounts(client.session.filename, "telegram")
+        active_accounts = get_active_accounts(api_key, "telegram")
         if not active_accounts:
             logger.warning("Нет доступных аккаунтов")
             return []
