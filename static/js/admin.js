@@ -392,7 +392,8 @@ function maskToken(token) {
 function createAccountItem(type, accountId, userId, displayName, status, isActive) {
     const accountItem = document.createElement('div');
     accountItem.className = 'account-item';
-    
+    accountItem.id = `account-${accountId}`;
+
     const accountInfo = document.createElement('div');
     accountInfo.className = 'account-info';
     
@@ -1201,295 +1202,70 @@ document.getElementById('addVkForm').addEventListener('submit', async (e) => {
     }
 }); 
 
-// Функция для проверки статуса аккаунта Telegram
-async function checkTelegramStatus(accountId) {
-    if (!accountId) return;
-    
+// Функция для проверки статуса аккаунта
+async function checkAccountStatus(type, accountId) {
+    const loadingIndicator = document.querySelector(`#account-${accountId} .loading-indicator`);
+    if (loadingIndicator) loadingIndicator.style.display = 'inline-block';
+
+    showNotification(`Проверка статуса аккаунта ${accountId}...`);
+
+    // Получаем админ-ключ
     const adminKey = getAdminKey();
     if (!adminKey) {
+        showNotification('Ошибка: Админ-ключ не найден. Пожалуйста, войдите снова.', 'error');
         window.location.href = '/login';
+        if (loadingIndicator) loadingIndicator.style.display = 'none';
         return;
     }
-    
-    // Показываем индикатор в кнопке
-    const statusButton = document.querySelector(`button[data-check-status="${accountId}"]`);
-    if (statusButton) {
-        const originalText = statusButton.innerHTML;
-        statusButton.disabled = true;
-        statusButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-        
-        try {
-            const response = await fetch(`/api/telegram/accounts/${accountId}/status`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${adminKey}`,
-                    'X-User-Id': statusButton.getAttribute('data-user-id')
-                }
-            });
-            
-            statusButton.disabled = false;
-            statusButton.innerHTML = originalText;
-            
-            if (response.ok) {
-                const result = await response.json();
-                const statusIndicator = document.querySelector(`[data-account-status="${accountId}"]`);
-                
-                if (statusIndicator) {
-                    if (result.is_authorized) {
-                        statusIndicator.className = 'account-status status-active';
-                        statusIndicator.innerHTML = '<i class="fas fa-check-circle"></i> Активен';
-                        showNotification('<i class="fas fa-check-circle"></i> Аккаунт авторизован и активен', 'success');
-                    } else {
-                        statusIndicator.className = 'account-status status-pending';
-                        statusIndicator.innerHTML = '<i class="fas fa-clock"></i> Ожидает авторизации';
-                        showNotification('<i class="fas fa-exclamation-triangle"></i> Аккаунт требует авторизации', 'warning');
-                    }
-                    
-                    // Обновляем кнопку для повторной авторизации
-                    const authButton = document.querySelector(`button[data-resend-code="${accountId}"]`);
-                    if (authButton) {
-                        authButton.disabled = result.is_authorized;
-                    }
-                }
-            } else {
-                const error = await response.json();
-                showNotification(`<i class="fas fa-exclamation-circle"></i> Ошибка при проверке статуса: ${error.detail || 'Неизвестная ошибка'}`, 'error');
-            }
-        } catch (error) {
-            console.error('Ошибка при проверке статуса аккаунта:', error);
-            showNotification('<i class="fas fa-exclamation-circle"></i> Произошла ошибка при проверке статуса аккаунта', 'error');
-            
-            statusButton.disabled = false;
-            statusButton.innerHTML = originalText;
-        }
-    }
-}
 
-// Функция для повторной отправки кода авторизации
-async function resendTelegramCode(accountId) {
-    if (!accountId) return;
-    
-    const adminKey = getAdminKey();
-    if (!adminKey) {
-        window.location.href = '/login';
+    let endpoint = '';
+    if (type === 'telegram') {
+        endpoint = `/api/telegram/accounts/${accountId}/status`;
+    } else if (type === 'vk') {
+        endpoint = `/api/vk/accounts/${accountId}/status`;
+    } else {
+        showNotification('Неизвестный тип аккаунта', 'error');
+        if (loadingIndicator) loadingIndicator.style.display = 'none';
         return;
     }
-    
-    // Показываем индикатор в кнопке
-    const authButton = document.querySelector(`button[data-resend-code="${accountId}"]`);
-    if (authButton) {
-        const originalText = authButton.innerHTML;
-        authButton.disabled = true;
-        authButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-        
-        try {
-            const response = await fetch(`/api/telegram/accounts/${accountId}/resend-code`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${adminKey}`,
-                    'X-User-Id': authButton.getAttribute('data-user-id')
-                }
-            });
-            
-            authButton.disabled = false;
-            authButton.innerHTML = originalText;
-            
-            if (response.ok) {
-                const result = await response.json();
-                
-                if (result.requires_auth) {
-                    // Открываем модальное окно для ввода кода
-                    showTelegramAuthModal(accountId);
-                    showNotification('<i class="fas fa-paper-plane"></i> Код авторизации отправлен на ваш телефон', 'info');
-                } else {
-                    showNotification('<i class="fas fa-check-circle"></i> ' + (result.message || 'Аккаунт уже авторизован'), 'success');
-                    await displayUsers(); // Обновляем список пользователей
-                }
-            } else {
-                const error = await response.json();
-                showNotification(`<i class="fas fa-exclamation-circle"></i> Ошибка при отправке кода: ${error.detail || 'Неизвестная ошибка'}`, 'error');
-            }
-        } catch (error) {
-            console.error('Ошибка при отправке кода авторизации:', error);
-            showNotification('<i class="fas fa-exclamation-circle"></i> Произошла ошибка при отправке кода авторизации', 'error');
-            
-            authButton.disabled = false;
-            authButton.innerHTML = originalText;
-        }
-    }
-}
 
-// Функция для открытия модального окна авторизации аккаунта
-function showTelegramAuthModal(accountId) {
-    currentTelegramAccountId = accountId;
-    
-    // Открываем модальное окно авторизации
-    document.getElementById('telegramModal').style.display = 'block';
-    document.getElementById('addTelegramForm').style.display = 'none';
-    document.getElementById('telegramAuthBlock').style.display = 'block';
-    document.getElementById('telegram2FABlock').style.display = 'none';
-    document.getElementById('authStatus').textContent = 'Ожидание ввода кода...';
-    
-    // Очищаем поле ввода кода
-    document.getElementById('auth_code').value = '';
-}
-
-// Обработчик формы загрузки файла сессии
-document.getElementById('uploadSessionForm')?.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const formData = new FormData(e.target);
-    
-    const adminKey = getAdminKey();
-    if (!adminKey) {
-        window.location.href = '/login';
-        return;
-    }
-    
-    // Показываем индикатор загрузки
-    const submitButton = e.target.querySelector('button[type="submit"]');
-    const originalButtonText = submitButton.innerHTML;
-    submitButton.disabled = true;
-    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Загрузка...';
-    
     try {
-        const response = await fetch('/api/telegram/upload-session', {
-            method: 'POST',
+        const response = await fetch(endpoint, {
+            method: 'GET',
             headers: {
-                'Authorization': `Bearer ${adminKey}`,
-                'X-User-Id': currentUser
-            },
-            body: formData
+                'Authorization': `Bearer ${adminKey}`
+            }
         });
-        
-        submitButton.disabled = false;
-        submitButton.innerHTML = originalButtonText;
-        
+
+        const result = await response.json();
+
         if (response.ok) {
-            const result = await response.json();
-            showNotification(`Файл сессии загружен. Статус: ${result.is_authorized ? 'Авторизован' : 'Требуется авторизация'}`, 'success');
-            closeModal('telegramModal');
-            await displayUsers();
+            // Используем правильный селектор для элемента статуса
+            const statusElement = document.querySelector(`#account-${accountId} .account-status`);
+            
+            // Проверяем, что элемент найден
+            if (statusElement) {
+                const newStatus = result.status;
+                // Обновляем классы и текст элемента статуса
+                statusElement.className = `account-status status-${newStatus.toLowerCase()}`;
+                statusElement.textContent = getStatusText(newStatus);
+                
+                showNotification(`Статус аккаунта ${accountId} обновлен: ${getStatusText(newStatus)}`, 'success');
+
+                // Обновляем данные пользователя, если необходимо
+                // await displayUsers(); // Пока закомментируем, чтобы не было лишней перезагрузки
+            } else {
+                console.error(`Не найден элемент статуса для #account-${accountId} .account-status`);
+                showNotification('Не удалось обновить интерфейс статуса', 'error');
+            }
         } else {
-            const error = await response.json();
-            showNotification(`Ошибка: ${error.detail || 'Не удалось загрузить файл сессии'}`, 'error');
+            showNotification(`Ошибка проверки статуса (${response.status}): ${result.detail || 'Неизвестная ошибка'}`, 'error');
         }
     } catch (error) {
-        console.error('Ошибка при загрузке файла сессии:', error);
-        showNotification('Произошла ошибка при загрузке файла сессии', 'error');
-        
-        submitButton.disabled = false;
-        submitButton.innerHTML = originalButtonText;
-    }
-});
-
-// Функция для проверки статуса токена VK
-async function checkVkStatus(accountId) {
-    if (!accountId) return;
-    
-    const adminKey = getAdminKey();
-    if (!adminKey) {
-        window.location.href = '/login';
-        return;
-    }
-    
-    // Показываем индикатор в кнопке
-    const statusButton = document.querySelector(`button[data-check-vk-status="${accountId}"]`);
-    if (statusButton) {
-        const originalText = statusButton.innerHTML;
-        statusButton.disabled = true;
-        statusButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-        
-        try {
-            const response = await fetch(`/api/vk/accounts/${accountId}/status`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${adminKey}`,
-                    'X-User-Id': statusButton.getAttribute('data-user-id')
-                }
-            });
-            
-            statusButton.disabled = false;
-            statusButton.innerHTML = originalText;
-            
-            if (response.ok) {
-                const result = await response.json();
-                const statusIndicator = document.querySelector(`[data-vk-account-status="${accountId}"]`);
-                
-                if (statusIndicator) {
-                    updateVkStatusIndicator(statusIndicator, result.status);
-                    
-                    // Обработка различных статусов
-                    switch (result.status) {
-                        case 'active':
-                            showNotification('<i class="fas fa-check-circle"></i> Токен VK активен и работает', 'success');
-                            break;
-                        case 'banned':
-                            showNotification('<i class="fas fa-ban"></i> Токен VK заблокирован', 'error');
-                            break;
-                        case 'invalid':
-                            showNotification('<i class="fas fa-exclamation-triangle"></i> Токен VK недействителен', 'error');
-                            break;
-                        case 'expired':
-                            showNotification('<i class="fas fa-clock"></i> Срок действия токена VK истек', 'warning');
-                            break;
-                        default:
-                            showNotification('<i class="fas fa-question-circle"></i> Неизвестный статус токена VK', 'warning');
-                    }
-                }
-            } else {
-                const error = await response.json();
-                showNotification(`<i class="fas fa-exclamation-circle"></i> Ошибка при проверке статуса: ${error.detail || 'Неизвестная ошибка'}`, 'error');
-            }
-        } catch (error) {
-            console.error('Ошибка при проверке статуса токена VK:', error);
-            showNotification('<i class="fas fa-exclamation-circle"></i> Произошла ошибка при проверке статуса токена', 'error');
-            
-            statusButton.disabled = false;
-            statusButton.innerHTML = originalText;
-        }
-    }
-}
-
-// Функция для обновления индикатора статуса VK
-function updateVkStatusIndicator(statusIndicator, status) {
-    statusIndicator.className = 'account-status';
-    
-    switch (status) {
-        case 'active':
-            statusIndicator.classList.add('status-active');
-            statusIndicator.innerHTML = '<i class="fas fa-check-circle"></i> Активен';
-            break;
-        case 'banned':
-            statusIndicator.classList.add('status-error');
-            statusIndicator.innerHTML = '<i class="fas fa-ban"></i> Заблокирован';
-            break;
-        case 'invalid':
-            statusIndicator.classList.add('status-error');
-            statusIndicator.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Недействителен';
-            break;
-        case 'expired':
-            statusIndicator.classList.add('status-warning');
-            statusIndicator.innerHTML = '<i class="fas fa-clock"></i> Истек срок';
-            break;
-        default:
-            statusIndicator.classList.add('status-pending');
-            statusIndicator.innerHTML = '<i class="fas fa-question-circle"></i> Неизвестно';
-    }
-}
-
-// Функция для получения HTML статуса VK аккаунта
-function getVkStatusHTML(status) {
-    switch (status) {
-        case 'active':
-            return '<i class="fas fa-check-circle"></i> Активен';
-        case 'banned':
-            return '<i class="fas fa-ban"></i> Заблокирован';
-        case 'invalid':
-            return '<i class="fas fa-exclamation-triangle"></i> Недействителен';
-        case 'expired':
-            return '<i class="fas fa-clock"></i> Истек срок';
-        default:
-            return '<i class="fas fa-question-circle"></i> Требует проверки';
+        console.error('Ошибка при проверке статуса:', error);
+        showNotification('Ошибка сети при проверке статуса', 'error');
+    } finally {
+        if (loadingIndicator) loadingIndicator.style.display = 'none';
     }
 }
 

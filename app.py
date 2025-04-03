@@ -28,7 +28,12 @@ if not os.getenv("BASE_URL"):
     sys.exit(1)
 
 # Импорты модулей после load_dotenv
-from telegram_utils import start_client, find_channels, get_trending_posts as get_telegram_trending, get_posts_in_channels, get_posts_by_keywords, get_posts_by_period
+from telegram_utils import (
+    start_client, find_channels, 
+    get_trending_posts, get_posts_in_channels, 
+    get_posts_by_keywords, get_posts_by_period, 
+    get_album_messages
+)
 from vk_utils import VKClient, find_vk_groups, get_vk_posts, get_vk_posts_in_groups
 from user_manager import (
     register_user, set_vk_token, get_vk_token, get_user, 
@@ -229,8 +234,8 @@ async def auth_middleware(request: Request, platform: str):
         else:
             raise HTTPException(401, "API ключ обязателен")
     
-    # Проверяем существование пользователя
-    if not await verify_api_key(api_key):
+    # Проверяем существование пользователя (убираем await)
+    if not verify_api_key(api_key):
         raise HTTPException(401, "Неверный API ключ")
     
     # Обновляем время последнего использования
@@ -679,7 +684,7 @@ async def trending_posts(request: Request, data: dict):
 
     if platform == 'telegram':
         client = await auth_middleware(request, 'telegram')
-        return await get_telegram_trending(client, group_ids, days_back, posts_per_group, min_views)
+        return await get_trending_posts(client, group_ids, days_back, posts_per_group, min_views)
     elif platform == 'vk':
         vk = await auth_middleware(request, 'vk')
         return await get_vk_posts_in_groups(vk, group_ids, count=posts_per_group * len(group_ids), min_views=min_views, days_back=days_back)
@@ -1303,22 +1308,6 @@ async def regenerate_api_key(user_id: str, request: Request):
     # Это действие невозможно с новой структурой данных,
     # так как api_key теперь является primary key пользователя
     raise HTTPException(status_code=400, detail="API key regeneration is not supported with the new database structure")
-
-# Функция для создания Telegram клиента
-async def create_telegram_client(session_name, api_id, api_hash, proxy=None):
-    """Создает и настраивает клиент Telegram с файловой сессией"""
-    # Используем файловую сессию вместо StringSession
-    logger.info(f"Создаем клиент с файловой сессией: {session_name}")
-    client = TelegramClient(
-        session_name,  # Путь к файлу сессии (без .session)
-        api_id,
-        api_hash
-    )
-    
-    if proxy:
-        client.set_proxy(proxy)
-        
-    return client
 
 @app.get("/api/telegram/accounts/{account_id}/status")
 async def check_telegram_account_status(request: Request, account_id: str):
@@ -2031,6 +2020,152 @@ async def get_accounts_statistics_detailed(request: Request):
         "users": user_stats,
         "timestamp": time.time()
     }
+
+# Новый эндпоинт для расширенного получения трендовых постов
+@app.post("/api/trending-posts-extended")
+async def api_trending_posts_extended(request: Request, data: dict):
+    """
+    Получение трендовых постов с расширенными параметрами фильтрации 
+    и поддержкой медиа-альбомов.
+    """
+    platform = data.get('platform', 'telegram')
+    channel_ids = data.get('channel_ids', [])
+    if not channel_ids:
+        raise HTTPException(status_code=400, detail="ID каналов обязательны")
+    
+    # Параметры фильтрации
+    days_back = data.get('days_back', 7)
+    posts_per_channel = data.get('posts_per_channel', 10)
+    min_views = data.get('min_views')
+    min_reactions = data.get('min_reactions')
+    min_comments = data.get('min_comments')
+    min_forwards = data.get('min_forwards')
+    
+    # Получение API ключа из заголовка
+    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API ключ не указан")
+    
+    if platform == 'telegram':
+        # Получаем следующий доступный аккаунт
+        from user_manager import get_next_available_account
+        
+        account = get_next_available_account(api_key, "telegram")
+        if not account:
+            raise HTTPException(status_code=400, detail="Нет доступных аккаунтов Telegram")
+        
+        # Получаем клиент
+        client = await auth_middleware(request, 'telegram')
+        
+        # Получаем трендовые посты с расширенными параметрами
+        posts = await get_trending_posts(
+            client, 
+            channel_ids, 
+            days_back=days_back, 
+            posts_per_channel=posts_per_channel,
+            min_views=min_views,
+            min_reactions=min_reactions,
+            min_comments=min_comments,
+            min_forwards=min_forwards
+        )
+        
+        # Обновляем статистику использования аккаунта
+        await update_account_usage(api_key, account["id"], "telegram")
+        
+        return posts
+    elif platform == 'vk':
+        # Здесь можно добавить аналогичную логику для VK
+        raise HTTPException(status_code=501, detail="Расширенные параметры пока не поддерживаются для VK")
+    else:
+        raise HTTPException(status_code=400, detail="Платформа не поддерживается")
+
+# Новый эндпоинт для загрузки медиафайлов
+@app.post("/api/media/upload")
+async def api_media_upload(request: Request):
+    """
+    Загрузка медиафайлов в хранилище S3.
+    
+    Поддерживает загрузку изображений и видео,
+    создаёт превью для больших файлов и оптимизирует изображения.
+    """
+    # Получение API ключа из заголовка
+    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API ключ не указан")
+    
+    # Проверяем наличие файла
+    form = await request.form()
+    if "file" not in form:
+        raise HTTPException(status_code=400, detail="Файл не найден в запросе")
+    
+    file = form["file"]
+    
+    # Генерируем уникальное имя файла
+    import uuid
+    import os
+    file_id = str(uuid.uuid4())
+    file_ext = os.path.splitext(file.filename)[1]
+    s3_filename = f"media/{file_id}{file_ext}"
+    local_path = f"temp_{file_id}{file_ext}"
+    
+    # Сохраняем файл на диск
+    try:
+        with open(local_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Импортируем и используем функции из media_utils
+        from media_utils import upload_to_s3, S3_LINK_TEMPLATE
+        
+        # Определяем, нужно ли оптимизировать файл
+        optimize = file_ext.lower() in ['.jpg', '.jpeg', '.png']
+        
+        # Загружаем файл в S3
+        success, info = await upload_to_s3(local_path, s3_filename, optimize=optimize)
+        
+        # Удаляем локальный файл
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        
+        # Возвращаем результат
+        if success:
+            # Если был создан превью для большого файла
+            if info and info.get('is_preview', False):
+                return {
+                    "success": True,
+                    "message": "Превью создано для большого файла",
+                    "thumbnail_url": S3_LINK_TEMPLATE.format(filename=info.get('thumbnail')),
+                    "preview_url": S3_LINK_TEMPLATE.format(filename=info.get('preview')),
+                    "original_size": info.get('size')
+                }
+            # Обычная загрузка
+            return {
+                "success": True,
+                "message": "Файл успешно загружен",
+                "url": S3_LINK_TEMPLATE.format(filename=s3_filename)
+            }
+        else:
+            # Если загрузка не удалась из-за превышения размера
+            if info and info.get('reason') == 'size_limit_exceeded':
+                return {
+                    "success": False,
+                    "message": f"Файл превышает максимально допустимый размер ({info.get('size')} байт)",
+                    "size": info.get('size'),
+                    "error": "size_limit_exceeded"
+                }
+            # Другие ошибки
+            return {
+                "success": False,
+                "message": "Не удалось загрузить файл",
+                "error": "upload_failed"
+            }
+    except Exception as e:
+        # Удаляем локальный файл в случае ошибки
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        
+        logger.error(f"Ошибка при загрузке файла: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при загрузке файла: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))

@@ -15,7 +15,8 @@ import boto3
 from PIL import Image
 import io
 from aiojobs import create_scheduler
-from dotenv import load_dotenv  # Импортируем для загрузки переменных окружения
+from dotenv import load_dotenv
+from typing import Union, Callable, Any, Optional, List, Dict
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -23,17 +24,17 @@ load_dotenv()
 # Настройка логирования
 print("Инициализация media_utils.py")
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Проверяем, не настроено ли уже логирование в других частях проекта
 if not logger.handlers:
     file_handler = logging.FileHandler('media_utils.log', mode='a')
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
 
@@ -45,10 +46,10 @@ logger.info("Логирование в media_utils инициализирова�
 # Константы
 S3_CACHE_FILE = "s3_file_cache.pkl"
 MAX_CACHE_SIZE = 1000
-S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'scraper')  # Имя бакета из переменных окружения
-S3_REGION = os.getenv('S3_REGION', 'ru-central1')  # Регион из переменных окружения
-S3_LINK_TEMPLATE = os.getenv('S3_LINK_TEMPLATE', 'https://scraper.website.yandexcloud.net/{filename}')  # Шаблон ссылки из переменных окружения
-MAX_FILE_SIZE = 50 * 1024 * 1024  # Максимальный размер файла для загрузки (50 МБ)
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'scraper')
+S3_REGION = os.getenv('S3_REGION', 'ru-central1')
+S3_LINK_TEMPLATE = os.getenv('S3_LINK_TEMPLATE', 'https://scraper.website.yandexcloud.net/{filename}')
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
 # S3 клиент 
 s3_client = None
@@ -59,42 +60,56 @@ scheduler = None
 # Кэш файлов S3
 s3_file_cache = OrderedDict()
 
-# Семафоры для контроля скорости запросов
-REQUEST_SEMAPHORE = asyncio.Semaphore(3)  # Ограничение на API запросы
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)  # Ограничение на скачивание медиа
-UPLOAD_SEMAPHORE = asyncio.Semaphore(5)    # Ограничение на загрузку в S3
+# Семафоры
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+UPLOAD_SEMAPHORE = asyncio.Semaphore(5)
 
-# Счетчик для контроля batch-загрузок
+# Счетчик и время для лимита скачиваний
 download_counter = 0
 last_download_time = time.time()
-DOWNLOAD_RATE_LIMIT = 20  # Максимальное количество скачиваний в минуту
-MIN_DOWNLOAD_DELAY = 0.5  # Минимальная задержка между скачиваниями (в секундах)
+DOWNLOAD_RATE_LIMIT = 20
+MIN_DOWNLOAD_DELAY = 0.5
 
-# Отслеживание ошибок FloodWait
+# История FloodWait
 flood_wait_history = []
-MAX_FLOOD_HISTORY = 5      # Количество последних ошибок FloodWait для анализа
+MAX_FLOOD_HISTORY = 5
 
 # Очередь задач загрузки
 upload_queue = asyncio.Queue(maxsize=100)
 is_worker_running = False
 
-# Функция инициализации S3 клиента
+# --- Функции обновления статистики и инициализации --- 
+
+def update_account_usage(api_key, account_id, platform):
+    """Заглушка для функции обновления статистики использования аккаунта"""
+    try:
+        from user_manager import update_account_usage as real_update
+        real_update(api_key, account_id, platform)
+    except ImportError:
+        # logger.debug(f"Функция update_account_usage недоступна, использую заглушку для {account_id}")
+        pass
+
 def init_s3_client():
     global s3_client
-    # Используем переменные окружения для ключей доступа
+    s3_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+    s3_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    s3_endpoint_url = os.getenv('S3_ENDPOINT_URL', 'https://storage.yandexcloud.net')
+    
+    if not s3_access_key_id or not s3_secret_access_key:
+        logger.error("Ключи доступа S3 (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) не найдены в .env")
+        return
+        
     s3_client = boto3.client(
         's3',
         region_name=S3_REGION,
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        endpoint_url=os.getenv('S3_ENDPOINT_URL', 'https://storage.yandexcloud.net')
+        aws_access_key_id=s3_access_key_id,
+        aws_secret_access_key=s3_secret_access_key,
+        endpoint_url=s3_endpoint_url
     )
     logger.info("S3 клиент инициализирован")
 
-# Функция загрузки кэша
 def load_cache():
     global s3_file_cache
-    logger.debug(f"Проверка наличия файла кэша: {S3_CACHE_FILE}")
     if os.path.exists(S3_CACHE_FILE):
         try:
             with open(S3_CACHE_FILE, "rb") as f:
@@ -106,17 +121,39 @@ def load_cache():
             logger.error(f"Ошибка при загрузке кэша из {S3_CACHE_FILE}: {e}")
             s3_file_cache = OrderedDict()
     else:
-        logger.info(f"Файл кэша {S3_CACHE_FILE} не существует, создаём новый")
         s3_file_cache = OrderedDict()
 
 async def save_cache():
-    logger.debug("Начало асинхронного сохранения кэша")
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, lambda: pickle.dump(s3_file_cache, open(S3_CACHE_FILE, "wb")))
-        logger.info(f"Кэш сохранён в {S3_CACHE_FILE}, размер: {len(s3_file_cache)} записей")
+        await loop.run_in_executor(None, lambda: pickle.dump(dict(s3_file_cache), open(S3_CACHE_FILE, "wb")))
+        logger.info(f"Кэш сохранён в {S3_CACHE_FILE}")
     except Exception as e:
-        logger.error(f"Ошибка при асинхронном сохранении кэша в {S3_CACHE_FILE}: {e}")
+        logger.error(f"Ошибка при асинхронном сохранении кэша: {e}")
+
+async def init_scheduler():
+    global scheduler
+    init_s3_client() # Инициализируем S3 клиент при старте
+    load_cache()
+    scheduler = await create_scheduler()
+    logger.info("Планировщик инициализирован")
+    # Запускаем воркер, если в очереди есть задачи (после загрузки кэша)
+    if not is_worker_running and not upload_queue.empty():
+         asyncio.create_task(process_upload_queue())
+
+async def close_scheduler():
+    global scheduler
+    if scheduler:
+        await scheduler.close()
+        scheduler = None
+        logger.info("Планировщик закрыт")
+    if not upload_queue.empty():
+        logger.info(f"Ожидание завершения {upload_queue.qsize()} задач в очереди загрузки...")
+        await upload_queue.join()
+        logger.info("Все задачи в очереди загрузки завершены")
+    await save_cache() # Сохраняем кэш при выходе
+
+# --- Функции обработки медиа --- 
 
 async def optimize_image(file_path, output_path):
     """Сжимает изображение, сохраняя его в output_path."""
@@ -174,97 +211,76 @@ async def create_video_preview(video_path, thumbnail_path, preview_video_path):
         return False
 
 async def upload_to_s3(file_path, s3_filename, optimize=False, check_size=True):
-    """Загружает файл в S3, сжимая его, если это изображение или видео превышает максимальный размер."""
     if s3_client is None:
-        init_s3_client()
+        logger.error("S3 клиент не инициализирован. Загрузка невозможна.")
+        return False, {"reason": "s3_client_not_initialized"}
     
     async with UPLOAD_SEMAPHORE:
         try:
-            # Проверяем размер файла, если требуется
             if check_size and os.path.exists(file_path):
                 file_size = os.path.getsize(file_path)
-                # Если файл превышает максимальный размер
                 if file_size > MAX_FILE_SIZE:
-                    # Если это видео
                     if file_path.lower().endswith(('.mp4', '.mov', '.avi')):
-                        logger.info(f"Файл {file_path} превышает максимальный размер ({file_size} байт), создаем превью")
-                        
-                        # Создаем временную директорию
+                        logger.info(f"Видео {file_path} ({file_size} байт) превышает лимит, создаем превью")
                         temp_dir = tempfile.mkdtemp()
                         try:
-                            # Пути для превью
                             thumbnail_path = os.path.join(temp_dir, f"thumb_{os.path.basename(file_path)}.jpg")
-                            preview_video_path = os.path.join(temp_dir, f"preview_{os.path.basename(file_path)}")
-                            
-                            # Создаем превью
+                            preview_video_path = os.path.join(temp_dir, f"preview_{os.path.basename(file_path)}.mp4")
                             preview_success = await create_video_preview(file_path, thumbnail_path, preview_video_path)
-                            
                             if preview_success:
-                                # Загружаем миниатюру в S3
                                 thumb_s3_filename = s3_filename.replace(os.path.splitext(s3_filename)[1], "_thumb.jpg")
+                                preview_s3_filename = s3_filename.replace(os.path.splitext(s3_filename)[1], "_preview.mp4")
                                 s3_client.upload_file(thumbnail_path, S3_BUCKET_NAME, thumb_s3_filename)
                                 logger.debug(f"Миниатюра видео загружена в S3: {thumb_s3_filename}")
-                                
-                                # Загружаем превью-видео в S3
-                                preview_s3_filename = s3_filename.replace(os.path.splitext(s3_filename)[1], "_preview.mp4")
                                 s3_client.upload_file(preview_video_path, S3_BUCKET_NAME, preview_s3_filename)
                                 logger.debug(f"Превью видео загружено в S3: {preview_s3_filename}")
-                                
-                                # Добавляем информацию о превью в кэш
                                 preview_info = {
                                     'is_preview': True,
                                     'thumbnail': thumb_s3_filename,
                                     'preview': preview_s3_filename,
                                     'size': file_size
                                 }
-                                s3_file_cache[f"preview_{os.path.basename(s3_filename)}"] = preview_info
-                                
+                                s3_file_cache[s3_filename] = preview_info 
                                 return True, preview_info
                         except Exception as e:
-                            logger.error(f"Ошибка при создании превью: {e}")
+                            logger.error(f"Ошибка при создании превью для {file_path}: {e}")
                         finally:
-                            # Удаляем временную директорию
                             shutil.rmtree(temp_dir, ignore_errors=True)
-                            
-                        # Если не удалось создать превью, пропускаем загрузку
-                        logger.warning(f"Пропуск загрузки большого файла: {file_path} ({file_size} байт)")
-                        return False, {'is_preview': False, 'reason': 'size_limit_exceeded', 'size': file_size}
+                        return False, {'is_preview': False, 'reason': 'preview_creation_failed', 'size': file_size}
                     else:
-                        # Для других больших файлов просто пропускаем загрузку
-                        logger.warning(f"Пропуск загрузки большого файла: {file_path} ({file_size} байт)")
+                        logger.warning(f"Файл {file_path} ({file_size} байт) пропущен из-за превышения размера")
                         return False, {'is_preview': False, 'reason': 'size_limit_exceeded', 'size': file_size}
             
-            # Обычная загрузка изображений
             if optimize and file_path.lower().endswith(('.jpg', '.jpeg', '.png')):
-                # Создаём временный файл для сжатого изображения
                 optimized_path = file_path + "_optimized.jpg"
                 await optimize_image(file_path, optimized_path)
-                # Загружаем сжатый файл
                 s3_client.upload_file(optimized_path, S3_BUCKET_NAME, s3_filename)
-                # Удаляем временный файл
                 os.remove(optimized_path)
-                logger.debug(f"Сжатый файл загружен в S3: {s3_filename}")
+                logger.debug(f"Сжатый файл {s3_filename} загружен в S3")
             else:
-                # Загружаем файл как есть (например, небольшое видео)
                 s3_client.upload_file(file_path, S3_BUCKET_NAME, s3_filename)
-                logger.debug(f"Файл загружен в S3 без сжатия: {s3_filename}")
+                logger.debug(f"Файл {s3_filename} загружен в S3 без сжатия")
             return True, None
         except Exception as e:
-            logger.error(f"Ошибка при загрузке файла в S3 {s3_filename}: {e}")
-            return False, None
+            logger.error(f"Ошибка при загрузке файла {s3_filename} в S3: {e}")
+            return False, {"reason": "upload_error", "error": str(e)}
 
 async def check_s3_file(s3_filename):
-    """Проверяет, существует ли файл в S3."""
-    if s3_client is None:
-        init_s3_client()
+    if s3_client is None: return False
     try:
         s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_filename)
         return True
-    except s3_client.exceptions.ClientError:
-        return False
+    except s3_client.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == '404':
+             return False # Файл не найден
+        else:
+             logger.error(f"Ошибка при проверке файла {s3_filename} в S3: {e}")
+             return False # Другая ошибка
+    except Exception as e:
+         logger.error(f"Неожиданная ошибка при проверке файла {s3_filename} в S3: {e}")
+         return False
 
 async def calculate_download_delay():
-    """Рассчитывает задержку между скачиваниями на основе истории ошибок FloodWait."""
     global download_counter, last_download_time, flood_wait_history
 
     # Проверяем, не превышен ли лимит скачиваний в минуту
@@ -282,137 +298,354 @@ async def calculate_download_delay():
 
     return MIN_DOWNLOAD_DELAY
 
+# --- Новая логика get_media_info и обработчика очереди --- 
+
+async def get_media_info(client, msg, album_messages=None) -> Optional[Dict]:
+    """
+    Получает информацию о медиа, формирует ссылки и добавляет задачи в очередь.
+    Возвращает словарь с информацией о медиа или None.
+    """
+    logger.debug(f"Начало обработки сообщения {msg.id}")
+    # Определяем, обрабатываем ли мы альбом
+    is_album = bool(album_messages)
+    
+    if not msg.media and not is_album: # Проверяем и случай альбома
+        logger.debug(f"Сообщение {msg.id} без медиа")
+        return None
+
+    media_info = {
+        'type': 'album' if is_album else 'unknown', # Устанавливаем тип сразу, если это альбом
+        'url': None,
+        'media_urls': [] # Список S3 ссылок
+    }
+    tasks_to_queue = []
+
+    try:
+        post_url = f'https://t.me/{msg.chat.username}/{msg.id}' if msg.chat.username else f'https://t.me/c/{abs(msg.chat.id)}/{msg.id}'
+        media_info['url'] = post_url
+    except Exception as e:
+        logger.warning(f"Не удалось сформировать URL для поста {msg.id}: {e}")
+
+    messages_to_process = album_messages if is_album else [msg]
+    # if album_messages: media_info['type'] = 'album' # Эта строка больше не нужна
+
+    processed_file_ids = set() # Чтобы не дублировать задачи для одного file_id
+
+    for current_msg in messages_to_process:
+        if not current_msg.media: continue
+
+        media = current_msg.media
+        media_type = 'unknown'
+        file_id = None
+        media_object = None # Объект Telethon для скачивания
+        file_ext = '.bin'
+        mime_type = 'application/octet-stream'
+
+        # Определяем тип медиа и получаем объект для скачивания
+        if isinstance(media, types.MessageMediaPhoto):
+            media_type = 'photo'
+            media_object = media.photo
+            file_id = str(media_object.id)
+            file_ext = '.jpg'
+            mime_type = 'image/jpeg'
+        elif isinstance(media, types.MessageMediaDocument):
+            media_object = media.document
+            file_id = str(media_object.id)
+            mime_type = getattr(media_object, 'mime_type', mime_type).lower()
+            if mime_type.startswith('video/'):
+                media_type = 'video'
+                file_ext = '.mp4' # Предполагаем mp4
+            elif mime_type.startswith('image/'):
+                media_type = 'photo'
+                file_ext = '.jpg' # Предполагаем jpg
+            elif mime_type.startswith('audio/'):
+                media_type = 'audio'
+                file_ext = '.mp3' # Предполагаем mp3
+            else:
+                media_type = 'document'
+                # Пытаемся угадать расширение по имени файла, если есть
+                fname_attr = next((attr.file_name for attr in media_object.attributes if isinstance(attr, types.DocumentAttributeFilename)), None)
+                if fname_attr:
+                     _root, _ext = os.path.splitext(fname_attr)
+                     if _ext: file_ext = _ext.lower()
+
+            # Уточняем тип для GIF/стикеров
+            for attr in media_object.attributes:
+                if isinstance(attr, types.DocumentAttributeAnimated): media_type = 'gif'; file_ext='.gif'
+                elif isinstance(attr, types.DocumentAttributeSticker): media_type = 'sticker'; file_ext='.webp' # Стикеры часто webp
+
+        elif isinstance(media, types.MessageMediaWebPage):
+            if media_info['type'] == 'unknown': media_info['type'] = 'webpage'
+            webpage = media.webpage
+            # Пытаемся извлечь фото или видео из веб-страницы
+            if webpage and hasattr(webpage, 'photo') and webpage.photo:
+                media_type = 'photo'
+                media_object = webpage.photo
+                file_id = str(media_object.id)
+                file_ext = '.jpg'
+            elif webpage and hasattr(webpage, 'document') and webpage.document:
+                doc = webpage.document
+                is_video = any(isinstance(attr, types.DocumentAttributeVideo) for attr in doc.attributes)
+                is_image = any(isinstance(attr, types.DocumentAttributeImageSize) for attr in doc.attributes)
+                if is_video:
+                    media_type = 'video'
+                    media_object = doc
+                    file_id = str(doc.id)
+                    file_ext = '.mp4'
+                elif is_image:
+                    media_type = 'photo'
+                    media_object = doc
+                    file_id = str(doc.id)
+                    file_ext = '.jpg'
+            # Если из веб-страницы не извлечь медиа, пропускаем
+
+        # Если успешно определили медиа и file_id
+        if file_id and media_object and file_id not in processed_file_ids:
+            processed_file_ids.add(file_id)
+            logger.debug(f"Подготовка задачи для file_id={file_id}, type={media_type}, ext={file_ext}")
+            
+            # Формируем имя S3 файла с префиксом
+            s3_filename = f"mediaTg/{file_id}{file_ext}"
+            s3_link = S3_LINK_TEMPLATE.format(filename=s3_filename)
+            
+            # Добавляем ссылку в результат сразу
+            if s3_link not in media_info['media_urls']:
+                media_info['media_urls'].append(s3_link)
+
+            # Проверяем кэш перед добавлением задачи
+            cache_hit = False
+            if file_id in s3_file_cache:
+                cached_entry = s3_file_cache[file_id]
+                if isinstance(cached_entry, dict) and cached_entry.get('is_preview'):
+                    # Если есть превью, основную ссылку уже добавили, задачу не создаем
+                    preview_s3_link = S3_LINK_TEMPLATE.format(filename=cached_entry.get('preview'))
+                    thumb_s3_link = S3_LINK_TEMPLATE.format(filename=cached_entry.get('thumbnail'))
+                    if preview_s3_link not in media_info['media_urls']: media_info['media_urls'].append(preview_s3_link)
+                    if thumb_s3_link not in media_info['media_urls']: media_info['media_urls'].append(thumb_s3_link)
+                    cache_hit = True
+                elif isinstance(cached_entry, str):
+                    # Если в кэше имя файла, проверяем его наличие в S3
+                    if await check_s3_file(cached_entry):
+                        logger.info(f"Файл {file_id} найден в S3 по кэшу ({cached_entry}). Задачу не добавляем.")
+                        cache_hit = True
+                    else:
+                        logger.warning(f"Файл {cached_entry} из кэша для {file_id} не найден в S3. Удаляем из кэша.")
+                        del s3_file_cache[file_id]
+
+            # Если файла нет в S3 (проверено по кэшу), добавляем задачу
+            if not cache_hit:
+                task_data = {
+                    'client': client, # Передаем клиент для скачивания
+                    'media': media_object,
+                    'file_id': file_id,
+                    'media_type': media_type,
+                    's3_filename': s3_filename,
+                    'file_ext': file_ext
+                }
+                tasks_to_queue.append(task_data)
+        
+        # Обновляем тип основного медиа, если он еще 'unknown'
+        if not is_album and media_info['type'] == 'unknown' and media_type != 'unknown':
+            media_info['type'] = media_type
+
+    # Добавляем задачи в очередь
+    if tasks_to_queue:
+        logger.info(f"Добавление {len(tasks_to_queue)} задач в очередь загрузки для сообщения {msg.id}")
+        for task in tasks_to_queue:
+            await add_to_upload_queue(task)
+
+    # Если нет URL медиа, но есть URL поста, возвращаем инфо
+    if not media_info['media_urls'] and media_info['url']:
+        logger.debug(f"Медиафайлы для поста {msg.id} не найдены или уже обработаны, возвращаем информацию без media_urls")
+        return media_info
+    # Если есть URL медиа, возвращаем инфо
+    elif media_info['media_urls']:
+        return media_info
+    # Иначе возвращаем None
+    else:
+        logger.warning(f"Не удалось извлечь медиа или URL для поста {msg.id}")
+        return None
+
 async def add_to_upload_queue(task_data):
-    """Добавляет задачу в очередь загрузки."""
     await upload_queue.put(task_data)
+    global is_worker_running
     if not is_worker_running:
         asyncio.create_task(process_upload_queue())
 
 async def process_upload_queue():
-    """Обрабатывает очередь задач загрузки."""
+    """Обрабатывает очередь задач загрузки (скачивание + загрузка)."""
     global is_worker_running
+    if is_worker_running:
+        return
     is_worker_running = True
-    while not upload_queue.empty():
-        task_data = await upload_queue.get()
-        file_path, s3_filename, optimize, check_size = task_data
+    logger.info("Запуск рабочего процесса обработки очереди загрузки...")
+
+    temp_dir = tempfile.gettempdir() # Получаем системную временную директорию
+    logger.info(f"Используется временная директория: {temp_dir}")
+
+    while True:
+        task_data = None
         try:
-            success, info = await upload_to_s3(file_path, s3_filename, optimize, check_size)
-            if success:
-                logger.info(f"Файл {s3_filename} успешно загружен в S3")
+            # Ожидаем задачу не более 5 секунд
+            task_data = await asyncio.wait_for(upload_queue.get(), timeout=5.0) 
+        except asyncio.TimeoutError:
+            # Если время вышло, проверяем, пуста ли очередь
+            if upload_queue.empty():
+                logger.info("Очередь загрузки пуста, завершение рабочего процесса.")
+                break # Выходим из цикла, если очередь пуста
             else:
-                logger.error(f"Ошибка при загрузке файла {s3_filename} в S3")
-        finally:
-            # Удаляем временный файл после загрузки (успешной или нет)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            upload_queue.task_done()
-    is_worker_running = False
+                continue # Продолжаем ждать, если очередь не пуста
+        except Exception as e:
+            logger.error(f"Ошибка при получении задачи из очереди: {e}")
+            await asyncio.sleep(1) # Пауза перед следующей попыткой
+            continue
 
-async def process_media_file(client, media, file_id, media_type):
-    """Обрабатывает медиафайл, загружает его в S3 и возвращает информацию о нем."""
-    try:
-        # Генерируем имя файла в S3
-        s3_filename = f"{file_id}_{media_type}"
+        if task_data is None: continue # На всякий случай
+
+        # Распаковываем данные задачи
+        client = task_data.get('client')
+        media = task_data.get('media')
+        file_id = task_data.get('file_id')
+        media_type = task_data.get('media_type')
+        s3_filename = task_data.get('s3_filename')
+        file_ext = task_data.get('file_ext')
         
-        # Создаем фоновую задачу для скачивания и загрузки файла
-        async def download_and_upload():
-            try:
-                # Проверяем, существует ли файл в S3
-                if await check_s3_file(s3_filename):
-                    logger.info(f"Файл {s3_filename} уже существует в S3")
-                    return
+        # Генерируем уникальное имя файла во временной директории
+        # Это важно, если несколько задач обрабатывают один file_id одновременно (хотя вряд ли)
+        temp_filename = f"telethon_temp_{file_id}_{int(time.time()*1000)}{file_ext}"
+        local_path = os.path.join(temp_dir, temp_filename)
+
+        logger.debug(f"Воркер: обработка задачи для file_id: {file_id}, s3: {s3_filename}, temp_path: {local_path}")
+        download_success = False
+        
+        try:
+            # --- Скачивание --- 
+            # Удаляем старый временный файл с таким же именем, если он вдруг остался (маловероятно с уникальным именем)
+            if os.path.exists(local_path):
+                 try: 
+                     os.remove(local_path) 
+                     logger.debug(f"Воркер: удален старый временный файл {local_path}")
+                 except Exception as e_rem_old:
+                     logger.warning(f"Воркер: не удалось удалить старый временный файл {local_path}: {e_rem_old}")
+            
+            # Используем семафор для ограничения одновременных скачиваний
+            async with DOWNLOAD_SEMAPHORE:
+                delay = await calculate_download_delay()
+                if delay > 0: 
+                    logger.debug(f"Воркер: задержка перед скачиванием {file_id}: {delay:.2f} сек.")
+                    await asyncio.sleep(delay)
                 
-                # Используем семафор для контроля скачиваний
-                async with DOWNLOAD_SEMAPHORE:
-                    # Рассчитываем задержку перед скачиванием
-                    delay = await calculate_download_delay()
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    
-                    # Скачиваем медиафайл
-                    file_path = f"temp_{file_id}_{media_type}"
-                    await client.download_media(media, file_path)
-                    
-                    # Обновляем счетчик скачиваний
-                    global download_counter
-                    download_counter += 1
-                    
-                    # Добавляем задачу в очередь загрузки
-                    await add_to_upload_queue((file_path, s3_filename, True, True))
-            except FloodWaitError as e:
-                # Обрабатываем FloodWaitError
-                global flood_wait_history
-                flood_wait_history.append({
-                    'wait_time': e.seconds,
-                    'timestamp': time.time()
-                })
-                # Оставляем только последние MAX_FLOOD_HISTORY ошибок
-                if len(flood_wait_history) > MAX_FLOOD_HISTORY:
-                    flood_wait_history = flood_wait_history[-MAX_FLOOD_HISTORY:]
-                logger.warning(f"Получен FloodWaitError для файла {file_id}, ожидание {e.seconds} секунд")
-            except Exception as e:
-                logger.error(f"Ошибка при скачивании/загрузке медиафайла {file_id}: {e}")
+                logger.info(f"Воркер: НАЧАЛО скачивания {file_id} -> {local_path}")
+                global download_counter, last_download_time
+                download_counter += 1
+                last_download_time = time.time() # Обновляем время последнего скачивания
+                
+                # Скачиваем медиа
+                downloaded_file_path = await client.download_media(media, local_path)
+                
+                # Строгая проверка, что файл действительно скачан и путь совпадает
+                if downloaded_file_path and os.path.exists(downloaded_file_path) and os.path.abspath(downloaded_file_path) == os.path.abspath(local_path):
+                    download_success = True
+                    try:
+                        file_size = os.path.getsize(local_path)
+                        logger.info(f"Воркер: УСПЕШНО скачан {file_id} -> {local_path}, Размер: {file_size} байт")
+                    except OSError as size_err:
+                         logger.warning(f"Воркер: Файл {local_path} скачан, но не удалось получить размер: {size_err}")
+                         logger.info(f"Воркер: УСПЕШНО скачан {file_id} -> {local_path} (размер неизвестен)")
+
+                else:
+                    logger.error(f"Воркер: ОШИБКА скачивания {file_id}. Ожидался путь: {local_path}, Получен: {downloaded_file_path}. Файл существует: {os.path.exists(local_path)}")
+                    download_success = False 
+
+        except FloodWaitError as e:
+            logger.warning(f"Воркер: FloodWaitError при скачивании {file_id}: {e.seconds} сек. Возврат задачи в очередь.")
+            global flood_wait_history
+            # Сохраняем информацию о FloodWait
+            flood_wait_history.append({'timestamp': time.time(), 'wait_time': e.seconds}) 
+            if len(flood_wait_history) > MAX_FLOOD_HISTORY: flood_wait_history.pop(0) # Удаляем старые записи
+            
+            # Ждем указанное время + небольшая случайная добавка и возвращаем задачу в очередь
+            await asyncio.sleep(e.seconds + random.uniform(0.5, 1.5)) 
+            await upload_queue.put(task_data) 
+            # Пропускаем оставшуюся часть обработки этой задачи
+            upload_queue.task_done() # Отмечаем задачу как обработанную (хотя она вернулась в очередь)
+            logger.debug(f"Воркер: задача {file_id} возвращена в очередь из-за FloodWait.")
+            continue 
+        except FileNotFoundError as fnf_err:
+             logger.error(f"Воркер: FileNotFoundError при скачивании {file_id} в {local_path}: {fnf_err}", exc_info=True)
+             download_success = False
+        except PermissionError as perm_err:
+             logger.error(f"Воркер: PermissionError при скачивании/сохранении {file_id} в {local_path}: {perm_err}", exc_info=True)
+             download_success = False
+        except Exception as e:
+            # Логируем любые другие непредвиденные ошибки при скачивании
+            logger.error(f"Воркер: Непредвиденная ошибка при скачивании {file_id}: {type(e).__name__} - {e}", exc_info=True)
+            download_success = False 
         
-        # Запускаем фоновую задачу
-        asyncio.create_task(download_and_upload())
+        # --- Загрузка в S3 --- 
+        if download_success:
+            # Дополнительная проверка на существование файла ПЕРЕД загрузкой
+            if os.path.exists(local_path):
+                 logger.info(f"Воркер: НАЧАЛО загрузки {local_path} (ID: {file_id}) -> S3:{s3_filename}")
+                 optimize = media_type == 'photo' # Оптимизируем только фото
+                 try:
+                    # Вызываем функцию загрузки с проверкой размера
+                    upload_success, info = await upload_to_s3(local_path, s3_filename, optimize=optimize, check_size=True) 
+                    
+                    if upload_success:
+                        cache_key = file_id
+                        # Если было создано превью, кэшируем информацию о нем
+                        if info and info.get('is_preview'):
+                            s3_file_cache[cache_key] = info 
+                            logger.info(f"Воркер: УСПЕШНО создано превью для {file_id} -> S3")
+                        # Иначе кэшируем имя основного файла
+                        else:
+                            s3_file_cache[cache_key] = s3_filename
+                            logger.info(f"Воркер: УСПЕШНО загружен файл {file_id} -> S3:{s3_filename}")
+                        
+                        # Обновляем кэш
+                        s3_file_cache.move_to_end(cache_key) # Перемещаем в конец для LRU
+                        if len(s3_file_cache) > MAX_CACHE_SIZE: s3_file_cache.popitem(last=False) # Удаляем самый старый, если превышен лимит
+                        asyncio.create_task(save_cache()) # Сохраняем кэш асинхронно
+                        
+                    elif info and info.get('reason') == 'size_limit_exceeded':
+                        # Файл слишком большой, не загружен
+                        logger.warning(f"Воркер: файл {file_id} ({s3_filename}) пропущен (слишком большой, {info.get('size')} байт)")
+                        # Не кэшируем, т.к. загрузки не было
+
+                    else:
+                         # Ошибка во время загрузки
+                         reason = info.get('reason', 'unknown') if info else 'unknown'
+                         error_details = info.get('error', 'N/A') if info else 'N/A'
+                         logger.error(f"Воркер: ОШИБКА загрузки {s3_filename} в S3. Причина: {reason}, Ошибка: {error_details}")
+
+                 except Exception as upload_exc:
+                     # Логируем исключения, возникшие при вызове upload_to_s3
+                     logger.error(f"Воркер: Исключение во время вызова upload_to_s3 для {local_path} -> {s3_filename}: {upload_exc}", exc_info=True)
+
+            else:
+                 # Эта ситуация критична и указывает на проблему: скачивание считалось успешным, но файла нет
+                 logger.error(f"Воркер: КРИТИЧЕСКАЯ ОШИБКА! Файл {local_path} для {file_id} не найден ПЕРЕД загрузкой, хотя скачивание считалось успешным. Пропуск загрузки.")
         
-        # Возвращаем информацию о файле сразу
-        return {
-            'file_id': file_id,
-            'media_type': media_type,
-            's3_filename': s3_filename,
-            's3_link': S3_LINK_TEMPLATE.format(filename=s3_filename),
-            'status': 'processing'
-        }
-    except Exception as e:
-        logger.error(f"Ошибка при обработке медиафайла {file_id}: {e}")
-        return None
+        else: # download_success == False
+            # Если скачивание не удалось, просто логируем пропуск загрузки
+             logger.warning(f"Воркер: Пропуск загрузки для {file_id}, так как скачивание не удалось.")
+        
+        # --- Очистка и завершение задачи --- 
+        # Пытаемся удалить временный файл, если он все еще существует (даже если были ошибки)
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                logger.debug(f"Воркер: Удален временный файл {local_path}")
+            except Exception as e_rem:
+                # Логируем ошибку, если не удалось удалить временный файл
+                logger.error(f"Воркер: Не удалось удалить временный файл {local_path}: {e_rem}")
+        
+        # Отмечаем задачу как выполненную в очереди asyncio
+        upload_queue.task_done()
+        logger.debug(f"Воркер: Задача для file_id {file_id} завершена (обработана).")
+        await asyncio.sleep(0.1) # Небольшая пауза для предотвращения 100% загрузки CPU
 
-async def get_media_info(client, msg, album_messages=None):
-    """Получает информацию о медиафайлах в сообщении."""
-    media_info = []
-    if msg.media:
-        media = msg.media
-        if isinstance(media, types.MessageMediaPhoto):
-            file_id = msg.id
-            media_type = 'photo'
-            info = await process_media_file(client, media, file_id, media_type)
-            if info:
-                media_info.append(info)
-        elif isinstance(media, types.MessageMediaDocument):
-            file_id = msg.id
-            media_type = 'document'
-            info = await process_media_file(client, media, file_id, media_type)
-            if info:
-                media_info.append(info)
-    if album_messages:
-        for album_msg in album_messages:
-            if album_msg.media:
-                media = album_msg.media
-                if isinstance(media, types.MessageMediaPhoto):
-                    file_id = album_msg.id
-                    media_type = 'photo'
-                    info = await process_media_file(client, media, file_id, media_type)
-                    if info:
-                        media_info.append(info)
-                elif isinstance(media, types.MessageMediaDocument):
-                    file_id = album_msg.id
-                    media_type = 'document'
-                    info = await process_media_file(client, media, file_id, media_type)
-                    if info:
-                        media_info.append(info)
-    return media_info
-
-async def init_scheduler():
-    """Инициализирует планировщик для фоновых задач."""
-    global scheduler
-    scheduler = await create_scheduler()
-    logger.info("Планировщик инициализирован")
-
-async def close_scheduler():
-    """Закрывает планировщик."""
-    global scheduler
-    if scheduler:
-        await scheduler.close()
-        scheduler = None
-        logger.info("Планировщик закрыт")
+    # Цикл завершен (очередь пуста)
+    is_worker_running = False
+    logger.info("Рабочий процесс обработки очереди загрузки штатно завершен.")
