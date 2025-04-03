@@ -10,7 +10,7 @@ import logging
 from dotenv import load_dotenv  # Импортируем раньше всех
 import os
 import uuid
-from typing import List
+from typing import List, Union
 import sys
 from datetime import datetime
 from telethon import TelegramClient
@@ -732,39 +732,26 @@ async def posts_by_keywords(request: Request, data: dict):
     raise HTTPException(400, "Платформа не поддерживается")
 
 @app.post("/posts-by-period")
-async def get_posts_by_period(
-    request: Request,
-    platform: str = Body(...),
-    group_ids: List[int] = Body(...),
-    max_posts: int = Body(100),
-    days_back: int = Body(7),
-    min_views: int = Body(0)
-):
+async def get_posts_by_period(request: Request, data: dict):
     """Получение постов из групп за указанный период."""
-    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not api_key:
-        raise HTTPException(status_code=401, detail="API ключ не указан")
+    platform = data.get('platform', 'telegram')
+    group_ids = data.get('group_ids', [])
+    if not group_ids:
+        raise HTTPException(400, "ID групп обязательны")
     
-    if platform == "telegram":
-        account = get_next_available_account(api_key, "telegram")
-        if not account:
-            raise HTTPException(status_code=400, detail="Нет доступных аккаунтов Telegram")
-        
+    max_posts = data.get('max_posts', 100)
+    days_back = data.get('days_back', 7)
+    min_views = data.get('min_views', 0)
+
+    if platform == 'telegram':
         client = await auth_middleware(request, 'telegram')
-        posts = await get_posts_by_period(client, group_ids, max_posts, days_back, min_views, api_key)
-        await update_account_usage(api_key, account["id"], "telegram")
-        return posts
-    elif platform == "vk":
-        account = get_next_available_account(api_key, "vk")
-        if not account:
-            raise HTTPException(status_code=400, detail="Нет доступных аккаунтов VK")
-        
+        from telegram_utils import get_posts_by_period as get_telegram_posts_by_period
+        return await get_telegram_posts_by_period(client, group_ids, max_posts, days_back, min_views)
+    elif platform == 'vk':
         vk = await auth_middleware(request, 'vk')
-        posts = await get_posts_by_period(vk, group_ids, max_posts, days_back, min_views)
-        await update_account_usage(api_key, account["id"], "vk")
-        return posts
-    else:
-        raise HTTPException(status_code=400, detail="Неподдерживаемая платформа")
+        from vk_utils import get_posts_by_period as get_vk_posts_by_period
+        return await get_vk_posts_by_period(vk, group_ids, max_posts, days_back, min_views)
+    raise HTTPException(400, "Платформа не поддерживается")
 
 @app.get("/api/accounts/status")
 async def get_accounts_status(api_key: str = Header(...)):

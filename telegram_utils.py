@@ -383,10 +383,12 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
 async def get_posts_in_channels(client: TelegramClient, channel_ids: List[int], keywords: Optional[List[str]] = None, count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
     """Получает посты из каналов по ключевым словам."""
     posts = []
+    wrapper = TelegramClientWrapper(client, client.session.filename)
+    
     for channel_id in channel_ids:
         try:
-            channel = await client.get_entity(channel_id)
-            result = await client(GetHistoryRequest(
+            channel = await wrapper._make_request(client.get_entity, channel_id)
+            result = await wrapper._make_request(GetHistoryRequest,
                 peer=channel,
                 limit=count // len(channel_ids),
                 offset_date=datetime.now() - timedelta(days=days_back),
@@ -395,17 +397,18 @@ async def get_posts_in_channels(client: TelegramClient, channel_ids: List[int], 
                 min_id=0,
                 add_offset=0,
                 hash=0
-            ))
+            )
             
             for message in result.messages:
-                if message.views >= min_views:
+                views = message.views or 0  # Обрабатываем случай, когда views = None
+                if views >= min_views:
                     if not keywords or any(keyword.lower() in message.message.lower() for keyword in keywords):
                         posts.append({
                             "id": message.id,
                             "channel_id": channel_id,
                             "channel_title": channel.title,
                             "text": message.message,
-                            "views": message.views,
+                            "views": views,
                             "date": message.date.isoformat(),
                             "url": f"https://t.me/c/{channel_id}/{message.id}"
                         })
@@ -418,69 +421,129 @@ async def get_posts_in_channels(client: TelegramClient, channel_ids: List[int], 
 async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str], post_keywords: List[str], count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
     """Получает посты из каналов по ключевым словам для групп и постов."""
     posts = []
+    wrapper = TelegramClientWrapper(client, client.session.filename)
+    
     for group_keyword in group_keywords:
         try:
-            result = await client(SearchGlobalRequest(
-                q=group_keyword,
-                filter=InputPeerChannel,
-                min_date=datetime.now() - timedelta(days=days_back)
-            ))
-            
-            for chat in result.chats:
-                if isinstance(chat, Channel):
-                    try:
-                        channel_posts = await get_posts_in_channels(
-                            client,
-                            [chat.id],
-                            post_keywords,
-                            count // len(group_keywords),
-                            min_views,
-                            days_back
-                        )
-                        posts.extend(channel_posts)
-                    except Exception as e:
-                        logger.error(f"Ошибка при получении постов из канала {chat.id}: {e}")
-                        continue
+            async with REQUEST_SEMAPHORE:
+                # Используем wrapper для поиска каналов
+                result = await wrapper._make_request(functions.contacts.SearchRequest,
+                    q=group_keyword,
+                    limit=100 # Искать среди 100 первых результатов
+                )
+                
+                # Обрабатываем найденные чаты
+                for chat in result.chats:
+                    if isinstance(chat, types.Channel) and not chat.megagroup:
+                        try:
+                            channel_posts = await get_posts_in_channels(
+                                client,
+                                [chat.id],
+                                post_keywords,
+                                count // len(group_keywords),
+                                min_views,
+                                days_back
+                            )
+                            posts.extend(channel_posts)
+                        except Exception as e:
+                            logger.error(f"Ошибка при получении постов из канала {chat.id}: {e}")
+                            continue
         except Exception as e:
             logger.error(f"Ошибка при поиске каналов по ключевому слову {group_keyword}: {e}")
             continue
     
     return sorted(posts, key=lambda x: x["views"], reverse=True)[:count]
 
-async def get_posts_by_period(client, group_ids: List[int], max_posts: int = 100, days_back: int = 7, min_views: int = 0, api_key: str = None) -> List[Dict]:
+async def get_posts_by_period(client, group_ids: List[Union[int, str]], max_posts: int = 100, days_back: int = 7, min_views: int = 0) -> List[Dict]:
     """Получение постов из групп за указанный период."""
     try:
         all_posts = []
-        cutoff_date = datetime.now() - timedelta(days=days_back)
-        wrapper = TelegramClientWrapper(client, client.session.filename, api_key)
+        cutoff_date = datetime.now().replace(tzinfo=None) - timedelta(days=days_back)
+        wrapper = TelegramClientWrapper(client, client.session.filename)
         
-        # Получаем активные аккаунты
-        active_accounts = get_active_accounts(api_key, "telegram")
-        if not active_accounts:
-            logger.warning("Нет доступных аккаунтов")
-            return []
-        
-        # Устанавливаем режим пониженной производительности, если необходимо
-        if len(active_accounts) == 1 and active_accounts[0].get("degraded_mode", False):
-            wrapper.set_degraded_mode(True)
-            logger.info("Используется режим пониженной производительности")
-        
-        # Распределяем группы между аккаунтами
-        groups_per_account = len(group_ids) // len(active_accounts) + 1
-        account_groups = [group_ids[i:i + groups_per_account] for i in range(0, len(group_ids), groups_per_account)]
-        
-        # Создаем задачи для каждого аккаунта
-        tasks = []
-        for account, groups in zip(active_accounts, account_groups):
-            task = asyncio.create_task(process_groups(wrapper, groups, max_posts // len(active_accounts), cutoff_date, min_views))
-            tasks.append(task)
-        
-        # Ждем завершения всех задач
-        results = await asyncio.gather(*tasks)
-        
-        # Объединяем результаты
-        for result in results:
-            all_posts.extend(result)
+        # Получаем посты из каждой группы
+        for group_id in group_ids:
+            try:
+                # Получаем информацию о канале
+                channel_entity = await wrapper._make_request(wrapper.client.get_entity, group_id)
+                if not isinstance(channel_entity, (Channel, User)):
+                    logger.warning(f"Не удалось получить информацию о канале {group_id}")
+                    continue
+                
+                # Получаем полную информацию о канале для количества подписчиков
+                try:
+                    full_chat = await wrapper._make_group_request(GetFullChannelRequest, channel_entity)
+                    subscribers = full_chat.full_chat.participants_count if hasattr(full_chat, 'full_chat') and hasattr(full_chat.full_chat, 'participants_count') else 0
+                except Exception as e:
+                    logger.error(f"Ошибка при получении информации о подписчиках канала {group_id}: {e}")
+                    subscribers = 0
+                
+                # Обеспечим, чтобы подписчиков было хотя бы 10 для логарифма
+                subscribers_for_calc = max(subscribers, 10)
+                
+                # Получаем посты из канала
+                channel_posts = await wrapper._make_request(wrapper.client.get_messages,
+                    channel_entity,
+                    limit=max_posts
+                )
+                
+                for post in channel_posts:
+                    if not post.message:
+                        continue
+                        
+                    post_date = post.date.replace(tzinfo=None)
+                    if post_date < cutoff_date:
+                        continue
+                        
+                    views = getattr(post, 'views', 0)
+                    if views < min_views:
+                        continue
+                    
+                    # Получаем дополнительные метрики
+                    reactions = len(post.reactions.results) if post.reactions else 0
+                    comments = post.replies.replies if post.replies else 0
+                    forwards = post.forwards or 0
+                    
+                    # Рассчитываем показатели вовлеченности
+                    raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
+                    trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0
+                    
+                    # Формируем URL в зависимости от типа ID канала
+                    channel_username = getattr(channel_entity, 'username', None)
+                    if channel_username:
+                        url = f"https://t.me/{channel_username}/{post.id}"
+                    else:
+                        url = f"https://t.me/c/{abs(channel_entity.id)}/{post.id}"
+                    
+                    post_data = {
+                        "id": post.id,
+                        "date": post_date.isoformat(),
+                        "views": views,
+                        "reactions": reactions,
+                        "comments": comments,
+                        "forwards": forwards,
+                        "text": post.message,
+                        "group_id": group_id,
+                        "group_title": channel_entity.title,
+                        "group_username": channel_username,
+                        "url": url,
+                        "media": [],
+                        "subscribers": subscribers,
+                        "trend_score": trend_score,
+                        "raw_engagement_score": raw_engagement_score
+                    }
+                    
+                    # Обрабатываем медиафайлы
+                    if post.media:
+                        media_data = await process_media_file(post.media)
+                        if media_data:
+                            post_data["media"].append(media_data)
+                    
+                    all_posts.append(post_data)
+                
+            except Exception as e:
+                logger.error(f"Ошибка при получении постов из канала {group_id}: {e}")
+                continue
         
         # Сортируем посты по дате (новые сверху)
         all_posts.sort(key=lambda x: x["date"], reverse=True)
@@ -491,61 +554,6 @@ async def get_posts_by_period(client, group_ids: List[int], max_posts: int = 100
     except Exception as e:
         logger.error(f"Ошибка при получении постов: {e}")
         return []
-
-async def process_groups(wrapper: TelegramClientWrapper, group_ids: List[int], max_posts: int, cutoff_date: datetime, min_views: int) -> List[Dict]:
-    """Обрабатывает группы для одного аккаунта."""
-    posts = []
-    for group_id in group_ids:
-        try:
-            # Получаем информацию о канале
-            channel_entity = await wrapper._make_request(wrapper.client.get_entity, group_id)
-            if not isinstance(channel_entity, (Channel, User)):
-                logger.warning(f"Не удалось получить информацию о канале {group_id}")
-                continue
-            
-            # Получаем посты из канала
-            channel_posts = await wrapper._make_request(wrapper.client.get_messages,
-                channel_entity,
-                limit=max_posts
-            )
-            
-            for post in channel_posts:
-                if not post.message:
-                    continue
-                    
-                post_date = post.date
-                if post_date < cutoff_date:
-                    continue
-                    
-                views = getattr(post, 'views', 0)
-                if views < min_views:
-                    continue
-                
-                post_data = {
-                    "id": post.id,
-                    "date": post_date.isoformat(),
-                    "views": views,
-                    "text": post.message,
-                    "group_id": group_id,
-                    "group_title": channel_entity.title,
-                    "group_username": getattr(channel_entity, 'username', None),
-                    "url": f"https://t.me/c/{group_id}/{post.id}",
-                    "media": []
-                }
-                
-                # Обрабатываем медиафайлы
-                if post.media:
-                    media_data = await process_media_file(post.media)
-                    if media_data:
-                        post_data["media"].append(media_data)
-                
-                posts.append(post_data)
-            
-        except Exception as e:
-            logger.error(f"Ошибка при получении постов из канала {group_id}: {e}")
-            continue
-    
-    return posts
 
 async def process_media_file(media):
     """Обрабатывает медиафайл и возвращает информацию о нем."""
