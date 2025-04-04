@@ -6,13 +6,15 @@ from vk_api.exceptions import ApiError
 from dotenv import load_dotenv
 import os
 import aiohttp
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union, Any
 from datetime import datetime, timedelta
-from media_utils import get_media_info
+from media_utils import get_media_info as telegram_get_media_info
 from user_manager import get_active_accounts, update_account_usage
 import math
 import redis
 import json
+import re
+import random
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -44,6 +46,55 @@ except Exception as e:
 
 # Глобальный кэш для количества участников групп (используется как fallback)
 GROUP_MEMBERS_CACHE = {}
+
+def validate_proxy(proxy: Optional[str]) -> bool:
+    """
+    Валидирует строку прокси и возвращает статус валидации.
+    
+    Args:
+        proxy: Строка с прокси в формате scheme://host:port или scheme://user:password@host:port
+        
+    Returns:
+        bool: True если прокси валиден, False в противном случае
+    """
+    if not proxy:
+        return False
+    
+    # Проверяем схему прокси
+    valid_schemes = ['http://', 'https://', 'socks4://', 'socks5://']
+    has_valid_scheme = any(proxy.startswith(scheme) for scheme in valid_schemes)
+    
+    # Если схема не указана, по умолчанию считаем http
+    if not has_valid_scheme:
+        proxy = f'http://{proxy}'
+    
+    # Проверяем формат прокси
+    proxy_pattern = r'^(https?://|socks[45]://)(([^:@]+)(:[^@]+)?@)?([^:@]+)(:(\d+))$'
+    return bool(re.match(proxy_pattern, proxy))
+
+def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
+    """
+    Подготавливает строку прокси для логирования (скрывая чувствительные данные).
+    
+    Args:
+        proxy: Строка с прокси
+        
+    Returns:
+        str: Безопасная для логирования версия строки прокси
+    """
+    if not proxy:
+        return "None"
+    
+    # Если в прокси есть логин/пароль, то скрываем их
+    if '@' in proxy:
+        scheme = proxy.split('://')[0] if '://' in proxy else 'http'
+        rest = proxy.split('://')[1] if '://' in proxy else proxy
+        
+        parts = rest.split('@')
+        host_part = parts[1]
+        # Возвращаем только схему и хост:порт, скрывая данные авторизации
+        return f"{scheme}://***@{host_part}"
+    return proxy
 
 class VKClient:
     def __init__(self, access_token: str, proxy: Optional[str] = None, account_id: Optional[str] = None, api_key: Optional[str] = None):
@@ -138,53 +189,79 @@ class VKClient:
             try:
                 # Логируем запрос (без токена для безопасности)
                 log_params = {k: v for k, v in request_params.items() if k != "access_token"}
-                logger.info(f"Отправка запроса к VK API: {method} c параметрами {log_params}")
                 
-                async with self.session.get(f"{self.base_url}/{method}", params=request_params, proxy=self.proxy) as response:
-                    if response.status != 200:
-                        logger.error(f"Ошибка при запросе к VK API: статус {response.status}")
-                        try:
-                            error_text = await response.text()
-                            logger.error(f"Текст ошибки: {error_text}")
-                        except:
-                            pass
-                        return {}
-                    
+                # Проверяем валидность прокси
+                proxy_valid = validate_proxy(self.proxy) if self.proxy else False
+                proxy_info = sanitize_proxy_for_logs(self.proxy) if self.proxy else "без прокси"
+                
+                if self.proxy:
+                    logger.info(f"Отправка запроса к VK API: {method} через прокси {proxy_info} c параметрами {log_params}")
+                else:
+                    logger.info(f"Отправка запроса к VK API: {method} без прокси c параметрами {log_params}")
+                
+                # Сначала пробуем с прокси, если он задан и валиден
+                if self.proxy and proxy_valid:
                     try:
-                        result = await response.json()
+                        async with self.session.get(f"{self.base_url}/{method}", params=request_params, proxy=self.proxy) as response:
+                            return await self._process_response(response, method, params)
+                    except aiohttp.ClientProxyConnectionError as e:
+                        logger.error(f"Ошибка подключения через прокси {proxy_info}: {e}")
+                        logger.warning(f"Пробуем запрос без прокси после ошибки")
                     except Exception as e:
-                        logger.error(f"Ошибка при декодировании JSON ответа: {e}")
-                        return {}
-                    
-                    # Проверяем ошибки VK API
-                    if "error" in result:
-                        error = result["error"]
-                        logger.error(f"Ошибка VK API: {error.get('error_code')} - {error.get('error_msg')}")
-                        
-                        # Если токен недействителен или истек
-                        if error.get("error_code") in [5, 27]:
-                            logger.error("Токен недействителен или истек")
-                            return {}
-                        
-                        # Если превышен лимит запросов
-                        if error.get("error_code") == 29:
-                            logger.warning("Превышен лимит запросов к VK API")
-                            await asyncio.sleep(1)  # Увеличиваем задержку при превышении лимита
-                            return await self._make_request(method, params)  # Повторяем запрос
-                        
-                        return {}
-                    
-                    self.requests_count += 1
-                    if self.account_id and self.api_key:
-                        update_account_usage(self.api_key, self.account_id, "vk")
-                    
-                    return result
+                        logger.error(f"Ошибка при запросе через прокси {proxy_info}: {e}")
+                        logger.warning(f"Пробуем запрос без прокси после ошибки")
+                
+                # Если прокси не задан, не валиден или произошла ошибка - пробуем без прокси
+                async with self.session.get(f"{self.base_url}/{method}", params=request_params) as response:
+                    return await self._process_response(response, method, params)
+                
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
                 logger.error(f"Ошибка при выполнении запроса к VK API: {e}")
                 logger.error(f"Трассировка: {tb}")
                 return {}
+    
+    async def _process_response(self, response, method, params):
+        """Обрабатывает ответ от API VK."""
+        if response.status != 200:
+            logger.error(f"Ошибка при запросе к VK API: статус {response.status}")
+            try:
+                error_text = await response.text()
+                logger.error(f"Текст ошибки: {error_text}")
+            except:
+                pass
+            return {}
+        
+        try:
+            result = await response.json()
+        except Exception as e:
+            logger.error(f"Ошибка при декодировании JSON ответа: {e}")
+            return {}
+        
+        # Проверяем ошибки VK API
+        if "error" in result:
+            error = result["error"]
+            logger.error(f"Ошибка VK API: {error.get('error_code')} - {error.get('error_msg')}")
+            
+            # Если токен недействителен или истек
+            if error.get("error_code") in [5, 27]:
+                logger.error("Токен недействителен или истек")
+                return {}
+            
+            # Если превышен лимит запросов
+            if error.get("error_code") == 29:
+                logger.warning("Превышен лимит запросов к VK API")
+                await asyncio.sleep(1)  # Увеличиваем задержку при превышении лимита
+                return await self._make_request(method, params)  # Повторяем запрос
+            
+            return {}
+        
+        self.requests_count += 1
+        if self.account_id and self.api_key:
+            update_account_usage(self.api_key, self.account_id, "vk")
+        
+        return result
 
     async def _make_group_request(self, method: str, params: Dict) -> Dict:
         """Выполняет запрос к группе с дополнительной задержкой."""
@@ -790,3 +867,71 @@ async def get_vk_posts(vk, group_keywords, search_keywords=None, count=10, min_v
         
     group_ids = [g['id'] for g in groups]
     return await get_vk_posts_in_groups(vk, group_ids, search_keywords, count, min_views, days_back, max_posts_per_group)
+
+# Функция для обработки вложений VK
+async def get_media_info(attachment):
+    """
+    Обрабатывает вложение VK и возвращает информацию о медиа.
+    
+    Args:
+        attachment (dict): Вложение VK
+        
+    Returns:
+        dict: Информация о медиа или None, если не удалось обработать
+    """
+    try:
+        attachment_type = attachment.get("type")
+        if not attachment_type:
+            return None
+            
+        result = {
+            "type": attachment_type,
+            "url": None,
+            "width": None,
+            "height": None
+        }
+        
+        if attachment_type == "photo":
+            photo = attachment["photo"]
+            sizes = photo.get("sizes", [])
+            if sizes:
+                # Находим максимальный размер
+                largest = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
+                result["url"] = largest.get("url")
+                result["width"] = largest.get("width")
+                result["height"] = largest.get("height")
+                
+        elif attachment_type == "video":
+            video = attachment["video"]
+            result["url"] = f"https://vk.com/video{video.get('owner_id')}_{video.get('id')}"
+            result["width"] = video.get("width")
+            result["height"] = video.get("height")
+            if "image" in video and isinstance(video["image"], list) and video["image"]:
+                # Находим максимальную картинку превью
+                largest_image = max(video["image"], key=lambda i: i.get("width", 0) * i.get("height", 0))
+                result["preview_url"] = largest_image.get("url")
+                
+        elif attachment_type == "doc":
+            doc = attachment["doc"]
+            result["url"] = doc.get("url")
+            result["title"] = doc.get("title")
+            result["size"] = doc.get("size")
+            
+        elif attachment_type == "link":
+            link = attachment["link"]
+            result["url"] = link.get("url")
+            result["title"] = link.get("title")
+            if "photo" in link:
+                sizes = link["photo"].get("sizes", [])
+                if sizes:
+                    largest = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
+                    result["preview_url"] = largest.get("url")
+        
+        # Если не удалось получить URL, возвращаем None
+        if not result["url"]:
+            return None
+            
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка при обработке вложения VK: {e}")
+        return None

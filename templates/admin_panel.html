@@ -11,15 +11,15 @@
         /* Принудительные стили для исправления ширины карточки */
         .users-grid {
             display: block !important;
-            width: 90% !important;
-            max-width: 800px !important;
+            width: 100% !important;
+            max-width: 1200px !important;
             margin: 20px auto !important;
             padding: 0 !important;
         }
         
         .user-card {
             width: 100% !important;
-            max-width: 800px !important;
+            max-width: 100% !important;
             min-width: auto !important;
             background-color: var(--card-bg-color) !important;
             border: 1px solid var(--border-color) !important;
@@ -86,6 +86,9 @@
             <div class="actions">
                 <button onclick="displayAccountsStats()" class="refresh-stats-btn">
                     <i class="fas fa-sync-alt"></i> Обновить статистику
+                </button>
+                <button onclick="resetAccountsStats()" class="reset-stats-btn">
+                    <i class="fas fa-undo"></i> Сбросить статистику
                 </button>
             </div>
             <div id="accountsStatsContainer">

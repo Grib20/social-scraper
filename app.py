@@ -16,8 +16,30 @@ from datetime import datetime
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 import time
+import redis
+import sqlite3
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 load_dotenv()  # Загружаем .env до импорта модулей
+
+# Настройка логирования
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Настройка подключения к Redis, если доступно
+try:
+    redis_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(redis_url) if redis_url else None
+    if redis_client:
+        redis_client.ping()
+        logger.info("Подключение к Redis успешно установлено")
+    else:
+        logger.warning("Redis не настроен, кэширование будет работать только локально")
+except Exception as e:
+    redis_client = None
+    logger.warning(f"Ошибка подключения к Redis: {e}. Кэширование будет работать только локально")
 
 # Определяем api_key_header
 api_key_header = APIKeyHeader(name="X-Admin-Key")
@@ -51,9 +73,7 @@ from admin_panel import (
     get_account_status,
     get_telegram_account as admin_get_telegram_account, get_vk_account as admin_get_vk_account
 )
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from account_manager import initialize_stats_manager, stats_manager
 
 # Telegram клиенты для каждого аккаунта
 telegram_clients = {}
@@ -96,35 +116,35 @@ class ClientPool:
         """Выбирает следующего клиента для использования на основе стратегии ротации."""
         if not active_accounts:
             return None, None
-        
+            
         # Сортируем аккаунты по количеству использований и времени последнего использования
         sorted_accounts = sorted(
             active_accounts, 
             key=lambda acc: (self.usage_counts.get(acc['id'], 0), self.last_used.get(acc['id'], 0))
         )
-        
+            
         # Пробуем каждый аккаунт по очереди, пока не найдем работающий
         for selected_account in sorted_accounts:
             account_id = selected_account['id']
-            
+                
             # Получаем или создаем клиента
             client = self.get_client(account_id)
             if not client:
                 client = self.create_client(selected_account)
-                
+                    
                 # Если не удалось создать клиента, пробуем следующий аккаунт
                 if not client:
                     logger.error(f"Не удалось создать клиента для аккаунта {account_id}")
                     continue
-                    
+                        
                 self.add_client(account_id, client)
-            
+                
             # Увеличиваем счетчик использования и обновляем время
             self.usage_counts[account_id] = self.usage_counts.get(account_id, 0) + 1
             self.last_used[account_id] = time.time()
-            
+                
             return client, account_id
-        
+            
         # Если ни один аккаунт не подошел
         logger.error("Не найден подходящий аккаунт")
         return None, None
@@ -136,77 +156,53 @@ class ClientPool:
 
 class VKClientPool(ClientPool):
     """Пул клиентов VK."""
+    def __init__(self):
+        super().__init__()
     
     def create_client(self, account):
         """Создает нового клиента VK."""
         from vk_utils import VKClient
-        
-        account_id = account.get('id', 'неизвестный')
         token = account.get('token')
-        user_api_key = account.get('user_api_key')
+        proxy = account.get('proxy')
+        api_key = account.get('api_key')
+        account_id = account.get('id')
         
-        logger.info(f"Создание VK клиента для аккаунта {account_id}")
-        
+        # Проверяем наличие токена
         if not token:
-            logger.error(f"Токен VK отсутствует для аккаунта {account_id}")
+            logger.error(f"Невозможно создать клиент VK для аккаунта {account_id}: токен отсутствует")
             return None
             
-        if not isinstance(token, str):
-            logger.error(f"Токен VK не является строкой для аккаунта {account_id}")
-            return None
+        # Логируем информацию о прокси
+        from vk_utils import sanitize_proxy_for_logs
+        proxy_info = sanitize_proxy_for_logs(proxy) if proxy else "без прокси"
+        logger.info(f"Создание VK клиента для аккаунта {account_id} с прокси {proxy_info}")
         
-        # Проверяем валидность токена VK
-        if not token.startswith('vk1.a.'):
-            logger.error(f"Токен VK имеет неверный формат для аккаунта {account_id}")
-            return None
-        
-        # Создаем клиент только если токен валидный
-        try:
-            client = VKClient(token, account.get('proxy'), account_id, user_api_key)
-            logger.info(f"VK клиент успешно создан для аккаунта {account_id}")
-            return client
-        except Exception as e:
-            logger.error(f"Ошибка при создании клиента VK: {str(e)}")
-            return None
+        client = VKClient(token, proxy, account_id, api_key)
+        return client
     
     def get_active_clients(self, api_key):
         """Получает активные клиенты VK на основе активных аккаунтов."""
         from user_manager import get_active_accounts
-        logger.info(f"Получение активных аккаунтов VK для API ключа {api_key}")
+        from vk_utils import sanitize_proxy_for_logs
+        
         active_accounts = get_active_accounts(api_key, "vk")
+        logger.info(f"Получено {len(active_accounts) if active_accounts else 0} активных VK аккаунтов")
         
-        if not active_accounts:
-            logger.error(f"Нет активных VK аккаунтов для пользователя с API ключом {api_key}")
-            return []
+        # Логируем информацию о каждом аккаунте
+        for idx, account in enumerate(active_accounts):
+            token_info = f"Токен {'присутствует' if account.get('token') else 'отсутствует'}"
+            proxy_info = sanitize_proxy_for_logs(account.get('proxy')) if account.get('proxy') else "без прокси"
+            logger.info(f"VK аккаунт {idx+1}: ID={account.get('id')}, {token_info}, прокси={proxy_info}")
         
-        logger.info(f"Получено {len(active_accounts)} активных аккаунтов VK")
-        
-        # Проверяем валидность полученных аккаунтов
-        valid_accounts = []
+        # Проверяем, все ли активные аккаунты имеют клиентов
         for account in active_accounts:
-            account_id = account.get('id', 'неизвестный')
-            if not account.get('token'):
-                logger.error(f"Аккаунт {account_id} не имеет токена")
-                continue
-                
-            token_start = account.get('token', '')[:10] + '...' if account.get('token') else 'None'
-            logger.info(f"Проверка аккаунта {account_id} с токеном {token_start}")
-                
-            # Сразу попробуем создать клиента для проверки валидности токена
-            client = self.create_client(account)
-            if client:
-                logger.info(f"Клиент для аккаунта {account_id} успешно создан")
-                self.add_client(account['id'], client)  # Добавляем клиента в пул
-                valid_accounts.append(account)  # Добавляем аккаунт в список валидных
-            else:
-                logger.error(f"Не удалось создать клиента для аккаунта {account_id} - токен невалидный")
+            if account['id'] not in self.clients:
+                client = self.create_client(account)
+                if client:
+                    self.add_client(account['id'], client)
+                    logger.info(f"Создан новый клиент VK для аккаунта {account['id']}")
         
-        if not valid_accounts:
-            logger.error(f"Нет валидных VK аккаунтов для пользователя с API ключом {api_key}")
-            return []
-        
-        logger.info(f"После валидации осталось {len(valid_accounts)} аккаунтов VK")
-        return valid_accounts
+        return active_accounts
 
 
 class TelegramClientPool(ClientPool):
@@ -276,6 +272,13 @@ class TelegramClientPool(ClientPool):
 vk_pool = VKClientPool()
 telegram_pool = TelegramClientPool()
 
+# Импорты для работы с Redis
+from redis_utils import (
+    update_account_usage_redis,
+    get_account_stats_redis,
+    reset_all_account_stats,
+    sync_all_accounts_stats
+)
 
 # Обновляем функцию auth_middleware
 async def auth_middleware(request: Request, platform: str):
@@ -315,7 +318,8 @@ async def auth_middleware(request: Request, platform: str):
             raise HTTPException(429, "Не удалось инициализировать клиент VK. Проверьте валидность токена в личном кабинете.")
         
         logger.info(f"Используется VK аккаунт {account_id}")
-        update_account_usage(api_key, account_id, "vk")
+        # Используем Redis для обновления статистики
+        update_account_usage_redis(api_key, account_id, "vk")
         return client
     
     elif platform == 'telegram':
@@ -325,7 +329,8 @@ async def auth_middleware(request: Request, platform: str):
             raise HTTPException(429, "Не удалось инициализировать клиент Telegram. Добавьте аккаунт Telegram в личном кабинете.")
         
         logger.info(f"Используется Telegram аккаунт {account_id}")
-        update_account_usage(api_key, account_id, "telegram")
+        # Используем Redis для обновления статистики
+        update_account_usage_redis(api_key, account_id, "telegram")
         return client
     
     else:
@@ -334,9 +339,43 @@ async def auth_middleware(request: Request, platform: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_scheduler()
+    # Инициализируем менеджера статистики аккаунтов
+    account_stats_manager = initialize_stats_manager(vk_pool, telegram_pool)
+    await account_stats_manager.start()
+    logger.info("Менеджер статистики аккаунтов запущен")
+    
+    # Инициализируем S3 клиент для обработки медиа
+    init_scheduler()
+    
+    # Планируем периодическую синхронизацию статистики Redis с SQLite
+    stats_sync_scheduler = AsyncIOScheduler()
+    stats_sync_scheduler.add_job(
+        sync_all_accounts_stats,
+        IntervalTrigger(minutes=15),  # Синхронизация каждые 15 минут
+        id='redis_stats_sync'
+    )
+    stats_sync_scheduler.start()
+    logger.info("Запланирована периодическая синхронизация статистики Redis с SQLite")
+    
     yield
-    await close_scheduler()
+    
+    # Останавливаем планировщик синхронизации
+    stats_sync_scheduler.shutdown()
+    logger.info("Планировщик синхронизации статистики остановлен")
+    
+    # Проводим финальную синхронизацию статистики
+    sync_all_accounts_stats()
+    logger.info("Выполнена финальная синхронизация статистики Redis с SQLite")
+    
+    # Останавливаем менеджера статистики
+    await account_stats_manager.stop()
+    logger.info("Менеджер статистики аккаунтов остановлен")
+    
+    # Отключаем все клиенты Telegram
+    await telegram_pool.disconnect_all()
+    
+    # Закрываем планировщик
+    close_scheduler()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -816,9 +855,16 @@ async def trending_posts(request: Request, data: dict):
     posts_per_group = data.get('posts_per_group', 10)
     min_views = data.get('min_views')
 
+    # Получаем API ключ из заголовка для передачи в функцию get_trending_posts
+    api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
+    if not api_key:
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            api_key = auth_header.split(' ')[1]
+
     if platform == 'telegram':
         client = await auth_middleware(request, 'telegram')
-        return await get_trending_posts(client, group_ids, days_back, posts_per_group, min_views)
+        return await get_trending_posts(client, group_ids, days_back, posts_per_group, min_views, api_key=api_key)
     elif platform == 'vk':
         vk = await auth_middleware(request, 'vk')
         return await get_vk_posts_in_groups(vk, group_ids, count=posts_per_group * len(group_ids), min_views=min_views, days_back=days_back)
@@ -941,14 +987,25 @@ async def get_posts_by_period(request: Request, data: dict):
     days_back = data.get('days_back', 7)
     min_views = data.get('min_views', 0)
 
+    api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
+    if not api_key:
+        # Пробуем получить из авторизации Bearer
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            api_key = auth_header.split(' ')[1]
+        else:
+            raise HTTPException(401, "API ключ обязателен")
+
     if platform == 'telegram':
         client = await auth_middleware(request, 'telegram')
         from telegram_utils import get_posts_by_period as get_telegram_posts_by_period
         return await get_telegram_posts_by_period(client, group_ids, max_posts, days_back, min_views)
     elif platform == 'vk':
         vk = await auth_middleware(request, 'vk')
-        from vk_utils import get_posts_by_period as get_vk_posts_by_period
-        return await get_vk_posts_by_period(vk, group_ids, max_posts, days_back, min_views)
+        # Устанавливаем API ключ для клиента VK
+        vk.api_key = api_key
+        # Вызываем метод get_posts_by_period у объекта VKClient
+        return await vk.get_posts_by_period(group_ids, max_posts, days_back, min_views)
     raise HTTPException(400, "Платформа не поддерживается")
 
 @app.get("/api/accounts/status")
@@ -1511,6 +1568,7 @@ async def check_telegram_account_status(request: Request, account_id: str):
     
     # Находим аккаунт по ID
     from user_manager import get_db_connection
+    from telegram_utils import create_telegram_client
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -1844,44 +1902,44 @@ async def check_vk_account_status(request: Request, account_id: str):
         
         # Используем асинхронный VKClient
         async with VKClient(token, account_dict.get("proxy")) as vk:
-            # Проверяем валидность токена, запрашивая информацию о пользователе
+        # Проверяем валидность токена, запрашивая информацию о пользователе
             result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
             
             if not result or "response" not in result or not result["response"]:
                 raise Exception("Ошибка при получении информации о пользователе")
             
             user_info = result["response"][0]
-            
-            # Если запрос выполнен успешно, токен действителен
-            status = "active"
-            logger.info(f"Токен VK действителен, пользователь: {user_info}")
-            
-            # Обновляем статус и информацию о пользователе в базе данных
-            cursor.execute('''
-                UPDATE vk_accounts
-                SET status = ?, 
-                    user_id = ?, 
-                    user_name = ?,
-                    error_message = NULL,
-                    error_code = NULL,
-                    last_checked_at = ?
-                WHERE id = ?
-            ''', (
-                status, 
-                user_info.get('id'), 
-                f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip(),
-                last_checked_at,
-                account_id
-            ))
-            conn.commit()
-            logger.info(f"Статус аккаунта обновлен на '{status}'")
-            
-            conn.close()
-            return {
-                "account_id": account_id,
-                "status": status,
-                "user_info": user_info
-            }
+        
+        # Если запрос выполнен успешно, токен действителен
+        status = "active"
+        logger.info(f"Токен VK действителен, пользователь: {user_info}")
+        
+        # Обновляем статус и информацию о пользователе в базе данных
+        cursor.execute('''
+            UPDATE vk_accounts
+            SET status = ?, 
+                user_id = ?, 
+                user_name = ?,
+                error_message = NULL,
+                error_code = NULL,
+                last_checked_at = ?
+            WHERE id = ?
+        ''', (
+            status, 
+            user_info.get('id'), 
+            f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip(),
+            last_checked_at,
+            account_id
+        ))
+        conn.commit()
+        logger.info(f"Статус аккаунта обновлен на '{status}'")
+        
+        conn.close()
+        return {
+            "account_id": account_id,
+            "status": status,
+            "user_info": user_info
+        }
     except Exception as e:
         logger.error(f"Ошибка при проверке токена VK: {str(e)}")
         
@@ -1943,94 +2001,86 @@ async def shutdown_event():
 
 # Добавим эндпоинт для получения расширенной статистики аккаунтов
 @app.get("/api/admin/accounts/stats")
-async def get_accounts_stats(request: Request):
-    """Получение статистики аккаунтов для отображения в интерфейсе."""
-    # Получаем API ключ из заголовка X-API-KEY
-    api_key = request.headers.get('x-api-key')
-    
-    # Если ключа нет, проверяем авторизацию
-    if not api_key:
-        auth_header = request.headers.get('authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            raise HTTPException(status_code=401, detail="API ключ обязателен")
-        api_key = auth_header.split(' ')[1]
-    
+async def admin_accounts_stats(request: Request):
+    """Получает статистику использования аккаунтов."""
     # Проверяем админ-ключ
-    if not await verify_admin_key(api_key):
-        raise HTTPException(status_code=401, detail="Неверный админ-ключ")
+    admin_key = request.headers.get("X-Admin-Key") or request.headers.get("X-API-KEY")
+    if not admin_key:
+        admin_key = request.cookies.get("admin_key")
     
-    from user_manager import get_db_connection
-    conn = get_db_connection()
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    
+    # Используем SQLite для получения основной информации об аккаунтах
+    conn = sqlite3.connect('users.db')
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Получаем данные по VK аккаунтам
+    # Получаем все аккаунты VK
     cursor.execute('''
         SELECT 
             id, 
             user_api_key, 
-            token,
+            token, 
+            proxy, 
             status, 
-            proxy,
-            requests_count,
-            last_request_time,
-            added_at,
-            user_name
+            is_active, 
+            request_limit,
+            user_id,
+            user_name,
+            error_message
         FROM vk_accounts
     ''')
-    vk_accounts_data = cursor.fetchall()
+    vk_accounts = [dict(row) for row in cursor.fetchall()]
     
-    # Получаем данные по Telegram аккаунтам
+    # Получаем все аккаунты Telegram
     cursor.execute('''
         SELECT 
             id, 
             user_api_key, 
             phone, 
+            proxy, 
             status, 
+            is_active, 
+            request_limit,
             api_id,
-            api_hash,
-            proxy,
-            requests_count,
-            last_request_time,
-            added_at
+            api_hash
         FROM telegram_accounts
     ''')
-    telegram_accounts_data = cursor.fetchall()
+    telegram_accounts = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
     
-    # Форматируем данные для VK
-    vk_accounts = []
-    for account in vk_accounts_data:
-        vk_accounts.append({
-            "id": account[0],
-            "user_api_key": account[1],
-            "login": account[8] or "Неизвестно",  # Используем user_name как логин
-            "status": account[3],
-            "proxy": account[4],
-            "requests_made": account[5] or 0,
-            "request_limit": 1000,  # Устанавливаем стандартный лимит
-            "last_used": account[6],
-            "active": account[3] == 'active'  # Используем статус для определения активности
-        })
+    # Дополняем данные статистикой из Redis
+    for account in vk_accounts:
+        account['login'] = account.get('user_name', 'Нет данных')
+        account['active'] = account.get('is_active', 1) == 1
+        
+        # Получаем актуальную статистику из Redis
+        redis_stats = get_account_stats_redis(account['id'], 'vk')
+        if redis_stats:
+            account['requests_count'] = redis_stats.get('requests_count', 0)
+            account['last_used'] = redis_stats.get('last_used')
+        else:
+            account['requests_count'] = 0
+            account['last_used'] = None
     
-    # Форматируем данные для Telegram
-    telegram_accounts = []
-    for account in telegram_accounts_data:
-        telegram_accounts.append({
-            "id": account[0],
-            "user_api_key": account[1],
-            "phone": account[2],
-            "status": account[3],
-            "api_id": account[4],
-            "api_hash": account[5],
-            "proxy": account[6],
-            "requests_made": account[7] or 0,
-            "request_limit": 1000,  # Устанавливаем стандартный лимит
-            "last_used": account[8],
-            "active": account[3] == 'active'  # Используем статус для определения активности
-        })
+    # Для каждого Telegram аккаунта добавляем логин и проверяем активность
+    for account in telegram_accounts:
+        account['login'] = account.get('phone', 'Нет данных')
+        account['active'] = account.get('is_active', 1) == 1
+        
+        # Получаем актуальную статистику из Redis
+        redis_stats = get_account_stats_redis(account['id'], 'telegram')
+        if redis_stats:
+            account['requests_count'] = redis_stats.get('requests_count', 0)
+            account['last_used'] = redis_stats.get('last_used')
+        else:
+            account['requests_count'] = 0
+            account['last_used'] = None
     
     return {
+        "timestamp": time.time(),
         "vk": vk_accounts,
         "telegram": telegram_accounts
     }
@@ -2096,11 +2146,18 @@ async def toggle_account_status(request: Request, data: dict):
         # Обновляем статус в пуле клиентов
         if platform.lower() == 'vk':
             # Найдем клиент в пуле и обновим его
-            for user_key, clients in vk_pool.clients.items():
-                for i, client in enumerate(clients):
-                    if str(client.id) == str(account_id):
-                        client.is_active = active
-                        break
+            try:
+                # В VKPool нет структуры clients с вложенным словарем, как в TelegramPool
+                # Поэтому обрабатываем его по-другому
+                if hasattr(vk_pool, 'clients') and isinstance(vk_pool.clients, dict):
+                    if account_id in vk_pool.clients:
+                        # Если клиент есть в словаре, обновляем его статус
+                        client = vk_pool.clients.get(account_id)
+                        if hasattr(client, 'is_active'):
+                            client.is_active = active
+                # Также можно обновить статус в других структурах vk_pool, если они есть
+            except Exception as e:
+                logger.warning(f"Не удалось обновить статус клиента VK в пуле: {e}")
         elif platform.lower() == 'telegram':
             # Для Telegram также обновим статус в пуле
             for user_key, clients in telegram_pool.clients.items():
@@ -2518,6 +2575,210 @@ async def bulk_posts(request: Request, data: dict):
         logger.error(f"Ошибка при получении постов по нескольким ключевым словам: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(500, f"Ошибка при получении постов по нескольким ключевым словам: {str(e)}")
+
+@app.post("/api/admin/check-proxy")
+async def check_proxy(request: Request):
+    """Проверяет валидность прокси для указанного аккаунта."""
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Неверный admin ключ")
+    
+    data = await request.json()
+    platform = data.get("platform")
+    account_id = data.get("account_id")
+    
+    if not platform or not account_id:
+        raise HTTPException(status_code=400, detail="Требуются platform и account_id")
+    
+    try:
+        if platform == "telegram":
+            # Получаем данные аккаунта Telegram
+            account = await db.accounts.find_one({"_id": ObjectId(account_id), "platform": "telegram"})
+            if not account:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            
+            # Проверяем наличие прокси
+            proxy = account.get("proxy")
+            if not proxy:
+                return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
+            
+            # Валидируем прокси
+            from telegram_utils import validate_proxy
+            is_valid, proxy_type = validate_proxy(proxy)
+            
+            if not is_valid:
+                return {"valid": False, "message": "Неверный формат прокси"}
+            
+            # Попытка подключения с прокси
+            try:
+                from telegram_utils import create_telegram_client
+                client = await create_telegram_client(
+                    session_name=f"check_proxy_{account['_id']}",
+                    api_id=int(account['api_id']),
+                    api_hash=account['api_hash'],
+                    proxy=proxy
+                )
+                
+                # Пробуем подключиться
+                await client.connect()
+                if await client.is_connected():
+                    await client.disconnect()
+                    return {"valid": True, "message": f"Успешное подключение через {proxy_type} прокси"}
+                else:
+                    return {"valid": False, "message": "Не удалось подключиться через прокси"}
+            except Exception as e:
+                return {"valid": False, "message": f"Ошибка подключения: {str(e)}"}
+                
+        elif platform == "vk":
+            # Получаем данные аккаунта VK
+            account = await db.accounts.find_one({"_id": ObjectId(account_id), "platform": "vk"})
+            if not account:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            
+            # Проверяем наличие прокси
+            proxy = account.get("proxy")
+            if not proxy:
+                return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
+            
+            # Валидируем прокси
+            from vk_utils import validate_proxy
+            is_valid = validate_proxy(proxy)
+            
+            if not is_valid:
+                return {"valid": False, "message": "Неверный формат прокси"}
+            
+            # Попытка отправить запрос через прокси
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("https://api.vk.com/method/users.get", params={"v": "5.131"}, proxy=proxy, timeout=10) as response:
+                        if response.status == 200:
+                            return {"valid": True, "message": "Успешное подключение к VK API через прокси"}
+                        else:
+                            return {"valid": False, "message": f"Ошибка запроса: HTTP {response.status}"}
+            except Exception as e:
+                return {"valid": False, "message": f"Ошибка подключения: {str(e)}"}
+        else:
+            raise HTTPException(status_code=400, detail="Неизвестная платформа")
+    except Exception as e:
+        logger.error(f"Ошибка при проверке прокси: {e}")
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
+
+@app.post("/api/admin/update-proxy")
+async def update_proxy(request: Request):
+    """Обновляет прокси для указанного аккаунта."""
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Неверный admin ключ")
+    
+    data = await request.json()
+    platform = data.get("platform")
+    account_id = data.get("account_id")
+    user_id = data.get("user_id")
+    proxy = data.get("proxy")
+    
+    if not platform or not account_id or not user_id:
+        raise HTTPException(status_code=400, detail="Требуются platform, account_id и user_id")
+    
+    try:
+        # Если proxy = null, удаляем прокси
+        if proxy is None:
+            # Обновление в БД - удаление прокси
+            result = await db.accounts.update_one(
+                {"_id": ObjectId(account_id), "platform": platform},
+                {"$unset": {"proxy": ""}}
+            )
+            
+            if result.modified_count == 0:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден или прокси уже отсутствует")
+                
+            return {"success": True, "message": "Прокси успешно удален"}
+        
+        # Проверка валидности прокси перед сохранением
+        if platform == "telegram":
+            from telegram_utils import validate_proxy
+            is_valid, _ = validate_proxy(proxy)
+        elif platform == "vk":
+            from vk_utils import validate_proxy
+            is_valid = validate_proxy(proxy)
+        else:
+            raise HTTPException(status_code=400, detail="Неизвестная платформа")
+            
+        if not is_valid:
+            raise HTTPException(status_code=400, detail="Неверный формат прокси")
+        
+        # Обновление в БД
+        result = await db.accounts.update_one(
+            {"_id": ObjectId(account_id), "platform": platform},
+            {"$set": {"proxy": proxy}}
+        )
+        
+        if result.modified_count == 0:
+            # Проверим, существует ли аккаунт
+            account = await db.accounts.find_one({"_id": ObjectId(account_id)})
+            if not account:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            else:
+                return {"success": True, "message": "Прокси не изменился"}
+                
+        return {"success": True, "message": "Прокси успешно обновлен"}
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении прокси: {e}")
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
+
+# Добавляем эндпоинт для ручного сброса и проверки статистики аккаунтов (только для админов)
+@app.post("/admin/accounts/reset-stats")
+async def reset_accounts_stats(request: Request):
+    """Ручной сброс статистики и режима пониженной производительности для всех аккаунтов."""
+    # Проверяем админ-ключ
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Неверный admin ключ")
+    
+    try:
+        reset_counts = 0
+        reset_degraded = 0
+        
+        # Сбрасываем статистику для VK аккаунтов в памяти
+        if vk_pool:
+            for account_id in list(vk_pool.usage_counts.keys()):
+                if vk_pool.usage_counts.get(account_id, 0) > 0:
+                    vk_pool.usage_counts[account_id] = 0
+                    reset_counts += 1
+                
+                client = vk_pool.get_client(account_id)
+                if client and hasattr(client, 'set_degraded_mode'):
+                    client.set_degraded_mode(False)
+                    reset_degraded += 1
+        
+        # Сбрасываем статистику для Telegram аккаунтов в памяти
+        if telegram_pool:
+            for account_id in list(telegram_pool.usage_counts.keys()):
+                if telegram_pool.usage_counts.get(account_id, 0) > 0:
+                    telegram_pool.usage_counts[account_id] = 0
+                    reset_counts += 1
+                
+                client = telegram_pool.get_client(account_id)
+                if client and hasattr(client, 'set_degraded_mode'):
+                    client.set_degraded_mode(False)
+                    reset_degraded += 1
+        
+        # Сбрасываем статистику в Redis и синхронизируем с базой данных
+        reset_all_account_stats()
+        
+        # Логируем результаты
+        logger.info(f"Сброшена статистика для всех аккаунтов")
+        logger.info(f"Отключен режим пониженной производительности для {reset_degraded} аккаунтов")
+        
+        return {
+            "status": "success",
+            "reset_count": reset_counts,
+            "reset_degraded": reset_degraded,
+            "message": f"Сброшена статистика для всех аккаунтов, отключен режим пониженной производительности для {reset_degraded} аккаунтов"
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при сбросе статистики аккаунтов: {e}")
+        raise HTTPException(500, f"Ошибка при сбросе статистики: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))

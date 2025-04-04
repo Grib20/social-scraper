@@ -28,7 +28,9 @@ cipher = Fernet(ENCRYPTION_KEY)
 
 def get_db_connection():
     """Получает соединение с базой данных."""
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect('users.db', timeout=30.0)
+    conn.execute('PRAGMA journal_mode = WAL')  # Используем WAL для лучшей производительности
+    conn.execute('PRAGMA busy_timeout = 30000')  # Устанавливаем таймаут ожидания 30 секунд
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -439,13 +441,15 @@ def update_account_usage(api_key: str, account_id: str, platform: str, token_exp
     
     table = 'telegram_accounts' if platform == 'telegram' else 'vk_accounts'
     status_update = ", status = 'inactive'" if token_expired else ""
+    current_time = datetime.now().isoformat()
     
     cursor.execute(f'''
     UPDATE {table} 
     SET requests_count = requests_count + 1, 
-        last_request_time = ?{status_update}
+        last_request_time = ?,
+        last_used = ?{status_update}
     WHERE id = ? AND user_api_key = ?
-    ''', (time.time(), account_id, api_key))
+    ''', (time.time(), current_time, account_id, api_key))
     
     updated = cursor.rowcount > 0
     conn.commit()

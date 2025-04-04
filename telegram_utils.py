@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from telethon import TelegramClient, functions, types
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 import logging
@@ -13,9 +14,10 @@ from telethon.tl.types import InputPeerChannel
 from telethon.tl.functions.messages import SearchGlobalRequest
 from telethon.tl.types import Channel, User
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Callable, Any, Union
+from typing import List, Dict, Optional, Callable, Any, Union, Tuple
 from user_manager import get_active_accounts, update_account_usage
 from telethon.tl.functions import TLRequest
+import sqlite3
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +31,61 @@ channel_members_cache = {}
 # Константа для режима пониженной производительности
 DEGRADED_MODE_DELAY = 0.5  # Увеличенная задержка между запросами
 
+def validate_proxy(proxy: Optional[str]) -> Tuple[bool, str]:
+    """
+    Валидирует строку прокси и возвращает статус валидации и тип прокси.
+    
+    Args:
+        proxy: Строка с прокси в формате scheme://host:port или scheme://user:password@host:port
+        
+    Returns:
+        Tuple[bool, str]: (валиден ли прокси, тип прокси)
+    """
+    if not proxy:
+        return False, "none"
+    
+    # Определяем тип прокси по схеме
+    if proxy.startswith('socks5://'):
+        proxy_type = 'socks5'
+    elif proxy.startswith('socks4://'):
+        proxy_type = 'socks4'
+    elif proxy.startswith('http://'):
+        proxy_type = 'http'
+    elif proxy.startswith('https://'):
+        proxy_type = 'https'
+    else:
+        # Если схема не указана, по умолчанию считаем http
+        proxy_type = 'http'
+        proxy = f'http://{proxy}'
+    
+    # Проверяем формат proxy:port или proxy:port@login:password
+    proxy_pattern = r'^(https?://|socks[45]://)(([^:@]+)(:[^@]+)?@)?([^:@]+)(:(\d+))$'
+    return bool(re.match(proxy_pattern, proxy)), proxy_type
+
+def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
+    """
+    Подготавливает строку прокси для логирования (скрывая чувствительные данные).
+    
+    Args:
+        proxy: Строка с прокси
+        
+    Returns:
+        str: Безопасная для логирования версия строки прокси
+    """
+    if not proxy:
+        return "None"
+    
+    # Если в прокси есть логин/пароль, то скрываем их
+    if '@' in proxy:
+        scheme = proxy.split('://')[0] if '://' in proxy else 'http'
+        rest = proxy.split('://')[1] if '://' in proxy else proxy
+        
+        parts = rest.split('@')
+        host_part = parts[1]
+        # Возвращаем только схему и хост:порт, скрывая данные авторизации
+        return f"{scheme}://***@{host_part}"
+    return proxy
+
 class TelegramClientWrapper:
     def __init__(self, client: TelegramClient, account_id: str, api_key: Optional[str] = None):
         self.client = client
@@ -38,6 +95,18 @@ class TelegramClientWrapper:
         self.last_group_request_time = 0
         self.requests_count = 0
         self.degraded_mode = False
+        
+        # Получаем информацию о прокси, если он установлен
+        proxy_dict = getattr(client.session, 'proxy', None)
+        self.has_proxy = proxy_dict is not None
+        if self.has_proxy:
+            self.proxy_type = proxy_dict.get('proxy_type', 'unknown')
+            host = proxy_dict.get('addr', 'unknown')
+            port = proxy_dict.get('port', 'unknown')
+            self.proxy_str = f"{self.proxy_type}://{host}:{port}"
+            logger.info(f"Клиент {account_id} использует прокси: {sanitize_proxy_for_logs(self.proxy_str)}")
+        else:
+            logger.info(f"Клиент {account_id} работает без прокси")
 
     def set_degraded_mode(self, degraded: bool):
         """Устанавливает режим пониженной производительности."""
@@ -69,20 +138,73 @@ class TelegramClientWrapper:
         self.requests_count += 1
         if self.api_key:
             try:
-                update_account_usage(self.api_key, self.account_id, "telegram")
+                # Используем Redis для обновления статистики аккаунтов
+                try:
+                    from redis_utils import update_account_usage_redis
+                    update_account_usage_redis(self.api_key, self.account_id, "telegram")
+                except ImportError:
+                    # Если Redis не доступен, используем обычное обновление
+                    update_account_usage(self.api_key, self.account_id, "telegram")
             except Exception as e:
                 logger.error(f"Ошибка при обновлении статистики использования: {e}")
         
-        # Проверяем, передан ли тип запроса (Request) или функция/метод
-        if isinstance(func_or_req_type, type) and issubclass(func_or_req_type, TLRequest):
-             # Это тип Request, создаем объект запроса и вызываем его
-             request_obj = func_or_req_type(*args, **kwargs)
-             return await self.client(request_obj)
-        elif callable(func_or_req_type):
-             # Это вызываемая функция/метод клиента
-             return await func_or_req_type(*args, **kwargs)
+        # Логируем информацию о запросе с учетом прокси
+        proxy_info = f" через прокси {sanitize_proxy_for_logs(self.proxy_str)}" if self.has_proxy else " без прокси"
+        if isinstance(func_or_req_type, type):
+            logger.info(f"Отправка запроса Telegram {func_or_req_type.__name__}{proxy_info}")
         else:
-             raise TypeError(f"Unsupported type for _make_request: {type(func_or_req_type)}")
+            logger.info(f"Выполнение метода Telegram {func_or_req_type.__name__}{proxy_info}")
+        
+        # Максимальное количество попыток при ошибке "database is locked"
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Проверяем, передан ли тип запроса (Request) или функция/метод
+                if isinstance(func_or_req_type, type) and issubclass(func_or_req_type, TLRequest):
+                     # Это тип Request, создаем объект запроса и вызываем его
+                     request_obj = func_or_req_type(*args, **kwargs)
+                     return await self.client(request_obj)
+                elif callable(func_or_req_type):
+                     # Это вызываемая функция/метод клиента
+                     return await func_or_req_type(*args, **kwargs)
+                else:
+                     raise TypeError(f"Unsupported type for _make_request: {type(func_or_req_type)}")
+            except sqlite3.OperationalError as db_err:
+                # Обрабатываем ошибку блокировки базы данных
+                if "database is locked" in str(db_err):
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(f"База данных заблокирована при запросе {func_or_req_type.__name__}. Повторная попытка {retry_count}/{max_retries} через {retry_count} сек.")
+                        await asyncio.sleep(retry_count)  # Увеличиваем паузу с каждой попыткой
+                        continue
+                    else:
+                        logger.error(f"Превышено количество попыток при обработке ошибки блокировки БД: {db_err}")
+                        raise
+                else:
+                    # Другие ошибки SQLite
+                    logger.error(f"SQLite ошибка при запросе Telegram: {db_err}")
+                    raise
+            except Exception as e:
+                # Проверяем другие исключения на наличие сообщения о блокировке базы данных
+                if "database is locked" in str(e):
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(f"База данных заблокирована при запросе {func_or_req_type.__name__}. Повторная попытка {retry_count}/{max_retries} через {retry_count} сек.")
+                        await asyncio.sleep(retry_count)  # Увеличиваем паузу с каждой попыткой
+                        continue
+                    else:
+                        logger.error(f"Превышено количество попыток при обработке ошибки блокировки БД: {e}")
+                        raise
+                # Проверяем, связана ли ошибка с прокси по сообщению об ошибке
+                error_msg = str(e).lower()
+                if self.has_proxy and ("proxy" in error_msg or "socks" in error_msg or "connection" in error_msg):
+                    logger.error(f"Ошибка соединения с прокси {sanitize_proxy_for_logs(self.proxy_str)}: {e}")
+                    # Здесь можно добавить логику для переключения на резервный способ подключения
+                else:
+                    logger.error(f"Ошибка при выполнении запроса Telegram: {e}")
+                raise
 
     async def _make_group_request(self, func_or_req_type: Union[Callable[..., Any], type], *args, **kwargs):
         """Выполняет запрос к группе с дополнительной задержкой."""
@@ -96,16 +218,92 @@ class TelegramClientWrapper:
         self.requests_count += 1
         if self.api_key:
             try:
-                update_account_usage(self.api_key, self.account_id, "telegram")
+                # Используем Redis для обновления статистики аккаунтов
+                try:
+                    from redis_utils import update_account_usage_redis
+                    update_account_usage_redis(self.api_key, self.account_id, "telegram")
+                except ImportError:
+                    # Если Redis не доступен, используем обычное обновление
+                    update_account_usage(self.api_key, self.account_id, "telegram")
             except Exception as e:
                 logger.error(f"Ошибка при обновлении статистики использования: {e}")
         
-        actual_method = getattr(self.client, method.__name__)
-        return await actual_method(*args, **kwargs)
+        proxy_info = f" через прокси {sanitize_proxy_for_logs(self.proxy_str)}" if self.has_proxy else " без прокси"
+        logger.info(f"Выполнение высокоуровневого метода Telegram {method.__name__}{proxy_info}")
+        
+        # Максимальное количество попыток при ошибке "database is locked"
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                actual_method = getattr(self.client, method.__name__)
+                return await actual_method(*args, **kwargs)
+            except sqlite3.OperationalError as db_err:
+                # Обрабатываем ошибку блокировки базы данных
+                if "database is locked" in str(db_err):
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(f"База данных заблокирована при высокоуровневом запросе {method.__name__}. Повторная попытка {retry_count}/{max_retries} через {retry_count} сек.")
+                        await asyncio.sleep(retry_count)  # Увеличиваем паузу с каждой попыткой
+                        continue
+                    else:
+                        logger.error(f"Превышено количество попыток при обработке ошибки блокировки БД: {db_err}")
+                        raise
+                else:
+                    # Другие ошибки SQLite
+                    logger.error(f"SQLite ошибка при высокоуровневом запросе Telegram: {db_err}")
+                    raise
+            except Exception as e:
+                # Проверяем другие исключения на наличие сообщения о блокировке базы данных
+                if "database is locked" in str(e):
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(f"База данных заблокирована при высокоуровневом запросе {method.__name__}. Повторная попытка {retry_count}/{max_retries} через {retry_count} сек.")
+                        await asyncio.sleep(retry_count)  # Увеличиваем паузу с каждой попыткой
+                        continue
+                    else:
+                        logger.error(f"Превышено количество попыток при обработке ошибки блокировки БД: {e}")
+                        raise
+                # Проверяем, связана ли ошибка с прокси по сообщению об ошибке
+                error_msg = str(e).lower()
+                if self.has_proxy and ("proxy" in error_msg or "socks" in error_msg or "connection" in error_msg):
+                    logger.error(f"Ошибка соединения с прокси при высокоуровневом запросе: {e}")
+                else:
+                    logger.error(f"Ошибка при выполнении высокоуровневого запроса Telegram: {e}")
+                raise
 
 async def start_client(client: TelegramClient) -> None:
     """Запускает клиент Telegram."""
     try:
+        # Получаем информацию о прокси, если он установлен
+        proxy_dict = getattr(client.session, 'proxy', None)
+        proxy_info = ""
+        if proxy_dict:
+            proxy_type = proxy_dict.get('proxy_type', 'unknown')
+            host = proxy_dict.get('addr', 'unknown')
+            port = proxy_dict.get('port', 'unknown')
+            proxy_str = f"{proxy_type}://{host}:{port}"
+            proxy_info = f" с прокси {sanitize_proxy_for_logs(proxy_str)}"
+        
+        logger.info(f"Запуск клиента Telegram {client.session.filename}{proxy_info}")
+        try:
+            await client.connect()
+            logger.info(f"Клиент Telegram {client.session.filename} успешно подключен")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if proxy_dict and ("proxy" in error_msg or "socks" in error_msg or "connection" in error_msg):
+                logger.error(f"Ошибка соединения с прокси при запуске клиента {client.session.filename}: {e}")
+                
+                # Если возникла ошибка прокси, пробуем подключиться без прокси как запасной вариант
+                logger.warning(f"Пробуем запустить клиент {client.session.filename} без прокси после ошибки")
+                client._proxy = None
+                await client.connect()
+                logger.info(f"Клиент Telegram {client.session.filename} успешно подключен без прокси")
+            else:
+                logger.error(f"Ошибка при запуске клиента: {e}")
+                raise
+                
         await client.start()
         logger.info(f"Клиент Telegram {client.session.filename} успешно запущен")
     except Exception as e:
@@ -237,11 +435,24 @@ async def get_album_messages(client, chat, main_message):
 
 async def get_trending_posts(client: TelegramClient, channel_ids: List[int], days_back: int = 7, posts_per_channel: int = 10, 
                            min_views: Optional[int] = None, min_reactions: Optional[int] = None, 
-                           min_comments: Optional[int] = None, min_forwards: Optional[int] = None) -> List[Dict]:
-    """Получает трендовые посты из каналов."""
+                           min_comments: Optional[int] = None, min_forwards: Optional[int] = None, 
+                           api_key: Optional[str] = None) -> List[Dict]:
+    """Получает трендовые посты из каналов с параллельной обработкой медиа."""
     now = int(time.time())
     start_time = now - (days_back * 24 * 60 * 60)
     all_posts = []
+    
+    # Нормализуем API ключ здесь, перед использованием
+    if api_key and isinstance(api_key, (list, dict)):
+        if isinstance(api_key, dict) and 'user_api_key' in api_key:
+            user_api_key = api_key['user_api_key']
+        elif isinstance(api_key, list) and len(api_key) > 0 and isinstance(api_key[0], dict) and 'user_api_key' in api_key[0]:
+            user_api_key = api_key[0]['user_api_key']
+        else:
+            logger.warning(f"Не удалось извлечь API ключ из: {api_key}. Будет использован последовательный режим.")
+            user_api_key = None
+    else:
+        user_api_key = api_key
     
     if isinstance(channel_ids, list) and channel_ids and isinstance(channel_ids[0], list):
         flat_channel_ids = [item for sublist in channel_ids for item in sublist]
@@ -365,28 +576,63 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
                     else:
                         individual_posts.append(post)
                 
-                # Шаг 4: Обработка медиа для постов и альбомов
-                channel_posts = []
+                # Шаг 4: Подготавливаем медиа для параллельного скачивания
+                media_tasks = []
                 
-                # Обрабатываем индивидуальные посты
+                # Подготавливаем индивидуальные посты
                 for post in individual_posts:
-                    post['media'] = await get_media_info(client, post['_msg'])
-                    del post['_msg']
-                    del post['_grouped_id']
-                    channel_posts.append(post)
+                    media_tasks.append({
+                        '_msg': post['_msg'],
+                        '_album_messages': None,
+                        'post_id': post['post_id'],
+                        'post_ref': post  # ссылка на пост для обновления
+                    })
                 
-                # Обрабатываем альбомы
+                # Подготавливаем альбомы
                 for album_id, album_posts in albums.items():
                     album_posts.sort(key=lambda x: x['post_id'], reverse=True)
                     main_post = album_posts[0]
                     all_album_msgs = await get_album_messages(client, chat_entity, main_post['_msg'])
-                    main_post['media'] = await get_media_info(client, main_post['_msg'], album_messages=all_album_msgs)
-                    del main_post['_msg']
-                    del main_post['_grouped_id']
-                    channel_posts.append(main_post)
+                    
+                    media_tasks.append({
+                        '_msg': main_post['_msg'],
+                        '_album_messages': all_album_msgs,
+                        'post_id': main_post['post_id'],
+                        'post_ref': main_post  # ссылка на пост для обновления
+                    })
                 
-                all_posts.extend(channel_posts)
-                logger.info(f"Найдено {len(channel_posts)} постов в канале {channel_id}")
+                # Шаг 5: Параллельное скачивание медиа
+                if media_tasks:
+                    logger.info(f"Запуск параллельного скачивания {len(media_tasks)} медиа для канала {channel_id}")
+                    
+                    # Импортируем здесь, чтобы избежать циклических импортов
+                    from media_utils import download_media_parallel
+                    
+                    # Запускаем параллельное скачивание медиа
+                    media_results = await download_media_parallel(media_tasks, user_api_key, max_workers=5)
+                    
+                    # Сопоставляем результаты с постами
+                    for i, task in enumerate(media_tasks):
+                        post = task['post_ref']
+                        if i < len(media_results) and media_results[i]:
+                            post['media'] = media_results[i]
+                        else:
+                            post['media'] = None  # Если скачивание не удалось
+                        
+                        # Удаляем временные поля
+                        del post['_msg']
+                        del post['_grouped_id']
+                        
+                        # Добавляем пост в итоговый список
+                        all_posts.append(post)
+                else:
+                    # Если нет медиа для скачивания, просто добавляем посты
+                    for post in individual_posts + [albums[album_id][0] for album_id in albums]:
+                        del post['_msg']
+                        del post['_grouped_id']
+                        all_posts.append(post)
+                
+                logger.info(f"Найдено {len(individual_posts) + len(albums)} постов в канале {channel_id}")
                 
             await asyncio.sleep(1)
             
@@ -610,13 +856,30 @@ async def create_telegram_client(session_name, api_id, api_hash, proxy=None):
     """Создает и настраивает клиент Telegram с файловой сессией"""
     # Используем файловую сессию вместо StringSession
     logger.info(f"Создаем клиент с файловой сессией: {session_name}")
+    
+    # Валидируем прокси, если он указан
+    proxy_type = None
+    if proxy:
+        is_valid, proxy_type = validate_proxy(proxy)
+        if is_valid:
+            logger.info(f"Установка прокси {sanitize_proxy_for_logs(proxy)} для клиента {session_name}")
+        else:
+            logger.warning(f"Некорректный формат прокси: {sanitize_proxy_for_logs(proxy)}. Клиент будет создан без прокси.")
+            proxy = None
+    
     client = TelegramClient(
         session_name,  # Путь к файлу сессии (без .session)
         api_id,
         api_hash
     )
     
-    if proxy:
-        client.set_proxy(proxy)
+    # Устанавливаем прокси, если он валидный
+    if proxy and proxy_type:
+        try:
+            client.set_proxy(proxy)
+            logger.info(f"Прокси {sanitize_proxy_for_logs(proxy)} успешно установлен для клиента {session_name}")
+        except Exception as e:
+            logger.error(f"Ошибка при установке прокси {sanitize_proxy_for_logs(proxy)}: {e}")
+            logger.warning(f"Клиент {session_name} будет работать без прокси")
         
     return client

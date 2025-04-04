@@ -8,11 +8,11 @@ python-multipart>=0.0.5
 cryptography==41.0.5
 boto3==1.29.3
 redis==5.0.1
-Pillow==10.2.0
+Pillow
 aiojobs>=0.3.0
 async-timeout==4.0.3
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-magic==0.4.27
-jinja2==3.0.3
+jinja2>=3.1.6
 aiofiles>=0.8.0

@@ -17,6 +17,7 @@ import io
 from aiojobs import create_scheduler
 from dotenv import load_dotenv
 from typing import Union, Callable, Any, Optional, List, Dict
+import sqlite3
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -78,16 +79,25 @@ MAX_FLOOD_HISTORY = 5
 upload_queue = asyncio.Queue(maxsize=100)
 is_worker_running = False
 
+# Добавляем новый семафор для параллельных скачиваний
+PARALLEL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)  # Максимум 5 одновременных задач скачивания
+
 # --- Функции обновления статистики и инициализации --- 
 
 def update_account_usage(api_key, account_id, platform):
-    """Заглушка для функции обновления статистики использования аккаунта"""
+    """Обновляет статистику использования аккаунта через Redis"""
     try:
-        from user_manager import update_account_usage as real_update
-        real_update(api_key, account_id, platform)
+        from redis_utils import update_account_usage_redis
+        # Вызываем функцию обновления статистики через Redis
+        update_account_usage_redis(api_key, account_id, platform)
     except ImportError:
-        # logger.debug(f"Функция update_account_usage недоступна, использую заглушку для {account_id}")
-        pass
+        # Если Redis не доступен, пытаемся использовать обычное обновление
+        try:
+            from user_manager import update_account_usage as real_update
+            real_update(api_key, account_id, platform)
+        except ImportError:
+            logger.debug(f"Функции update_account_usage и update_account_usage_redis недоступны для {account_id}")
+            pass
 
 def init_s3_client():
     global s3_client
@@ -555,7 +565,7 @@ async def process_upload_queue():
 
                 else:
                     logger.error(f"Воркер: ОШИБКА скачивания {file_id}. Ожидался путь: {local_path}, Получен: {downloaded_file_path}. Файл существует: {os.path.exists(local_path)}")
-                    download_success = False 
+                    download_success = False
 
         except FloodWaitError as e:
             logger.warning(f"Воркер: FloodWaitError при скачивании {file_id}: {e.seconds} сек. Возврат задачи в очередь.")
@@ -570,7 +580,22 @@ async def process_upload_queue():
             # Пропускаем оставшуюся часть обработки этой задачи
             upload_queue.task_done() # Отмечаем задачу как обработанную (хотя она вернулась в очередь)
             logger.debug(f"Воркер: задача {file_id} возвращена в очередь из-за FloodWait.")
-            continue 
+            continue
+        except sqlite3.OperationalError as db_err:
+            # Обрабатываем ошибку блокировки базы данных
+            if "database is locked" in str(db_err):
+                logger.warning(f"База данных заблокирована при скачивании {file_id}, переставляем задачу в очередь")
+                # Добавляем небольшую задержку перед повторной попыткой
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+                # Возвращаем задачу в очередь
+                await upload_queue.put(task_data)
+                # Отмечаем задачу как обработанную и продолжаем с новой
+                upload_queue.task_done()
+                continue
+            else:
+                # Другие ошибки SQLite
+                logger.error(f"Воркер: SQLite ошибка при скачивании {file_id}: {db_err}", exc_info=True)
+                download_success = False
         except FileNotFoundError as fnf_err:
              logger.error(f"Воркер: FileNotFoundError при скачивании {file_id} в {local_path}: {fnf_err}", exc_info=True)
              download_success = False
@@ -578,9 +603,20 @@ async def process_upload_queue():
              logger.error(f"Воркер: PermissionError при скачивании/сохранении {file_id} в {local_path}: {perm_err}", exc_info=True)
              download_success = False
         except Exception as e:
-            # Логируем любые другие непредвиденные ошибки при скачивании
-            logger.error(f"Воркер: Непредвиденная ошибка при скачивании {file_id}: {type(e).__name__} - {e}", exc_info=True)
-            download_success = False 
+            # Проверяем на ошибку блокировки базы данных в строковом виде
+            if isinstance(e, Exception) and "database is locked" in str(e):
+                logger.warning(f"Воркер: База данных заблокирована при скачивании {file_id}, переставляем задачу в очередь")
+                # Добавляем небольшую задержку перед повторной попыткой
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+                # Возвращаем задачу в очередь
+                await upload_queue.put(task_data)
+                # Отмечаем задачу как обработанную и продолжаем с новой
+                upload_queue.task_done()
+                continue
+            else:
+                # Логируем любые другие непредвиденные ошибки при скачивании
+                logger.error(f"Воркер: Непредвиденная ошибка при скачивании {file_id}: {type(e).__name__} - {e}", exc_info=True)
+                download_success = False
         
         # --- Загрузка в S3 --- 
         if download_success:
@@ -649,3 +685,181 @@ async def process_upload_queue():
     # Цикл завершен (очередь пуста)
     is_worker_running = False
     logger.info("Рабочий процесс обработки очереди загрузки штатно завершен.")
+
+async def download_media_parallel(media_info_list, api_key, max_workers=5):
+    """
+    Скачивает медиа параллельно, используя доступные аккаунты Telegram.
+    
+    Args:
+        media_info_list: Список информации о медиа
+        api_key: API ключ пользователя
+        max_workers: Максимальное количество параллельных задач
+    
+    Returns:
+        list: Список результатов обработки медиа
+    """
+    # Импортируем здесь, чтобы избежать циклических импортов
+    from app import telegram_pool
+    
+    # Настраиваем семафор для контроля числа параллельных задач
+    download_semaphore = asyncio.Semaphore(max_workers)
+    tasks = []
+    
+    # Проверяем и нормализуем API ключ
+    if isinstance(api_key, (list, dict)):
+        if isinstance(api_key, dict):
+            actual_api_key = api_key.get('user_api_key')
+        elif len(api_key) > 0 and isinstance(api_key[0], dict):
+            actual_api_key = api_key[0].get('user_api_key')
+        else:
+            actual_api_key = None
+    else:
+        actual_api_key = api_key
+    
+    if not actual_api_key:
+        logger.error(f"Не удалось извлечь API ключ из: {api_key}")
+        return []
+    
+    logger.info(f"Запуск параллельного скачивания {len(media_info_list)} медиафайлов (max_workers={max_workers})")
+    
+    # Получаем активные аккаунты один раз
+    try:
+        active_accounts = await telegram_pool.get_active_clients(actual_api_key)
+        if not active_accounts:
+            logger.error(f"Не найдены активные аккаунты для API ключа: {actual_api_key}")
+            return []
+        
+        # Логирование структуры аккаунтов для отладки
+        logger.info(f"Получено {len(active_accounts)} активных аккаунтов для API ключа: {actual_api_key}")
+        logger.info(f"Структура аккаунтов: {type(active_accounts)}, первый аккаунт: {type(active_accounts[0])}")
+        
+        # Проверяем структуру первого аккаунта для отладки
+        if active_accounts and isinstance(active_accounts[0], dict):
+            logger.info(f"Ключи первого аккаунта: {active_accounts[0].keys()}")
+        elif active_accounts and isinstance(active_accounts[0], (list, tuple)):
+            logger.info(f"Длина первого аккаунта (tuple/list): {len(active_accounts[0])}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении активных аккаунтов: {e}")
+        return []
+    
+    # Счетчик для выбора следующего аккаунта
+    account_index = 0
+    
+    async def download_single_media(media_info):
+        """Скачивает одиночный медиафайл с использованием доступного аккаунта"""
+        nonlocal account_index
+        
+        async with download_semaphore:
+            try:
+                # Выбираем следующий доступный аккаунт из пула
+                # Используем простой round-robin для распределения задач
+                account_data = active_accounts[account_index % len(active_accounts)]
+                account_index += 1
+                
+                logger.debug(f"Обработка аккаунта: {account_data}")
+                
+                # Извлекаем клиент и account_id из данных аккаунта
+                client = None
+                account_id = None
+                
+                if isinstance(account_data, dict):
+                    # Формат словаря
+                    account_id = account_data.get('id') or account_data.get('account_id')
+                    client = account_data.get('client')
+                    
+                    # Если клиента нет в словаре, попробуем получить его через telegram_pool по account_id
+                    if not client and account_id:
+                        try:
+                            # Создаем клиент, если его нет
+                            client = telegram_pool.clients.get(account_id)
+                            if not client:
+                                logger.info(f"Пытаемся создать клиент для аккаунта {account_id}")
+                                await telegram_pool.connect_client(account_id)
+                                client = telegram_pool.clients.get(account_id)
+                        except Exception as e:
+                            logger.error(f"Ошибка при создании клиента для аккаунта {account_id}: {e}")
+                
+                elif isinstance(account_data, (list, tuple)) and len(account_data) >= 2:
+                    # Формат списка/кортежа: [client, account_id, ...]
+                    client = account_data[0]
+                    account_id = account_data[1]
+                
+                # Проверяем, что смогли извлечь клиент и account_id
+                if not client or not account_id:
+                    # Вместо возврата None попробуем получить другой аккаунт, если есть
+                    if account_index < len(active_accounts) * 3:  # максимум 3 попытки на все аккаунты
+                        logger.warning(f"Аккаунт {account_data} не содержит клиента. Пробуем следующий.")
+                        return await download_single_media(media_info)
+                    
+                    logger.error(f"Не удалось получить клиент из данных аккаунта: {account_data}")
+                    return None
+                
+                logger.info(f"Скачивание медиа через аккаунт {account_id}")
+                
+                # Подключаем клиента, если он не подключен
+                await telegram_pool.connect_client(account_id)
+                
+                # Получаем информацию о медиа для скачивания
+                msg = media_info.get('_msg')
+                album_messages = media_info.get('_album_messages')
+                
+                if not msg:
+                    logger.error("Медиа информация не содержит объект сообщения")
+                    return None
+                    
+                # Вызываем существующую функцию для получения медиа информации
+                result = await get_media_info(client, msg, album_messages)
+                
+                # Обновляем статистику использования аккаунта через Redis
+                try:
+                    from redis_utils import update_account_usage_redis
+                    update_account_usage_redis(actual_api_key, account_id, "telegram")
+                except ImportError:
+                    # Если Redis не доступен, используем прямое обновление
+                    update_account_usage(actual_api_key, account_id, "telegram")
+                
+                return result
+                
+            except sqlite3.OperationalError as db_err:
+                # Обрабатываем ошибку блокировки базы данных
+                if "database is locked" in str(db_err):
+                    logger.warning(f"База данных заблокирована при скачивании медиа через аккаунт {account_id}, повторная попытка через 1 секунду")
+                    # Добавляем задержку перед повторной попыткой
+                    await asyncio.sleep(1.0)
+                    # Рекурсивно повторяем операцию
+                    return await download_single_media(media_info)
+                else:
+                    # Другие ошибки SQLite
+                    logger.error(f"SQLite ошибка при скачивании медиа через аккаунт {account_id}: {db_err}", exc_info=True)
+                    return None
+            except Exception as e:
+                # Проверяем на ошибку блокировки базы данных в строковом виде
+                if "database is locked" in str(e):
+                    logger.warning(f"База данных заблокирована при скачивании медиа через аккаунт {account_id}, повторная попытка через 1 секунду")
+                    # Добавляем задержку перед повторной попыткой
+                    await asyncio.sleep(1.0)
+                    # Рекурсивно повторяем операцию
+                    return await download_single_media(media_info)
+                else:
+                    # Другие ошибки
+                    logger.error(f"Ошибка при скачивании медиа: {e}")
+                    return None
+    
+    # Создаем задачи для каждого медиафайла
+    for media_info in media_info_list:
+        task = asyncio.create_task(download_single_media(media_info))
+        tasks.append(task)
+    
+    # Ждем завершения всех задач
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Фильтруем результаты, исключая None и исключения
+    valid_results = []
+    for res in results:
+        if isinstance(res, Exception):
+            logger.error(f"Исключение при параллельном скачивании: {res}")
+        elif res is not None:
+            valid_results.append(res)
+    
+    logger.info(f"Параллельное скачивание завершено: {len(valid_results)} из {len(media_info_list)} файлов успешно обработано")
+    return valid_results

@@ -303,7 +303,8 @@ async function displayUsers() {
                         user.id, 
                         account.phone, 
                         account.status, 
-                        account.is_active
+                        account.is_active,
+                        account.proxy
                     );
                     telegramList.appendChild(telegramItem);
                 });
@@ -350,7 +351,8 @@ async function displayUsers() {
                         user.id, 
                         displayName, 
                         account.status, 
-                        account.is_active
+                        account.is_active,
+                        account.proxy
                     );
                     vkList.appendChild(vkItem);
                 });
@@ -388,63 +390,339 @@ function maskToken(token) {
     return token.substring(0, 4) + '...' + token.substring(token.length - 4);
 }
 
-// Функция для создания элемента аккаунта
-function createAccountItem(type, accountId, userId, displayName, status, isActive) {
+// Функция создания элемента аккаунта с информацией о прокси
+function createAccountItem(platform, accountId, userId, displayName, status, lastActivity, proxy = null) {
+    const accountIcon = platform === 'telegram' ? 'fab fa-telegram' : 'fab fa-vk';
+    const statusClass = status === 'active' || status === 'Активен' ? 'active' : 'inactive';
+    const statusText = getStatusText(status);
+    
+    // Форматирование даты последнего использования
+    let lastUsedText = "Не использовался";
+    let lastUsedClass = "not-used";
+    
+    if (lastActivity && lastActivity !== "Invalid Date") {
+        try {
+            const date = new Date(lastActivity);
+            if (!isNaN(date.getTime())) {
+                lastUsedText = date.toLocaleString();
+                lastUsedClass = "";
+            }
+        } catch (e) {
+            console.error("Ошибка форматирования даты:", e);
+        }
+    }
+    
+    // Создаем DOM элемент вместо HTML строки
     const accountItem = document.createElement('div');
     accountItem.className = 'account-item';
-    accountItem.id = `account-${accountId}`;
-
+    accountItem.setAttribute('data-id', accountId);
+    accountItem.setAttribute('data-platform', platform);
+    
+    // Информация об аккаунте
     const accountInfo = document.createElement('div');
     accountInfo.className = 'account-info';
     
+    // Имя аккаунта
+    const accountName = document.createElement('span');
+    accountName.className = 'account-name';
+    
     const icon = document.createElement('i');
-    icon.className = type === 'telegram' ? 'fab fa-telegram' : 'fab fa-vk';
+    icon.className = accountIcon;
+    accountName.appendChild(icon);
     
-    const name = document.createElement('span');
-    name.textContent = displayName;
+    // Добавляем имя и пробел
+    accountName.append(' ', displayName);
     
-    const statusBadge = document.createElement('span');
-    statusBadge.className = `account-status status-${status.toLowerCase()}`;
-    statusBadge.textContent = getStatusText(status);
+    // Индикатор статуса
+    const statusIndicator = document.createElement('span');
+    statusIndicator.className = `status-indicator ${statusClass}`;
+    statusIndicator.setAttribute('data-tooltip', `Статус: ${statusText}`);
+    accountName.appendChild(statusIndicator);
     
-    accountInfo.appendChild(icon);
-    accountInfo.appendChild(name);
-    accountInfo.appendChild(statusBadge);
+    accountInfo.appendChild(accountName);
     
+    // Детали аккаунта
+    const accountDetails = document.createElement('div');
+    accountDetails.className = 'account-details';
+    
+    // ID аккаунта
+    const accountIdElem = document.createElement('span');
+    accountIdElem.className = 'account-id';
+    accountIdElem.textContent = `ID: ${platform}-${accountId.substring(0, 8)}`;
+    accountDetails.appendChild(accountIdElem);
+    
+    // Последнее использование
+    const lastUsage = document.createElement('div');
+    lastUsage.className = 'last-usage';
+    
+    const lastUsageLabel = document.createElement('span');
+    lastUsageLabel.className = 'last-usage-label';
+    lastUsageLabel.textContent = 'Последнее использование:';
+    
+    const lastUsageValue = document.createElement('span');
+    lastUsageValue.className = `last-usage-value ${lastUsedClass}`;
+    lastUsageValue.textContent = lastUsedText;
+    
+    lastUsage.appendChild(lastUsageLabel);
+    lastUsage.appendChild(lastUsageValue);
+    accountDetails.appendChild(lastUsage);
+    
+    // Прокси
+    const proxyInfo = document.createElement('div');
+    proxyInfo.className = 'proxy-info';
+    
+    const proxyLabel = document.createElement('span');
+    proxyLabel.className = 'proxy-label';
+    proxyLabel.textContent = 'Прокси:';
+    
+    const proxyValue = document.createElement('span');
+    proxyValue.className = 'proxy-value';
+    proxyValue.textContent = proxy ? maskProxy(proxy) : 'Не установлен';
+    
+    proxyInfo.appendChild(proxyLabel);
+    proxyInfo.appendChild(proxyValue);
+    accountDetails.appendChild(proxyInfo);
+    
+    accountInfo.appendChild(accountDetails);
+    accountItem.appendChild(accountInfo);
+    
+    // Действия
     const accountActions = document.createElement('div');
     accountActions.className = 'account-actions';
     
     // Кнопка проверки статуса
-    const checkButton = document.createElement('button');
-    checkButton.className = 'check-status-btn';
-    checkButton.innerHTML = `<i class="fas fa-sync-alt"></i>`;
-    checkButton.title = 'Проверить статус';
-    checkButton.onclick = () => checkAccountStatus(type, accountId);
+    const checkBtn = document.createElement('button');
+    checkBtn.className = 'action-btn check-btn';
+    checkBtn.onclick = function() { checkAccountStatus(platform, accountId); };
+    const checkIcon = document.createElement('i');
+    checkIcon.className = 'fas fa-sync-alt';
+    checkBtn.appendChild(checkIcon);
     
-    // Кнопка переключения статуса активности
-    const toggleButton = document.createElement('button');
-    toggleButton.className = 'toggle-status-btn';
-    toggleButton.innerHTML = isActive 
-        ? `<i class="fas fa-toggle-on"></i>` 
-        : `<i class="fas fa-toggle-off"></i>`;
-    toggleButton.title = isActive ? 'Деактивировать' : 'Активировать';
-    toggleButton.onclick = () => toggleAccountStatus(type, accountId, !isActive);
+    // Кнопка проверки прокси
+    const proxyBtn = document.createElement('button');
+    proxyBtn.className = 'action-btn proxy-btn';
+    proxyBtn.onclick = function() { checkProxyValidity(platform, accountId); };
+    const proxyIcon = document.createElement('i');
+    proxyIcon.className = 'fas fa-network-wired';
+    proxyBtn.appendChild(proxyIcon);
+    
+    // Кнопка редактирования прокси
+    const proxyEditBtn = document.createElement('button');
+    proxyEditBtn.className = 'action-btn proxy-edit-btn';
+    proxyEditBtn.onclick = function() { showChangeProxyModal(platform, accountId, userId); };
+    const proxyEditIcon = document.createElement('i');
+    proxyEditIcon.className = 'fas fa-edit';
+    proxyEditBtn.appendChild(proxyEditIcon);
     
     // Кнопка удаления
-    const deleteButton = document.createElement('button');
-    deleteButton.className = 'delete-account-btn';
-    deleteButton.innerHTML = `<i class="fas fa-trash-alt"></i>`;
-    deleteButton.title = 'Удалить';
-    deleteButton.onclick = () => deleteAccount(type, accountId, userId);
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'action-btn delete-btn';
+    deleteBtn.onclick = function() { deleteAccount(platform, accountId, userId); };
+    const deleteIcon = document.createElement('i');
+    deleteIcon.className = 'fas fa-trash';
+    deleteBtn.appendChild(deleteIcon);
     
-    accountActions.appendChild(checkButton);
-    accountActions.appendChild(toggleButton);
-    accountActions.appendChild(deleteButton);
+    accountActions.appendChild(checkBtn);
+    accountActions.appendChild(proxyBtn);
+    accountActions.appendChild(proxyEditBtn);
+    accountActions.appendChild(deleteBtn);
     
-    accountItem.appendChild(accountInfo);
     accountItem.appendChild(accountActions);
     
     return accountItem;
+}
+
+// Функция для маскировки прокси (безопасность)
+function maskProxy(proxy) {
+    if (!proxy) return 'Не установлен';
+    
+    try {
+        // Разбираем URL прокси
+        let url = proxy;
+        let protocol = '';
+        
+        if (proxy.includes('://')) {
+            const parts = proxy.split('://');
+            protocol = parts[0] + '://';
+            url = parts[1];
+        }
+        
+        // Если есть логин и пароль
+        if (url.includes('@')) {
+            const [auth, hostPort] = url.split('@');
+            // Возвращаем звездочки вместо логина и пароля
+            return `${protocol}***@${hostPort}`;
+        }
+        
+        return proxy;
+    } catch (error) {
+        console.error('Ошибка при маскировке прокси:', error);
+        return proxy;
+    }
+}
+
+// Функция для проверки валидности прокси
+async function checkProxyValidity(platform, accountId) {
+    try {
+        showNotification('Проверка прокси...', 'info');
+        
+        const response = await fetch('/api/admin/check-proxy', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': getAdminKey()
+            },
+            body: JSON.stringify({
+                platform,
+                account_id: accountId
+            })
+        });
+        
+        const result = await response.json();
+        
+        if (result.valid) {
+            showNotification(result.message, 'success');
+        } else {
+            showNotification(result.message, 'error');
+        }
+    } catch (error) {
+        console.error('Ошибка при проверке прокси:', error);
+        showNotification('Ошибка при проверке прокси: ' + error.message, 'error');
+    }
+}
+
+// Показать модальное окно для изменения прокси
+function showChangeProxyModal(platform, accountId, userId) {
+    // Создаем модальное окно, если его еще нет
+    let proxyModal = document.getElementById('proxyChangeModal');
+    
+    if (!proxyModal) {
+        proxyModal = document.createElement('div');
+        proxyModal.id = 'proxyChangeModal';
+        proxyModal.className = 'modal';
+        
+        proxyModal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeProxyModal()">&times;</span>
+                <h3><i class="fas fa-network-wired"></i> Изменение прокси</h3>
+                <form id="changeProxyForm">
+                    <input type="hidden" id="proxy_platform" name="platform">
+                    <input type="hidden" id="proxy_account_id" name="account_id">
+                    <input type="hidden" id="proxy_user_id" name="user_id">
+                    
+                    <div class="form-group">
+                        <label for="proxy_value"><i class="fas fa-network-wired"></i> Прокси:</label>
+                        <input type="text" id="proxy_value" name="proxy" placeholder="socks5://user:pass@host:port">
+                        <small>Укажите прокси в формате socks5://user:pass@host:port или http://user:pass@host:port</small>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button type="submit" class="save-button"><i class="fas fa-save"></i> Сохранить</button>
+                        <button type="button" class="remove-button" onclick="removeProxy()"><i class="fas fa-trash"></i> Удалить прокси</button>
+                    </div>
+                </form>
+            </div>
+        `;
+        
+        document.body.appendChild(proxyModal);
+        
+        // Обработчик формы
+        document.getElementById('changeProxyForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            updateProxy();
+        });
+    }
+    
+    // Заполняем данные формы
+    document.getElementById('proxy_platform').value = platform;
+    document.getElementById('proxy_account_id').value = accountId;
+    document.getElementById('proxy_user_id').value = userId;
+    
+    // Показываем модальное окно
+    proxyModal.style.display = 'block';
+}
+
+// Закрыть модальное окно прокси
+function closeProxyModal() {
+    const modal = document.getElementById('proxyChangeModal');
+    if (modal) {
+        modal.style.display = 'none';
+    }
+}
+
+// Обновить прокси
+async function updateProxy() {
+    try {
+        const platform = document.getElementById('proxy_platform').value;
+        const accountId = document.getElementById('proxy_account_id').value;
+        const userId = document.getElementById('proxy_user_id').value;
+        const proxy = document.getElementById('proxy_value').value;
+        
+        const response = await fetch('/api/admin/update-proxy', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': getAdminKey()
+            },
+            body: JSON.stringify({
+                platform,
+                account_id: accountId,
+                user_id: userId,
+                proxy
+            })
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showNotification(result.message, 'success');
+            closeProxyModal();
+            // Обновляем данные на странице
+            displayAccounts();
+        } else {
+            showNotification(result.detail || 'Ошибка при обновлении прокси', 'error');
+        }
+    } catch (error) {
+        console.error('Ошибка при обновлении прокси:', error);
+        showNotification('Ошибка при обновлении прокси: ' + error.message, 'error');
+    }
+}
+
+// Удалить прокси
+async function removeProxy() {
+    try {
+        const platform = document.getElementById('proxy_platform').value;
+        const accountId = document.getElementById('proxy_account_id').value;
+        const userId = document.getElementById('proxy_user_id').value;
+        
+        const response = await fetch('/api/admin/update-proxy', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': getAdminKey()
+            },
+            body: JSON.stringify({
+                platform,
+                account_id: accountId,
+                user_id: userId,
+                proxy: null
+            })
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showNotification(result.message, 'success');
+            closeProxyModal();
+            // Обновляем данные на странице
+            displayAccounts();
+        } else {
+            showNotification(result.detail || 'Ошибка при удалении прокси', 'error');
+        }
+    } catch (error) {
+        console.error('Ошибка при удалении прокси:', error);
+        showNotification('Ошибка при удалении прокси: ' + error.message, 'error');
+    }
 }
 
 // Функция для получения текстового представления статуса
@@ -506,55 +784,77 @@ function copyToClipboard(text) {
     }
 }
 
-// Отображение уведомления
-function showNotification(message, type = 'info') {
+// Функция для отображения уведомлений
+function showNotification(message, type = 'info', duration = 4000) {
+    // Проверяем, существует ли уже контейнер для уведомлений
+    let notificationsContainer = document.querySelector('.notifications');
+    
+    if (!notificationsContainer) {
+        // Создаем контейнер, если его нет
+        notificationsContainer = document.createElement('div');
+        notificationsContainer.className = 'notifications';
+        document.body.appendChild(notificationsContainer);
+    }
+    
+    // Создаем новое уведомление
     const notification = document.createElement('div');
     notification.className = `notification ${type}`;
     
-    let iconClass = 'fa-info-circle';
-    if (type === 'success') iconClass = 'fa-check-circle';
-    else if (type === 'error') iconClass = 'fa-exclamation-circle';
-    else if (type === 'warning') iconClass = 'fa-exclamation-triangle';
+    // Определяем иконку в зависимости от типа
+    let icon = 'info-circle';
     
-    // Проверяем, содержит ли сообщение уже HTML-иконку
-    const hasIcon = message.includes('<i class="fas');
+    if (type === 'success') icon = 'check-circle';
+    if (type === 'error') icon = 'exclamation-circle';
+    if (type === 'warning') icon = 'exclamation-triangle';
     
+    // Содержимое уведомления
     notification.innerHTML = `
         <div class="notification-content">
-            ${hasIcon ? '' : `<i class="fas ${iconClass}"></i>`}
+            <i class="fas fa-${icon}"></i>
             <span>${message}</span>
         </div>
-        <button class="close-notification">×</button>
+        <button class="close-notification">
+            <i class="fas fa-times"></i>
+        </button>
     `;
     
-    document.body.appendChild(notification);
+    // Добавляем уведомление в контейнер
+    notificationsContainer.appendChild(notification);
     
     // Показываем уведомление с анимацией
     setTimeout(() => {
         notification.classList.add('show');
     }, 10);
     
-    // Автоматически скрываем через 3 секунды
-    const timeout = setTimeout(() => {
-        closeNotification(notification);
-    }, 3500);
-    
-    // Обработка закрытия уведомления
+    // Настраиваем обработчик для закрытия уведомления
     const closeButton = notification.querySelector('.close-notification');
-    closeButton.addEventListener('click', () => {
-        clearTimeout(timeout);
-        closeNotification(notification);
-    });
+    if (closeButton) {
+        closeButton.addEventListener('click', () => {
+            closeNotification(notification);
+        });
+    }
+    
+    // Автоматически закрываем уведомление через указанное время
+    if (duration > 0) {
+        setTimeout(() => {
+            closeNotification(notification);
+        }, duration);
+    }
+    
+    return notification;
 }
 
-// Закрытие уведомления
+// Функция для закрытия уведомления
 function closeNotification(notification) {
+    // Удаляем класс show для запуска анимации исчезновения
     notification.classList.remove('show');
+    
+    // Удаляем элемент после завершения анимации
     setTimeout(() => {
         if (notification.parentNode) {
             notification.parentNode.removeChild(notification);
         }
-    }, 300);
+    }, 300); // Время равно продолжительности анимации
 }
 
 // Функции для работы с модальными окнами
@@ -1204,17 +1504,14 @@ document.getElementById('addVkForm').addEventListener('submit', async (e) => {
 
 // Функция для проверки статуса аккаунта
 async function checkAccountStatus(type, accountId) {
-    const loadingIndicator = document.querySelector(`#account-${accountId} .loading-indicator`);
-    if (loadingIndicator) loadingIndicator.style.display = 'inline-block';
-
-    showNotification(`Проверка статуса аккаунта ${accountId}...`);
+    // Показываем уведомление о начале проверки
+    showNotification(`Проверка статуса аккаунта...`, 'info');
 
     // Получаем админ-ключ
     const adminKey = getAdminKey();
     if (!adminKey) {
         showNotification('Ошибка: Админ-ключ не найден. Пожалуйста, войдите снова.', 'error');
         window.location.href = '/login';
-        if (loadingIndicator) loadingIndicator.style.display = 'none';
         return;
     }
 
@@ -1225,7 +1522,6 @@ async function checkAccountStatus(type, accountId) {
         endpoint = `/api/vk/accounts/${accountId}/status`;
     } else {
         showNotification('Неизвестный тип аккаунта', 'error');
-        if (loadingIndicator) loadingIndicator.style.display = 'none';
         return;
     }
 
@@ -1240,32 +1536,53 @@ async function checkAccountStatus(type, accountId) {
         const result = await response.json();
 
         if (response.ok) {
-            // Используем правильный селектор для элемента статуса
-            const statusElement = document.querySelector(`#account-${accountId} .account-status`);
+            // Найдем элемент аккаунта по data-id и data-platform
+            const accountItem = document.querySelector(`.account-item[data-id="${accountId}"][data-platform="${type}"]`);
             
-            // Проверяем, что элемент найден
-            if (statusElement) {
-                const newStatus = result.status;
-                // Обновляем классы и текст элемента статуса
-                statusElement.className = `account-status status-${newStatus.toLowerCase()}`;
-                statusElement.textContent = getStatusText(newStatus);
+            if (accountItem) {
+                // Находим элемент статуса внутри карточки аккаунта
+                const statusElement = accountItem.querySelector('.status-indicator');
                 
-                showNotification(`Статус аккаунта ${accountId} обновлен: ${getStatusText(newStatus)}`, 'success');
-
-                // Обновляем данные пользователя, если необходимо
-                // await displayUsers(); // Пока закомментируем, чтобы не было лишней перезагрузки
+                if (statusElement) {
+                    // Обновляем класс статуса
+                    const newStatus = result.status;
+                    
+                    // Удаляем старые классы статуса
+                    statusElement.classList.remove('active', 'inactive', 'cooldown', 'error');
+                    
+                    // Добавляем новый класс в зависимости от статуса
+                    if (newStatus === 'active') {
+                        statusElement.classList.add('active');
+                    } else if (newStatus === 'inactive') {
+                        statusElement.classList.add('inactive');
+                    } else if (newStatus === 'cooldown') {
+                        statusElement.classList.add('cooldown');
+                    } else if (newStatus === 'error') {
+                        statusElement.classList.add('error');
+                    }
+                    
+                    // Обновляем подсказку
+                    statusElement.setAttribute('data-tooltip', `Статус: ${getStatusLabel(newStatus)}`);
+                    
+                    showNotification(`Статус аккаунта успешно проверен: ${getStatusLabel(newStatus)}`, 'success');
+                } else {
+                    console.error('Элемент индикатора статуса не найден в карточке аккаунта');
+                    showNotification('Не удалось обновить интерфейс статуса. Обновляем страницу...', 'warning');
+                    // Перезагружаем список пользователей
+                    await displayUsers();
+                }
             } else {
-                console.error(`Не найден элемент статуса для #account-${accountId} .account-status`);
-                showNotification('Не удалось обновить интерфейс статуса', 'error');
+                console.error(`Элемент аккаунта с ID ${accountId} типа ${type} не найден`);
+                showNotification('Не удалось найти элемент аккаунта. Обновляем список...', 'warning');
+                // Перезагружаем список пользователей
+                await displayUsers();
             }
         } else {
-            showNotification(`Ошибка проверки статуса (${response.status}): ${result.detail || 'Неизвестная ошибка'}`, 'error');
+            showNotification(`Ошибка проверки статуса: ${result.error || 'Неизвестная ошибка'}`, 'error');
         }
     } catch (error) {
         console.error('Ошибка при проверке статуса:', error);
         showNotification('Ошибка сети при проверке статуса', 'error');
-    } finally {
-        if (loadingIndicator) loadingIndicator.style.display = 'none';
     }
 }
 
@@ -1446,13 +1763,13 @@ function createAccountsStatsTable(accounts, platform) {
         
         // Использовано
         const usedCell = document.createElement('td');
-        usedCell.textContent = account.requests_made || '0';
+        usedCell.textContent = account.requests_count || '0';
         row.appendChild(usedCell);
         
         // % использования
         const percentCell = document.createElement('td');
         if (account.request_limit) {
-            const percent = Math.round((account.requests_made || 0) / account.request_limit * 100);
+            const percent = Math.round((account.requests_count || 0) / account.request_limit * 100);
             percentCell.textContent = `${percent}%`;
             
             // Добавляем цветовое обозначение
@@ -1471,8 +1788,18 @@ function createAccountsStatsTable(accounts, platform) {
         // Последнее использование
         const lastUsedCell = document.createElement('td');
         if (account.last_used) {
-            const lastUsed = new Date(account.last_used);
-            lastUsedCell.textContent = lastUsed.toLocaleString();
+            try {
+                const lastUsed = new Date(account.last_used);
+                // Проверяем валидность даты
+                if (!isNaN(lastUsed.getTime())) {
+                    lastUsedCell.textContent = lastUsed.toLocaleString();
+                } else {
+                    lastUsedCell.textContent = 'Никогда';
+                }
+            } catch (e) {
+                console.error("Ошибка форматирования даты:", e, account.last_used);
+                lastUsedCell.textContent = 'Никогда';
+            }
         } else {
             lastUsedCell.textContent = 'Никогда';
         }
@@ -1578,4 +1905,110 @@ function getStatusLabel(status) {
     };
     
     return statuses[status] || status;
+}
+
+// Функция отображения аккаунтов (после обновления прокси)
+async function displayAccounts() {
+    console.log('Обновление данных об аккаунтах...');
+    
+    // Получаем админ-ключ
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        console.error('Админ-ключ не найден');
+        window.location.href = '/login';
+        return;
+    }
+    
+    try {
+        // Обновляем список пользователей, так как аккаунты находятся внутри их структуры
+        await displayUsers();
+        showNotification('Данные успешно обновлены', 'success');
+    } catch (error) {
+        console.error('Ошибка при обновлении аккаунтов:', error);
+        showNotification('Ошибка при обновлении данных', 'error');
+    }
+}
+
+// Функция удаления аккаунта (обобщённая для Telegram и VK)
+async function deleteAccount(platform, accountId, userId) {
+    if (platform === 'telegram') {
+        await deleteTelegramAccount(userId, accountId);
+    } else if (platform === 'vk') {
+        await deleteVkAccount(userId, accountId);
+    }
+}
+
+/**
+ * Сбрасывает статистику использования всех аккаунтов
+ */
+async function resetAccountsStats() {
+    // Получаем админ-ключ
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        showNotification('Ошибка: Админ-ключ не найден. Пожалуйста, войдите снова.', 'error');
+        window.location.href = '/login';
+        return;
+    }
+    
+    try {
+        // Показываем уведомление о начале процесса
+        showNotification('Сброс статистики аккаунтов...', 'info');
+        
+        // Добавляем анимацию на кнопку сброса
+        const resetBtn = document.querySelector('.reset-stats-btn');
+        if (resetBtn) {
+            const icon = resetBtn.querySelector('i');
+            if (icon) {
+                icon.className = 'fas fa-spinner fa-spin';
+                resetBtn.disabled = true;
+            }
+        }
+        
+        const response = await fetch('/admin/accounts/reset-stats', {
+            method: 'POST',
+            headers: {
+                'X-Admin-Key': adminKey,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({})
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error ${response.status}`);
+        }
+        
+        const result = await response.json();
+        
+        // Восстанавливаем иконку кнопки
+        if (resetBtn) {
+            const icon = resetBtn.querySelector('i');
+            if (icon) {
+                icon.className = 'fas fa-undo';
+                resetBtn.disabled = false;
+            }
+        }
+        
+        showNotification(
+            `Статистика сброшена: ${result.reset_count} аккаунтов (${result.vk_updated} VK, ${result.tg_updated} Telegram)`, 
+            'success'
+        );
+        
+        // Обновляем статистику на странице после небольшой задержки
+        setTimeout(async () => {
+            await displayAccountsStats();
+        }, 500);
+    } catch (error) {
+        console.error('Ошибка при сбросе статистики:', error);
+        showNotification('Произошла ошибка при сбросе статистики аккаунтов: ' + error.message, 'error');
+        
+        // Восстанавливаем иконку кнопки в случае ошибки
+        const resetBtn = document.querySelector('.reset-stats-btn');
+        if (resetBtn) {
+            const icon = resetBtn.querySelector('i');
+            if (icon) {
+                icon.className = 'fas fa-undo';
+                resetBtn.disabled = false;
+            }
+        }
+    }
 } 
