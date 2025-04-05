@@ -23,10 +23,38 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
+# Функция для чтения Docker secrets
+def read_docker_secret(secret_name):
+    try:
+        with open(f'/run/secrets/{secret_name}', 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except (FileNotFoundError, PermissionError):
+        # Если не удалось прочитать из Docker secrets, пробуем из переменной окружения
+        env_name = secret_name.upper()
+        if secret_name == "aws_access_key":
+            env_name = "AWS_ACCESS_KEY_ID"
+        elif secret_name == "aws_secret_key":
+            env_name = "AWS_SECRET_ACCESS_KEY"
+        elif secret_name == "encryption_key":
+            env_name = "ENCRYPTION_KEY"
+        return os.getenv(env_name)
+
 # Настройка логирования
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Инициализация секретов из Docker secrets или переменных окружения
+AWS_ACCESS_KEY_ID = read_docker_secret('aws_access_key') or os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = read_docker_secret('aws_secret_key') or os.getenv('AWS_SECRET_ACCESS_KEY')
+ENCRYPTION_KEY = read_docker_secret('encryption_key') or os.getenv('ENCRYPTION_KEY')
+
+if AWS_ACCESS_KEY_ID:
+    os.environ['AWS_ACCESS_KEY_ID'] = AWS_ACCESS_KEY_ID
+if AWS_SECRET_ACCESS_KEY:
+    os.environ['AWS_SECRET_ACCESS_KEY'] = AWS_SECRET_ACCESS_KEY
+if ENCRYPTION_KEY:
+    os.environ['ENCRYPTION_KEY'] = ENCRYPTION_KEY
 
 # Настройка подключения к Redis, если доступно
 try:

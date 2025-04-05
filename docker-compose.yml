@@ -9,16 +9,29 @@ services:
       - ./telegram_sessions:/app/telegram_sessions
       - ./logs:/app/logs
       - ./data:/app/data
+      - ./users.db:/app/users.db
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
       - PORT=3030
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - redis
     restart: unless-stopped
     networks:
       - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3030/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    secrets:
+      - aws_access_key
+      - aws_secret_key
+      - encryption_key
+      - admin_key
 
   redis:
     image: redis:7-alpine
@@ -30,6 +43,11 @@ services:
     restart: unless-stopped
     networks:
       - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   redis_data:
@@ -37,4 +55,14 @@ volumes:
 
 networks:
   app-network:
-    driver: bridge 
+    driver: bridge
+    
+secrets:
+  aws_access_key:
+    file: ./secrets/aws_access_key.txt
+  aws_secret_key:
+    file: ./secrets/aws_secret_key.txt
+  encryption_key:
+    file: ./secrets/encryption_key.txt
+  admin_key:
+    file: ./secrets/admin_key.txt 

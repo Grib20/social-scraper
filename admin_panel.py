@@ -14,8 +14,17 @@ load_dotenv()
 # Настройка логирования
 logger = logging.getLogger(__name__)
 
+# Функция для чтения Docker secrets
+def read_docker_secret(secret_name):
+    try:
+        with open(f'/run/secrets/{secret_name}', 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except (FileNotFoundError, PermissionError):
+        return None
+
 # Проверка админ-ключа
-ADMIN_KEY = os.getenv('ADMIN_KEY', 'your-secret-admin-key')
+admin_key_from_secret = read_docker_secret('admin_key')
+ADMIN_KEY = admin_key_from_secret or os.getenv('ADMIN_KEY', 'your-secret-admin-key')
 api_key_header = APIKeyHeader(name="X-Admin-Key")
 
 async def verify_admin_key(api_key: str) -> bool:

@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     libpng-dev \
     libmagic1 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем файлы зависимостей
@@ -20,17 +21,20 @@ COPY requirements.txt .
 # Устанавливаем зависимости Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Создаем директории для статических файлов и шаблонов
-RUN mkdir -p /app/static /app/templates
+# Создаем директории для данных
+RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data
+
+# Создаем непривилегированного пользователя
+RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 
 # Копируем файлы приложения
 COPY . .
 
-# Создаем директорию для сессий Telegram
-RUN mkdir -p telegram_sessions
+# Даем права на запись в нужные директории
+RUN chown -R appuser:appuser /app/telegram_sessions /app/logs /app/data
 
-# Создаем директорию для логов
-RUN mkdir -p logs
+# Переключаемся на непривилегированного пользователя
+USER appuser
 
 # Устанавливаем переменные окружения
 ENV PYTHONUNBUFFERED=1
