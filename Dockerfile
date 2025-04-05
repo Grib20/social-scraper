@@ -48,8 +48,9 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 # Копируем файлы приложения
 COPY . .
 
-# Даем права на запись во все необходимые директории и файлы
-RUN touch /app/scraper.log /app/media_utils.log && \
+# Создаем симлинки для лог-файлов в директории logs
+RUN ln -sf /app/logs/scraper.log /app/scraper.log && \
+    ln -sf /app/logs/media_utils.log /app/media_utils.log && \
     chown -R appuser:appuser /app
 
 # Переключаемся на непривилегированного пользователя
@@ -58,6 +59,7 @@ USER appuser
 # Устанавливаем переменные окружения
 ENV PYTHONUNBUFFERED=1
 ENV PORT=3030
+ENV LOG_DIR=/app/logs
 
 # Открываем порт
 EXPOSE 3030

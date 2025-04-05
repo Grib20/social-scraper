@@ -14,14 +14,13 @@ services:
       - data:/app/data
       - ./users.db:/app/users.db
       - ./secrets:/app/secrets
-      - ./scraper.log:/app/scraper.log
-      - ./media_utils.log:/app/media_utils.log
     env_file:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
       - PORT=3030
       - REDIS_URL=redis://redis:6379/0
+      - LOG_DIR=/app/logs
     depends_on:
       redis:
         condition: service_healthy
