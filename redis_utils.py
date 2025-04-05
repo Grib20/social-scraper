@@ -14,6 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Получаем параметры подключения из .env
+REDIS_URL = os.getenv('REDIS_URL')
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 REDIS_DB = int(os.getenv('REDIS_DB', 0))
@@ -26,19 +27,36 @@ def init_redis():
     """Инициализирует подключение к Redis."""
     global redis_client
     try:
-        redis_client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            password=REDIS_PASSWORD,
-            decode_responses=True,  # Автоматически декодируем ответы
-            socket_timeout=5,
-            socket_connect_timeout=5,
-            retry_on_timeout=True
-        )
+        # Сначала пробуем подключиться через URL, если он задан
+        if REDIS_URL:
+            logger.info(f"Пробуем подключиться к Redis через URL: {REDIS_URL.split('@')[0]}...")
+            redis_client = redis.from_url(
+                REDIS_URL, 
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True
+            )
+        else:
+            # Если URL не задан, используем отдельные параметры
+            logger.info(f"Подключение к Redis через параметры: {REDIS_HOST}:{REDIS_PORT}")
+            redis_client = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                db=REDIS_DB,
+                password=REDIS_PASSWORD,
+                decode_responses=True,  # Автоматически декодируем ответы
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True
+            )
+        
         # Проверяем соединение
         redis_client.ping()
-        logger.info(f"Подключение к Redis на {REDIS_HOST}:{REDIS_PORT} успешно")
+        if REDIS_URL:
+            logger.info(f"Подключение к Redis через URL успешно")
+        else:
+            logger.info(f"Подключение к Redis на {REDIS_HOST}:{REDIS_PORT} успешно")
         return True
     except Exception as e:
         logger.error(f"Ошибка подключения к Redis: {e}")

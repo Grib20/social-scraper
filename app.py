@@ -2845,6 +2845,11 @@ async def reset_accounts_stats(request: Request):
         logger.error(f"Ошибка при сбросе статистики аккаунтов: {e}")
         raise HTTPException(500, f"Ошибка при сбросе статистики: {str(e)}")
 
+@app.get("/health")
+async def health_check():
+    """Endpoint для проверки работоспособности сервиса."""
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))
     uvicorn.run(app, host="0.0.0.0", port=port)
