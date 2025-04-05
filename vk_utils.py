@@ -385,7 +385,8 @@ class VKClient:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             
             # Получаем активные аккаунты
-            active_accounts = get_active_accounts(self.api_key, "vk")
+            from user_manager import get_active_accounts
+            active_accounts = await get_active_accounts(self.api_key, "vk")
             if not active_accounts:
                 logger.warning("Нет доступных аккаунтов")
                 return []
@@ -427,8 +428,12 @@ class VKClient:
         posts = []
         for group_id in group_ids:
             try:
+                # Преобразуем ID группы в число, убираем минус, если есть
+                group_id_str = str(group_id).replace('-', '')
+                group_id_int = int(group_id_str)
+                
                 result = await self._make_group_request("wall.get", {
-                    "owner_id": -group_id,
+                    "owner_id": -group_id_int,  # Используем отрицательное числовое значение
                     "count": max_posts,
                     "offset": 0
                 })
@@ -450,11 +455,11 @@ class VKClient:
                             "text": post["text"],
                             "group_id": group_id,
                             "group_title": post.get("group_title", ""),
-                            "url": f"https://vk.com/wall-{group_id}_{post['id']}",
+                            "url": f"https://vk.com/wall-{group_id_str}_{post['id']}",
                             "likes": post.get("likes", {}).get("count", 0),
                             "reposts": post.get("reposts", {}).get("count", 0),
                             "comments": post.get("comments", {}).get("count", 0),
-                            "group_members": await self._get_group_members_count(group_id),
+                            "group_members": await self._get_group_members_count(group_id_int),
                             "media": []
                         }
                         
@@ -476,10 +481,18 @@ class VKClient:
         
         return posts
 
-    async def _get_group_members_count(self, group_id: int) -> int:
+    async def _get_group_members_count(self, group_id: Union[int, str]) -> int:
         """Получает количество участников группы с использованием Redis."""
+        # Преобразуем ID группы в число, убираем минус, если есть
+        if isinstance(group_id, str):
+            group_id_str = group_id.replace('-', '')
+            group_id_int = int(group_id_str)
+        else:
+            group_id_int = abs(group_id)  # Убираем минус, если есть
+            group_id_str = str(group_id_int)
+        
         # Формируем ключ для Redis
-        redis_key = f"vk:group:members:{group_id}"
+        redis_key = f"vk:group:members:{group_id_int}"
         
         # Проверяем Redis, если доступен
         if redis_client:
@@ -487,50 +500,50 @@ class VKClient:
                 cached_value = redis_client.get(redis_key)
                 if cached_value:
                     members_count = int(cached_value)
-                    logger.info(f"Получено количество участников группы {group_id} из Redis: {members_count}")
+                    logger.info(f"Получено количество участников группы {group_id_int} из Redis: {members_count}")
                     return members_count
             except Exception as e:
                 logger.error(f"Ошибка при чтении из Redis: {e}")
         
         # Проверяем глобальный кэш в памяти как fallback
-        if group_id in GROUP_MEMBERS_CACHE:
-            logger.info(f"Получено количество участников группы {group_id} из глобального кэша: {GROUP_MEMBERS_CACHE[group_id]}")
-            return GROUP_MEMBERS_CACHE[group_id]
+        if group_id_int in GROUP_MEMBERS_CACHE:
+            logger.info(f"Получено количество участников группы {group_id_int} из глобального кэша: {GROUP_MEMBERS_CACHE[group_id_int]}")
+            return GROUP_MEMBERS_CACHE[group_id_int]
             
         # Затем локальный кэш экземпляра
-        if group_id in self.group_members_cache:
-            logger.info(f"Получено количество участников группы {group_id} из локального кэша: {self.group_members_cache[group_id]}")
-            return self.group_members_cache[group_id]
+        if group_id_int in self.group_members_cache:
+            logger.info(f"Получено количество участников группы {group_id_int} из локального кэша: {self.group_members_cache[group_id_int]}")
+            return self.group_members_cache[group_id_int]
             
         try:
-            logger.info(f"Запрашиваем количество участников группы {group_id}")
+            logger.info(f"Запрашиваем количество участников группы {group_id_int}")
             result = await self._make_request("groups.getById", {
-                "group_id": group_id,
+                "group_id": group_id_int,
                 "fields": "members_count"
             })
             
             if "response" in result and result["response"] and "members_count" in result["response"][0]:
                 members_count = result["response"][0]["members_count"]
-                logger.info(f"Получено количество участников группы {group_id}: {members_count}")
+                logger.info(f"Получено количество участников группы {group_id_int}: {members_count}")
                 
                 # Сохраняем результат во всех кэшах
-                self.group_members_cache[group_id] = members_count
-                GROUP_MEMBERS_CACHE[group_id] = members_count
+                self.group_members_cache[group_id_int] = members_count
+                GROUP_MEMBERS_CACHE[group_id_int] = members_count
                 
                 # Сохраняем в Redis с TTL, если доступен
                 if redis_client:
                     try:
                         redis_client.setex(redis_key, GROUP_MEMBERS_CACHE_TTL, members_count)
-                        logger.info(f"Сохранено количество участников группы {group_id} в Redis с TTL {GROUP_MEMBERS_CACHE_TTL} сек")
+                        logger.info(f"Сохранено количество участников группы {group_id_int} в Redis с TTL {GROUP_MEMBERS_CACHE_TTL} сек")
                     except Exception as e:
                         logger.error(f"Ошибка при сохранении в Redis: {e}")
                 
                 return members_count
             else:
-                logger.warning(f"Не удалось получить количество участников группы {group_id}")
+                logger.warning(f"Не удалось получить количество участников группы {group_id_int}")
                 return 10000  # Возвращаем значение по умолчанию
         except Exception as e:
-            logger.error(f"Ошибка при получении количества участников группы {group_id}: {e}")
+            logger.error(f"Ошибка при получении количества участников группы {group_id_int}: {e}")
             return 10000  # Возвращаем значение по умолчанию в случае ошибки
 
 async def find_vk_groups(vk, keywords, min_members=10000, max_count=20):
@@ -935,3 +948,109 @@ async def get_media_info(attachment):
     except Exception as e:
         logger.error(f"Ошибка при обработке вложения VK: {e}")
         return None
+
+async def find_vk_groups_parallel(vk, keywords, min_members=10000, max_count=20, api_key=None):
+    """
+    Параллельный поиск групп ВКонтакте с использованием нескольких аккаунтов.
+    
+    Args:
+        vk (VKClient): Основной клиент VK
+        keywords (list): Список ключевых слов для поиска
+        min_members (int): Минимальное количество участников в группе
+        max_count (int): Максимальное количество групп для возврата
+        api_key (str): API ключ пользователя для доступа к пулу аккаунтов
+        
+    Returns:
+        list: Отсортированный список уникальных групп, отвечающих критериям
+    """
+    # Преобразуем ключевые слова в список, если передана строка
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    
+    logger.info(f"Начинаем параллельный поиск групп по ключевым словам: {keywords}")
+    
+    # Получаем активные аккаунты VK, если передан API ключ
+    if api_key:
+        try:
+            from user_manager import get_active_accounts
+            active_accounts = await get_active_accounts(api_key, "vk")
+            
+            if active_accounts and len(active_accounts) > 1:
+                logger.info(f"Распределение запросов между {len(active_accounts)} активными аккаунтами VK")
+                
+                # Распределяем ключевые слова между аккаунтами
+                kw_per_account = len(keywords) // len(active_accounts) + 1
+                account_keywords = [keywords[i:i + kw_per_account] for i in range(0, len(keywords), kw_per_account)]
+                
+                # Создаем клиенты и задачи для параллельного поиска
+                tasks = []
+                for i, acc in enumerate(active_accounts):
+                    if i >= len(account_keywords) or not account_keywords[i]:
+                        continue
+                        
+                    kw_list = account_keywords[i]
+                    acc_token = acc.get("access_token")
+                    acc_id = acc.get("id")
+                    
+                    if acc_token:
+                        # Создаем отдельный клиент для каждого аккаунта
+                        acc_client = VKClient(acc_token, None, acc_id)
+                        
+                        # Создаем задачу для поиска групп
+                        task = find_vk_groups(acc_client, kw_list, min_members, max_count)
+                        tasks.append(task)
+                        logger.info(f"Создана задача для VK аккаунта {acc_id} с ключевыми словами: {kw_list}")
+                
+                # Запускаем все задачи параллельно
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Объединяем результаты
+                    all_groups = []
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logger.error(f"Ошибка при поиске групп: {result}")
+                        elif isinstance(result, list):
+                            all_groups.extend(result)
+                    
+                    # Делаем группы уникальными по ID
+                    unique_groups = {}
+                    for group in all_groups:
+                        group_id = group.get("id")
+                        if group_id and group_id not in unique_groups:
+                            unique_groups[group_id] = group
+                    
+                    # Сортируем по количеству участников
+                    sorted_groups = sorted(unique_groups.values(), key=lambda x: x.get("members", 0), reverse=True)
+                    
+                    # Возвращаем только max_count групп
+                    result = sorted_groups[:max_count]
+                    logger.info(f"Параллельный поиск групп: найдено {len(result)} групп")
+                    return result
+            else:
+                logger.info(f"Использование одного аккаунта для поиска: найдено {len(active_accounts) if active_accounts else 0} аккаунтов")
+        except Exception as e:
+            logger.error(f"Ошибка при параллельном поиске групп: {e}")
+            # Продолжаем выполнение с одним клиентом
+    
+    # Если не смогли использовать параллельный поиск, 
+    # используем стандартный метод с одним клиентом
+    logger.info("Использование стандартного метода поиска с одним аккаунтом")
+    return await find_vk_groups(vk, keywords, min_members, max_count)
+
+async def find_groups_by_keywords(vk, keywords, min_members=10000, max_count=20, api_key=None):
+    """
+    Обертка над find_vk_groups_parallel для совместимости с вызовом в app.py
+    
+    Args:
+        vk (VKClient): Клиент VK
+        keywords (list): Список ключевых слов для поиска
+        min_members (int): Минимальное количество участников в группе
+        max_count (int): Максимальное количество групп для возврата
+        api_key (str): API ключ пользователя для доступа к пулу аккаунтов
+        
+    Returns:
+        list: Отсортированный список уникальных групп, отвечающих критериям
+    """
+    logger.info(f"Вызов find_groups_by_keywords для поиска групп ВК по ключевым словам: {keywords}")
+    return await find_vk_groups_parallel(vk, keywords, min_members, max_count, api_key)

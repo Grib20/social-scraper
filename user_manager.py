@@ -8,6 +8,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
+import asyncio
 
 load_dotenv()
 
@@ -339,7 +340,7 @@ def delete_vk_account(api_key: str, account_id: str) -> bool:
     conn.close()
     return deleted
 
-def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
+async def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
     """Получает список активных аккаунтов для платформы."""
     logger.info(f"Выполняется get_active_accounts для платформы {platform} и api_key {api_key}")
     conn = get_db_connection()
@@ -423,7 +424,20 @@ def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
 
 def get_next_available_account(api_key: str, platform: str) -> Optional[Dict]:
     """Получает следующий доступный аккаунт для использования."""
-    active_accounts = get_active_accounts(api_key, platform)
+    active_accounts = asyncio.run(get_active_accounts(api_key, platform))
+    if not active_accounts:
+        return None
+    
+    if len(active_accounts) == 1:
+        account = active_accounts[0]
+        account["degraded_mode"] = True
+        return account
+    
+    return active_accounts[0]
+
+async def get_next_available_account_async(api_key: str, platform: str) -> Optional[Dict]:
+    """Асинхронная версия получения следующего доступного аккаунта."""
+    active_accounts = await get_active_accounts(api_key, platform)
     if not active_accounts:
         return None
     
@@ -539,7 +553,7 @@ def get_users_dict() -> Dict:
     conn.close()
     return users
 
-def verify_api_key(api_key: str) -> bool:
+async def verify_api_key(api_key: str) -> bool:
     """Проверяет, существует ли пользователь с указанным API ключом."""
     user = get_user(api_key)
     if not user:
