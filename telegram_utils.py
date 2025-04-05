@@ -438,31 +438,80 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
                            min_comments: Optional[int] = None, min_forwards: Optional[int] = None, 
                            api_key: Optional[str] = None) -> List[Dict]:
     """Получает трендовые посты из каналов с параллельной обработкой медиа."""
-    now = int(time.time())
-    start_time = now - (days_back * 24 * 60 * 60)
+    try:
     all_posts = []
-    
-    # Нормализуем API ключ здесь, перед использованием
-    if api_key and isinstance(api_key, (list, dict)):
-        if isinstance(api_key, dict) and 'user_api_key' in api_key:
-            user_api_key = api_key['user_api_key']
-        elif isinstance(api_key, list) and len(api_key) > 0 and isinstance(api_key[0], dict) and 'user_api_key' in api_key[0]:
-            user_api_key = api_key[0]['user_api_key']
+        # Чтобы была совместимость с API, нужно учесть, что channel_ids могут приходить разных типов
+        flat_channel_ids = []
+        for ch_id in channel_ids:
+            if isinstance(ch_id, list) or isinstance(ch_id, tuple):
+                flat_channel_ids.extend(list(ch_id))
         else:
-            logger.warning(f"Не удалось извлечь API ключ из: {api_key}. Будет использован последовательный режим.")
-            user_api_key = None
+                flat_channel_ids.append(ch_id)
+        
+        cutoff_date = datetime.now().replace(tzinfo=None) - timedelta(days=days_back)
+        
+        # Используем ротацию аккаунтов, если передан api_key
+        if api_key:
+            from app import telegram_pool
+            active_accounts = await telegram_pool.get_active_clients(api_key)
+            if active_accounts and len(active_accounts) > 1:
+                logger.info(f"Распределение запросов между {len(active_accounts)} активными аккаунтами Telegram для trending-posts")
+                
+                # Распределяем каналы между аккаунтами
+                channels_per_account = len(flat_channel_ids) // len(active_accounts) + 1
+                account_channels = [flat_channel_ids[i:i + channels_per_account] for i in range(0, len(flat_channel_ids), channels_per_account)]
+                
+                # Создаем задачи для каждого аккаунта
+                tasks = []
+                for account_data, channels in zip(active_accounts, account_channels):
+                    if isinstance(account_data, dict):
+                        account_client = account_data.get('client')
+                        account_id = account_data.get('id')
+                    elif isinstance(account_data, (list, tuple)) and len(account_data) >= 2:
+                        account_client = account_data[0]
+                        account_id = account_data[1]
     else:
-        user_api_key = api_key
-    
-    if isinstance(channel_ids, list) and channel_ids and isinstance(channel_ids[0], list):
-        flat_channel_ids = [item for sublist in channel_ids for item in sublist]
-    else:
-        flat_channel_ids = channel_ids
-    
-    logger.info(f"Сбор трендовых постов: channel_ids={flat_channel_ids}, days_back={days_back}, "
-                f"posts_per_channel={posts_per_channel}, min_views={min_views}, "
-                f"min_reactions={min_reactions}, min_comments={min_comments}, min_forwards={min_forwards}")
-    
+                        logger.warning(f"Некорректный формат данных аккаунта: {account_data}")
+                        continue
+                    
+                    if account_client:
+                        # Подключаем клиента, если это необходимо
+                        if hasattr(telegram_pool, 'connect_client'):
+                            await telegram_pool.connect_client(account_id)
+                        
+                        # Добавляем задачу для текущего аккаунта и его каналы
+                        task = asyncio.create_task(
+                            _process_channels_for_trending(
+                                account_client, 
+                                channels, 
+                                cutoff_date,
+                                posts_per_channel, 
+                                min_views, 
+                                min_reactions, 
+                                min_comments, 
+                                min_forwards,
+                                api_key
+                            )
+                        )
+                        tasks.append(task)
+                        logger.info(f"Создана задача для аккаунта {account_id} с {len(channels)} каналами")
+                
+                # Ждем завершения всех задач
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Обрабатываем результаты
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logger.error(f"Ошибка при обработке каналов: {result}")
+                        elif isinstance(result, list):
+                            all_posts.extend(result)
+                    
+                    # Сортируем по trend_score
+                    all_posts.sort(key=lambda x: x.get('trend_score', 0), reverse=True)
+                    return all_posts
+        
+        # Стандартный метод с одним аккаунтом
     wrapper = TelegramClientWrapper(client, client.session.filename)
     
     for channel_id in flat_channel_ids:
@@ -520,132 +569,227 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
                 
                 # Шаг 1: Получаем и фильтруем посты
                 filtered_posts = []
-                async for msg in client.iter_messages(chat_entity, limit=100):
-                    if msg.date.timestamp() < start_time:
+                    
+                    # Запрашиваем messages через универсальную обертку
+                    # Передаем метод клиента client.get_messages
+                posts_result = await wrapper._make_request(client.get_messages, 
+                                                          input_peer, 
+                                                          limit=100)  # Получаем больше постов для фильтрации
+                    
+                    # Фильтруем посты по дате и критериям
+                    for post in posts_result:
+                        # Проверяем, что пост содержит хоть какой-то текст
+                        if not post.message:
                         continue
                     
-                    views = msg.views or 0
-                    reactions = len(msg.reactions.results) if msg.reactions else 0
-                    comments = msg.replies.replies if msg.replies else 0
-                    forwards = msg.forwards or 0
-                    
-                    if (min_views and views < min_views) or \
-                       (min_reactions and reactions < min_reactions) or \
-                       (min_comments and comments < min_comments) or \
-                       (min_forwards and forwards < min_forwards):
+                        # Фильтр по просмотрам
+                        views = getattr(post, 'views', 0)
+                        if min_views is not None and views < min_views:
+                            continue
+                            
+                        # Фильтр по дате
+                        post_date = post.date.replace(tzinfo=None)
+                        if post_date < cutoff_date:
                         continue
                     
-                    raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
-                    trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0 
-                    
-                    channel_id_str = str(chat_entity.id)
-                    post = {
-                        'text': msg.message or '',
+                        # Фильтры по дополнительным параметрам
+                        reactions = len(post.reactions.results) if post.reactions else 0
+                        if min_reactions is not None and reactions < min_reactions:
+                            continue
+                            
+                        comments = post.replies.replies if post.replies else 0
+                        if min_comments is not None and comments < min_comments:
+                            continue
+                            
+                        forwards = post.forwards or 0
+                        if min_forwards is not None and forwards < min_forwards:
+                            continue
+                        
+                        # Рассчитываем engagement score
+                        post_data = {
+                            'id': post.id,
+                            'channel_id': str(channel_id),
+                            'channel_title': channel_title,
+                            'channel_username': channel_username,
+                            'subscribers': subscribers,
+                            'text': post.message,
                         'views': views,
                         'reactions': reactions,
                         'comments': comments,
                         'forwards': forwards,
-                        'date': msg.date.isoformat(),
-                        'post_id': msg.id,
-                        'channel_id': channel_id_str,
-                        'channel_title': channel_title,
-                        'url': f'https://t.me/{channel_username}/{msg.id}' if channel_username else f'https://t.me/c/{abs(chat_entity.id)}/{msg.id}',
-                        'media': None,
-                        'subscribers': subscribers,
-                        'trend_score': trend_score,
-                        'raw_engagement_score': raw_engagement_score,
-                        '_msg': msg,
-                        '_grouped_id': msg.grouped_id if hasattr(msg, 'grouped_id') else None
-                    }
-                    
-                    filtered_posts.append(post)
-                
-                # Шаг 2: Сортируем и ограничиваем количество постов
-                top_posts = sorted(filtered_posts, key=lambda x: x['trend_score'], reverse=True)[:posts_per_channel]
-                
-                # Шаг 3: Группировка постов по альбомам
-                albums = {}
-                individual_posts = []
-                
-                for post in top_posts:
-                    grouped_id = post['_grouped_id']
-                    if grouped_id:
-                        if grouped_id not in albums:
-                            albums[grouped_id] = []
-                        albums[grouped_id].append(post)
-                    else:
-                        individual_posts.append(post)
-                
-                # Шаг 4: Подготавливаем медиа для параллельного скачивания
-                media_tasks = []
-                
-                # Подготавливаем индивидуальные посты
-                for post in individual_posts:
-                    media_tasks.append({
-                        '_msg': post['_msg'],
-                        '_album_messages': None,
-                        'post_id': post['post_id'],
-                        'post_ref': post  # ссылка на пост для обновления
-                    })
-                
-                # Подготавливаем альбомы
-                for album_id, album_posts in albums.items():
-                    album_posts.sort(key=lambda x: x['post_id'], reverse=True)
-                    main_post = album_posts[0]
-                    all_album_msgs = await get_album_messages(client, chat_entity, main_post['_msg'])
-                    
-                    media_tasks.append({
-                        '_msg': main_post['_msg'],
-                        '_album_messages': all_album_msgs,
-                        'post_id': main_post['post_id'],
-                        'post_ref': main_post  # ссылка на пост для обновления
-                    })
-                
-                # Шаг 5: Параллельное скачивание медиа
-                if media_tasks:
-                    logger.info(f"Запуск параллельного скачивания {len(media_tasks)} медиа для канала {channel_id}")
-                    
-                    # Импортируем здесь, чтобы избежать циклических импортов
-                    from media_utils import download_media_parallel
-                    
-                    # Запускаем параллельное скачивание медиа
-                    media_results = await download_media_parallel(media_tasks, user_api_key, max_workers=5)
-                    
-                    # Сопоставляем результаты с постами
-                    for i, task in enumerate(media_tasks):
-                        post = task['post_ref']
-                        if i < len(media_results) and media_results[i]:
-                            post['media'] = media_results[i]
-                        else:
-                            post['media'] = None  # Если скачивание не удалось
+                            'date': post.date.isoformat(),
+                            'media': []
+                        }
                         
-                        # Удаляем временные поля
-                        del post['_msg']
-                        del post['_grouped_id']
+                        # Формируем URL в зависимости от типа ID канала
+                        if channel_username:
+                            post_data['url'] = f"https://t.me/{channel_username}/{post.id}"
+                        else: 
+                            channel_id_for_url = abs(getattr(chat_entity, 'id', 0))
+                            post_data['url'] = f"https://t.me/c/{channel_id_for_url}/{post.id}"
                         
-                        # Добавляем пост в итоговый список
-                        all_posts.append(post)
-                else:
-                    # Если нет медиа для скачивания, просто добавляем посты
-                    for post in individual_posts + [albums[album_id][0] for album_id in albums]:
-                        del post['_msg']
-                        del post['_grouped_id']
-                        all_posts.append(post)
-                
-                logger.info(f"Найдено {len(individual_posts) + len(albums)} постов в канале {channel_id}")
-                
-            await asyncio.sleep(1)
-            
-        except FloodWaitError as e:
-            logger.warning(f"Flood wait на {e.seconds} секунд при сборе трендов для {channel_id}")
-            await asyncio.sleep(e.seconds)
+                        # Обрабатываем медиа, если есть
+                        if post.media:
+                            # Используем get_media_info из модуля media_utils вместо process_media_file
+                            from media_utils import get_media_info
+                            # Для вызова get_media_info нужно создать информацию о сообщении в формате API
+                            media_info = await get_media_info(client, post)
+                            if media_info and 'media_urls' in media_info:
+                                post_data['media'] = media_info.get('media_urls', [])
+                                
+                        # Вычисляем общий score для тренда
+                        raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
+                        trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0
+                        
+                        post_data['trend_score'] = trend_score
+                        filtered_posts.append(post_data)
+                    
+                    # Берем только нужное количество лучших постов из этого канала
+                    top_posts = sorted(filtered_posts, key=lambda x: x.get('trend_score', 0), reverse=True)[:posts_per_channel]
+                    all_posts.extend(top_posts)
+                    
+            except Exception as e:
+                logger.error(f"Ошибка при обработке канала {channel_id}: {e}")
+                continue
+        
+        # Сортируем все посты по трендовости
+        all_posts.sort(key=lambda x: x.get('trend_score', 0), reverse=True)
+        return all_posts
+    except Exception as e:
+        logger.error(f"Общая ошибка в get_trending_posts: {e}")
+        return []
+
+async def _process_channels_for_trending(client, channel_ids, cutoff_date, posts_per_channel, min_views, min_reactions, min_comments, min_forwards, api_key=None):
+    """Вспомогательная функция для параллельной обработки каналов и получения трендовых постов."""
+    wrapper = TelegramClientWrapper(client, client.session.filename)
+    channel_posts = []
+    
+    for channel_id in channel_ids:
+        if not isinstance(channel_id, str) and not isinstance(channel_id, int):
+            logger.warning(f"Пропуск неверного формата channel_id: {channel_id}, тип {type(channel_id)}")
             continue
-        except Exception as e:
-            logger.error(f"Ошибка при сборе трендов для {channel_id}: {e}", exc_info=True)
+        
+        try:
+            # 1. Получаем input_peer
+            try:
+                input_peer = await wrapper._make_request(client.get_input_entity, channel_id)
+            except ValueError as e:
+                logger.error(f"Не удалось найти сущность для {channel_id}: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Ошибка при получении input_entity для {channel_id}: {e}")
+                continue
+            
+            # 2. Запрашиваем полную информацию о канале
+            full_chat_result = await wrapper._make_group_request(functions.channels.GetFullChannelRequest, input_peer)
+            
+            # 3. Извлекаем сущность чата
+            chat_entity = None
+            for chat_res in full_chat_result.chats:
+                if hasattr(input_peer, 'channel_id') and str(chat_res.id) == str(input_peer.channel_id):
+                     chat_entity = chat_res
+                     break
+                elif hasattr(input_peer, 'user_id') and str(chat_res.id) == str(input_peer.user_id):
+                     chat_entity = chat_res
+                     break
+                elif hasattr(input_peer, 'chat_id') and str(chat_res.id) == str(input_peer.chat_id):
+                     chat_entity = chat_res
+                     break
+            
+            if not chat_entity:
+                 logger.error(f"Не удалось найти сущность чата для {channel_id} в результате GetFullChannelRequest")
+                 continue 
+            
+            # Получаем данные канала
+            channel_username = getattr(chat_entity, 'username', None)
+            channel_title = getattr(chat_entity, 'title', 'Unknown Title')
+            
+            # Получаем количество подписчиков
+            subscribers = channel_members_cache.get(str(channel_id), 0) 
+            if not subscribers and hasattr(full_chat_result, 'full_chat') and hasattr(full_chat_result.full_chat, 'participants_count'):
+                subscribers = full_chat_result.full_chat.participants_count
+            
+            subscribers_for_calc = max(subscribers, 10)
+            
+            # Получаем посты канала
+            filtered_posts = []
+            posts_result = await wrapper._make_request(client.get_messages, input_peer, limit=100)
+            
+            # Фильтруем посты
+            for post in posts_result:
+                if not post.message:
+            continue
+                    
+                # Фильтр по просмотрам
+                views = getattr(post, 'views', 0)
+                if min_views is not None and views < min_views:
             continue
     
-    logger.info(f"Возвращено {len(all_posts)} трендовых постов")
-    return sorted(all_posts, key=lambda x: x['trend_score'], reverse=True)
+                # Фильтр по дате
+                post_date = post.date.replace(tzinfo=None)
+                if post_date < cutoff_date:
+                    continue
+                    
+                # Фильтры по дополнительным параметрам
+                reactions = len(post.reactions.results) if post.reactions else 0
+                if min_reactions is not None and reactions < min_reactions:
+                    continue
+                    
+                comments = post.replies.replies if post.replies else 0
+                if min_comments is not None and comments < min_comments:
+                    continue
+                    
+                forwards = post.forwards or 0
+                if min_forwards is not None and forwards < min_forwards:
+                    continue
+                
+                # Создаем данные поста
+                post_data = {
+                    'id': post.id,
+                    'channel_id': str(channel_id),
+                    'channel_title': channel_title,
+                    'channel_username': channel_username,
+                    'subscribers': subscribers,
+                    'text': post.message,
+                    'views': views,
+                    'reactions': reactions,
+                    'comments': comments,
+                    'forwards': forwards,
+                    'date': post.date.isoformat(),
+                    'media': []
+                }
+                
+                # Формируем URL
+                if channel_username:
+                    post_data['url'] = f"https://t.me/{channel_username}/{post.id}"
+                else: 
+                    channel_id_for_url = abs(getattr(chat_entity, 'id', 0))
+                    post_data['url'] = f"https://t.me/c/{channel_id_for_url}/{post.id}"
+                
+                # Обрабатываем медиа
+                if post.media:
+                    # Используем get_media_info из модуля media_utils вместо process_media_file
+                    from media_utils import get_media_info
+                    # Для вызова get_media_info нужно создать информацию о сообщении в формате API
+                    media_info = await get_media_info(client, post)
+                    if media_info and 'media_urls' in media_info:
+                        post_data['media'] = media_info.get('media_urls', [])
+                        
+                # Вычисляем тренд
+                raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
+                trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0
+                
+                post_data['trend_score'] = trend_score
+                filtered_posts.append(post_data)
+            
+            # Берем топовые посты канала
+            top_posts = sorted(filtered_posts, key=lambda x: x.get('trend_score', 0), reverse=True)[:posts_per_channel]
+            channel_posts.extend(top_posts)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке канала {channel_id} для трендов: {e}")
+    
+    return channel_posts
 
 async def get_posts_in_channels(client: TelegramClient, channel_ids: List[int], keywords: Optional[List[str]] = None, count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
     """Получает посты из каналов по ключевым словам."""
@@ -721,11 +865,72 @@ async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str
     
     return sorted(posts, key=lambda x: x["views"], reverse=True)[:count]
 
-async def get_posts_by_period(client, group_ids: List[Union[int, str]], max_posts: int = 100, days_back: int = 7, min_views: int = 0) -> List[Dict]:
+async def get_posts_by_period(client, group_ids: List[Union[int, str]], max_posts: int = 100, days_back: int = 7, min_views: int = 0, api_key: Optional[str] = None) -> List[Dict]:
     """Получение постов из групп за указанный период."""
     try:
         all_posts = []
         cutoff_date = datetime.now().replace(tzinfo=None) - timedelta(days=days_back)
+        
+        # Получаем все активные аккаунты, если передан api_key
+        if api_key:
+            from app import telegram_pool
+            active_accounts = await telegram_pool.get_active_clients(api_key)
+            if active_accounts and len(active_accounts) > 1:
+                logger.info(f"Распределение запросов между {len(active_accounts)} активными аккаунтами Telegram")
+                
+                # Распределяем группы между аккаунтами
+                groups_per_account = len(group_ids) // len(active_accounts) + 1
+                account_groups = [group_ids[i:i + groups_per_account] for i in range(0, len(group_ids), groups_per_account)]
+                
+                # Создаем задачи для каждого аккаунта
+                tasks = []
+                for account_data, groups in zip(active_accounts, account_groups):
+                    if isinstance(account_data, dict):
+                        account_client = account_data.get('client')
+                        account_id = account_data.get('id')
+                    elif isinstance(account_data, (list, tuple)) and len(account_data) >= 2:
+                        account_client = account_data[0]
+                        account_id = account_data[1]
+                    else:
+                        logger.warning(f"Некорректный формат данных аккаунта: {account_data}")
+                        continue
+                    
+                    if account_client:
+                        # Подключаем клиента, если это необходимо
+                        if hasattr(telegram_pool, 'connect_client'):
+                            await telegram_pool.connect_client(account_id)
+                        
+                        # Добавляем задачу для текущего аккаунта и его группы
+                        task = asyncio.create_task(
+                            _process_groups_for_posts(
+                                account_client, 
+                                groups, 
+                                max_posts // len(active_accounts), 
+                                cutoff_date, 
+                                min_views
+                            )
+                        )
+                        tasks.append(task)
+                        logger.info(f"Создана задача для аккаунта {account_id} с {len(groups)} группами")
+                
+                # Ждем завершения всех задач
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Обрабатываем результаты
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logger.error(f"Ошибка при обработке групп: {result}")
+                        elif isinstance(result, list):
+                            all_posts.extend(result)
+                    
+                    # Сортируем посты по дате (новые сверху)
+                    all_posts.sort(key=lambda x: x["date"], reverse=True)
+                    
+                    # Ограничиваем количество постов
+                    return all_posts[:max_posts]
+        
+        # Если не используем ротацию аккаунтов или произошла ошибка, используем стандартный метод
         wrapper = TelegramClientWrapper(client, client.session.filename)
         
         # Получаем посты из каждой группы
@@ -821,6 +1026,94 @@ async def get_posts_by_period(client, group_ids: List[Union[int, str]], max_post
     except Exception as e:
         logger.error(f"Ошибка при получении постов: {e}")
         return []
+
+async def _process_groups_for_posts(client, group_ids, max_posts, cutoff_date, min_views):
+    """Вспомогательная функция для параллельной обработки групп."""
+    wrapper = TelegramClientWrapper(client, client.session.filename)
+    group_posts = []
+    
+    for group_id in group_ids:
+        try:
+            # Получаем информацию о канале
+            channel_entity = await wrapper._make_request(wrapper.client.get_entity, group_id)
+            if not isinstance(channel_entity, (Channel, User)):
+                logger.warning(f"Не удалось получить информацию о канале {group_id}")
+                continue
+            
+            # Получаем полную информацию о канале для количества подписчиков
+            try:
+                full_chat = await wrapper._make_group_request(GetFullChannelRequest, channel_entity)
+                subscribers = full_chat.full_chat.participants_count if hasattr(full_chat, 'full_chat') and hasattr(full_chat.full_chat, 'participants_count') else 0
+            except Exception as e:
+                logger.error(f"Ошибка при получении информации о подписчиках канала {group_id}: {e}")
+                subscribers = 0
+            
+            # Обеспечим, чтобы подписчиков было хотя бы 10 для логарифма
+            subscribers_for_calc = max(subscribers, 10)
+            
+            # Получаем посты из канала
+            channel_posts = await wrapper._make_request(wrapper.client.get_messages,
+                channel_entity,
+                limit=max_posts
+            )
+            
+            for post in channel_posts:
+                if not post.message:
+                    continue
+                    
+                post_date = post.date.replace(tzinfo=None)
+                if post_date < cutoff_date:
+                    continue
+                    
+                views = getattr(post, 'views', 0)
+                if views < min_views:
+                    continue
+                
+                # Получаем дополнительные метрики
+                reactions = len(post.reactions.results) if post.reactions else 0
+                comments = post.replies.replies if post.replies else 0
+                forwards = post.forwards or 0
+                
+                # Рассчитываем показатели вовлеченности
+                raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
+                trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0
+                
+                # Формируем URL в зависимости от типа ID канала
+                channel_username = getattr(channel_entity, 'username', None)
+                if channel_username:
+                    url = f"https://t.me/{channel_username}/{post.id}"
+                else:
+                    url = f"https://t.me/c/{abs(channel_entity.id)}/{post.id}"
+                
+                post_data = {
+                    "id": post.id,
+                    "date": post_date.isoformat(),
+                    "views": views,
+                    "reactions": reactions,
+                    "comments": comments,
+                    "forwards": forwards,
+                    "text": post.message,
+                    "group_id": group_id,
+                    "group_title": channel_entity.title,
+                    "group_username": channel_username,
+                    "url": url,
+                    "media": [],
+                    "subscribers": subscribers,
+                    "trend_score": trend_score,
+                    "raw_engagement_score": raw_engagement_score
+                }
+                
+                # Обрабатываем медиафайлы
+                if post.media:
+                    media_data = await process_media_file(post.media)
+                    if media_data:
+                        post_data["media"].append(media_data)
+                
+                group_posts.append(post_data)
+        except Exception as e:
+            logger.error(f"Ошибка при обработке группы {group_id}: {e}")
+    
+    return group_posts
 
 async def process_media_file(media):
     """Обрабатывает медиафайл и возвращает информацию о нем."""

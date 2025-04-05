@@ -1027,7 +1027,7 @@ async def get_posts_by_period(request: Request, data: dict):
     if platform == 'telegram':
         client = await auth_middleware(request, 'telegram')
         from telegram_utils import get_posts_by_period as get_telegram_posts_by_period
-        return await get_telegram_posts_by_period(client, group_ids, max_posts, days_back, min_views)
+        return await get_telegram_posts_by_period(client, group_ids, max_posts, days_back, min_views, api_key=api_key)
     elif platform == 'vk':
         vk = await auth_middleware(request, 'vk')
         # Устанавливаем API ключ для клиента VK
