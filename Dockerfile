@@ -37,10 +37,13 @@ RUN apt-get update && apt-get install -y \
     libmagic1 \
     ffmpeg \
     curl \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Создаем директории для данных
-RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets
+# Создаем директории для данных и базу данных
+RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets \
+    && touch /app/users.db \
+    && chmod 666 /app/users.db
 
 # Создаем непривилегированного пользователя
 RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
@@ -48,9 +51,8 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 # Копируем файлы приложения
 COPY . .
 
-# Создаем симлинки для лог-файлов в директории logs
-RUN ln -sf /app/logs/scraper.log /app/scraper.log && \
-    ln -sf /app/logs/media_utils.log /app/media_utils.log && \
+# Даем права на запись во все необходимые директории и файлы
+RUN chmod 666 /app/users.db && \
     chown -R appuser:appuser /app
 
 # Переключаемся на непривилегированного пользователя
@@ -60,6 +62,7 @@ USER appuser
 ENV PYTHONUNBUFFERED=1
 ENV PORT=3030
 ENV LOG_DIR=/app/logs
+ENV DB_PATH=/app/users.db
 
 # Открываем порт
 EXPOSE 3030

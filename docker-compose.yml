@@ -12,7 +12,7 @@ services:
       - media_downloads:/app/media_downloads
       - logs:/app/logs
       - data:/app/data
-      - ./users.db:/app/users.db
+      - database:/app/users.db
       - ./secrets:/app/secrets
     env_file:
       - .env
@@ -21,6 +21,7 @@ services:
       - PORT=3030
       - REDIS_URL=redis://redis:6379/0
       - LOG_DIR=/app/logs
+      - DB_PATH=/app/users.db
     depends_on:
       redis:
         condition: service_healthy
@@ -73,6 +74,8 @@ volumes:
   logs:
     driver: local
   data:
+    driver: local
+  database:
     driver: local
 
 networks:
