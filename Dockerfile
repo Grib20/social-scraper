@@ -40,10 +40,9 @@ RUN apt-get update && apt-get install -y \
     sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Создаем директории для данных и базу данных
-RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets \
-    && touch /app/users.db \
-    && chmod 666 /app/users.db
+# Создаем директории для данных и директорию для базы данных
+RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets /app/database \
+    && chmod -R 777 /app/database
 
 # Создаем непривилегированного пользователя
 RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
@@ -52,8 +51,7 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 COPY . .
 
 # Даем права на запись во все необходимые директории и файлы
-RUN chmod 666 /app/users.db && \
-    chown -R appuser:appuser /app
+RUN chown -R appuser:appuser /app
 
 # Переключаемся на непривилегированного пользователя
 USER appuser
@@ -62,7 +60,7 @@ USER appuser
 ENV PYTHONUNBUFFERED=1
 ENV PORT=3030
 ENV LOG_DIR=/app/logs
-ENV DB_PATH=/app/users.db
+ENV DB_PATH=/app/database/users.db
 
 # Открываем порт
 EXPOSE 3030
