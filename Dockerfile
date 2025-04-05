@@ -48,8 +48,9 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 # Копируем файлы приложения
 COPY . .
 
-# Даем права на запись в нужные директории
-RUN chown -R appuser:appuser /app/telegram_sessions /app/logs /app/data /app/secrets
+# Даем права на запись во все необходимые директории и файлы
+RUN touch /app/scraper.log /app/media_utils.log && \
+    chown -R appuser:appuser /app
 
 # Переключаемся на непривилегированного пользователя
 USER appuser

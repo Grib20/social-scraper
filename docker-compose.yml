@@ -14,6 +14,8 @@ services:
       - data:/app/data
       - ./users.db:/app/users.db
       - ./secrets:/app/secrets
+      - ./scraper.log:/app/scraper.log
+      - ./media_utils.log:/app/media_utils.log
     env_file:
       - .env
     environment:
