@@ -1,6 +1,7 @@
 # Git
 .git
 .gitignore
+.github/
 
 # Python
 __pycache__/
@@ -27,26 +28,60 @@ wheels/
 
 # Виртуальное окружение
 venv/
+.venv/
 ENV/
+env/
+virtualenv/
 
-# IDE
+# IDE и редакторы
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
+.project
+.pydevproject
+.settings/
 
 # Логи и данные
 logs/
 *.log
 data/
 telegram_sessions/
+media_downloads/
+*.db
+*.pkl
+*.sqlite
+*.sqlite3
 
 # Docker
-Dockerfile
-docker-compose.yml
 .dockerignore
+
+# Тесты
+tests/
+test/
+*_test.py
+*_tests.py
+
+# Документация
+docs/
+*.md
+LICENSE
 
 # Другие
 .DS_Store
 .env
-.env.* 
+.env.*
+!.env.example
+*.bak
+*.tmp
+*.pid
+*.pyc
+*$py.class
+.coverage
+
+# Секреты и ключи
+secrets/
+*.pem
+*.key
+*.crt 

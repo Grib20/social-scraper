@@ -3,13 +3,17 @@ version: '3.8'
 services:
   app:
     build: .
+    container_name: social-scraper-app
+    restart: unless-stopped
     ports:
-      - "3030:3030"
+      - "${PORT:-3030}:3030"
     volumes:
-      - ./telegram_sessions:/app/telegram_sessions
-      - ./logs:/app/logs
-      - ./data:/app/data
+      - telegram_sessions:/app/telegram_sessions
+      - media_downloads:/app/media_downloads
+      - logs:/app/logs
+      - data:/app/data
       - ./users.db:/app/users.db
+      - ./secrets:/app/secrets
     env_file:
       - .env
     environment:
@@ -17,8 +21,8 @@ services:
       - PORT=3030
       - REDIS_URL=redis://redis:6379/0
     depends_on:
-      - redis
-    restart: unless-stopped
+      redis:
+        condition: service_healthy
     networks:
       - app-network
     healthcheck:
@@ -27,20 +31,24 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    secrets:
-      - aws_access_key
-      - aws_secret_key
-      - encryption_key
-      - admin_key
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
 
   redis:
     image: redis:7-alpine
+    container_name: social-scraper-redis
+    restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
-    restart: unless-stopped
     networks:
       - app-network
     healthcheck:
@@ -48,9 +56,22 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
 
 volumes:
   redis_data:
+    driver: local
+  telegram_sessions:
+    driver: local
+  media_downloads:
+    driver: local
+  logs:
+    driver: local
+  data:
     driver: local
 
 networks:

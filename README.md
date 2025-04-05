@@ -196,27 +196,123 @@ http://localhost:3030/admin
 - Чувствительные данные (токены, ключи) шифруются перед сохранением
 - Поддержка прокси для обхода блокировок
 
+## Развертывание с Docker
+
+Для простого и быстрого развертывания приложения вы можете использовать Docker и docker-compose.
+
+### Подготовка к развертыванию
+
+1. Клонируйте репозиторий:
+```bash
+git clone https://github.com/your-username/social-scraper.git
+cd social-scraper
+```
+
+2. Создайте файл `.env` на основе `.env.example`:
+```bash
+cp .env.example .env
+```
+
+3. Отредактируйте `.env` файл, указав необходимые значения переменных окружения:
+```
+# Базовые настройки
+PORT=3030
+BASE_URL=https://ваш-домен.com
+ADMIN_KEY=безопасный-ключ-администратора
+
+# Ключ для шифрования данных (сгенерируйте командой ниже)
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENCRYPTION_KEY=ваш-ключ-шифрования
+
+# Настройки S3
+AWS_ACCESS_KEY_ID=ваш-aws-ключ
+AWS_SECRET_ACCESS_KEY=ваш-aws-секрет
+S3_REGION=регион-s3
+S3_BUCKET_NAME=имя-бакета
+S3_ENDPOINT_URL=ссылка-на-s3-хранилище
+S3_LINK_TEMPLATE=шаблон-ссылки-s3
+
+# Redis настройки
+REDIS_URL=redis://redis:6379/0
+```
+
+4. Создайте директорию `secrets` и требуемые файлы с секретами:
+```bash
+mkdir -p secrets
+echo "ваш-aws-ключ" > secrets/aws_access_key.txt
+echo "ваш-aws-секрет" > secrets/aws_secret_key.txt
+echo "ваш-ключ-шифрования" > secrets/encryption_key.txt
+echo "безопасный-ключ-администратора" > secrets/admin_key.txt
+```
+
+### Сборка и запуск с помощью docker-compose
+
+1. Запустите приложение с помощью docker-compose:
+```bash
+docker-compose up -d
+```
+
+2. Проверьте статус контейнеров:
+```bash
+docker-compose ps
+```
+
+3. Проверьте логи приложения:
+```bash
+docker-compose logs -f app
+```
+
+4. Откройте приложение в браузере:
+```
+http://localhost:3030
+```
+или по вашему домену, если он настроен.
+
+### Обновление приложения
+
+1. Получите последние изменения:
+```bash
+git pull
+```
+
+2. Пересоберите и запустите контейнеры:
+```bash
+docker-compose up -d --build
+```
+
+### Создание резервных копий
+
+1. Данные хранятся в томах Docker, а также в файле базы данных `users.db`:
+```bash
+# Копирование базы данных
+cp users.db users.db.backup_$(date +%s)
+```
+
+2. Для резервного копирования томов Docker используйте:
+```bash
+docker run --rm -v social-scraper_telegram_sessions:/source -v $(pwd)/backups:/dest -w /source alpine tar czf /dest/telegram_sessions_$(date +%Y%m%d).tar.gz .
+docker run --rm -v social-scraper_data:/source -v $(pwd)/backups:/dest -w /source alpine tar czf /dest/data_$(date +%Y%m%d).tar.gz .
+docker run --rm -v social-scraper_logs:/source -v $(pwd)/backups:/dest -w /source alpine tar czf /dest/logs_$(date +%Y%m%d).tar.gz .
+docker run --rm -v social-scraper_redis_data:/source -v $(pwd)/backups:/dest -w /source alpine tar czf /dest/redis_data_$(date +%Y%m%d).tar.gz .
+```
+
+### Масштабирование и производительность
+
+Для настройки ресурсов, выделяемых контейнерам, отредактируйте секцию `deploy` в файле `docker-compose.yml`:
+
+```yaml
+deploy:
+  resources:
+    limits:
+      cpus: '1'
+      memory: 2G
+    reservations:
+      cpus: '0.5'
+      memory: 1G
+```
+
 ## Разработка
 
 ### Структура проекта
 
 ```
-social-scraper/
-├── app.py              # Основной файл приложения
-├── admin_panel.py      # Функции админ-панели
-├── telegram_utils.py   # Утилиты для работы с Telegram
-├── vk_utils.py         # Утилиты для работы с VK
-├── user_manager.py     # Управление пользователями
-├── media_utils.py      # Утилиты для работы с медиафайлами
-├── requirements.txt    # Зависимости проекта
-├── .env               # Переменные окружения
-└── README.md          # Документация
-```
-
-### Тестирование
-
-Для тестирования API можно использовать Postman. Коллекция с примерами запросов доступна в файле `social-scraper.postman_collection.json`.
-
-## Лицензия
-
-MIT

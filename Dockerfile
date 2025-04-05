@@ -1,28 +1,46 @@
-# Используем официальный образ Python
-FROM python:3.11-slim
+# Используем многоэтапную сборку
+FROM python:3.11-slim as builder
 
-# Устанавливаем рабочую директорию
-WORKDIR /app
+# Устанавливаем рабочую директорию для сборки
+WORKDIR /build
 
-# Устанавливаем системные зависимости
+# Устанавливаем системные зависимости для сборки
 RUN apt-get update && apt-get install -y \
     gcc \
     python3-dev \
-    libjpeg-dev \
-    zlib1g-dev \
-    libpng-dev \
-    libmagic1 \
-    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем файлы зависимостей
 COPY requirements.txt .
 
-# Устанавливаем зависимости Python
-RUN pip install --no-cache-dir -r requirements.txt
+# Устанавливаем зависимости Python в виртуальное окружение
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Вторая стадия - финальный образ
+FROM python:3.11-slim
+
+# Устанавливаем рабочую директорию
+WORKDIR /app
+
+# Копируем виртуальное окружение из стадии сборки
+COPY --from=builder /venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# Устанавливаем системные зависимости только необходимые для запуска
+RUN apt-get update && apt-get install -y \
+    libjpeg-dev \
+    zlib1g-dev \
+    libpng-dev \
+    libmagic1 \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Создаем директории для данных
-RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data
+RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets
 
 # Создаем непривилегированного пользователя
 RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
@@ -31,7 +49,7 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 COPY . .
 
 # Даем права на запись в нужные директории
-RUN chown -R appuser:appuser /app/telegram_sessions /app/logs /app/data
+RUN chown -R appuser:appuser /app/telegram_sessions /app/logs /app/data /app/secrets
 
 # Переключаемся на непривилегированного пользователя
 USER appuser
@@ -42,6 +60,10 @@ ENV PORT=3030
 
 # Открываем порт
 EXPOSE 3030
+
+# Запускаем приложение через Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:3030/health || exit 1
 
 # Запускаем приложение
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3030"]
