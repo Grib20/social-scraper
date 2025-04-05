@@ -29,15 +29,34 @@ cipher = Fernet(ENCRYPTION_KEY)
 
 def get_db_connection():
     """Получает соединение с базой данных."""
-    conn = sqlite3.connect('users.db', timeout=30.0)
+    db_path = os.getenv('DB_PATH', 'users.db')
+    
+    # Проверяем, существует ли база данных, и инициализируем, если нет
+    db_exists = os.path.exists(db_path)
+    
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.execute('PRAGMA journal_mode = WAL')  # Используем WAL для лучшей производительности
     conn.execute('PRAGMA busy_timeout = 30000')  # Устанавливаем таймаут ожидания 30 секунд
     conn.row_factory = sqlite3.Row
+    
+    # Если база данных новая, инициализируем ее
+    if not db_exists:
+        logger.info(f"База данных {db_path} не существует. Создаем новую базу и таблицы...")
+        conn.close()
+        init_db()
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn.execute('PRAGMA journal_mode = WAL')
+        conn.execute('PRAGMA busy_timeout = 30000')
+        conn.row_factory = sqlite3.Row
+        logger.info(f"База данных {db_path} успешно инициализирована.")
+    
     return conn
 
 def init_db():
     """Инициализирует базу данных, создает таблицы, если они не существуют."""
-    conn = get_db_connection()
+    db_path = os.getenv('DB_PATH', 'users.db')
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
     # Создаем таблицу пользователей

@@ -2847,8 +2847,22 @@ async def reset_accounts_stats(request: Request):
 
 @app.get("/health")
 async def health_check():
-    """Endpoint для проверки работоспособности сервиса."""
-    return {"status": "ok"}
+    """Проверка работоспособности сервиса."""
+    try:
+        # Проверка подключения к базе данных
+        from user_manager import get_db_connection
+        conn = get_db_connection()
+        conn.execute("SELECT 1")
+        conn.close()
+        
+        # Проверка Redis, если доступен
+        if redis_client:
+            redis_client.ping()
+        
+        return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Ошибка при проверке работоспособности: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при проверке работоспособности: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))
