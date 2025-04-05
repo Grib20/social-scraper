@@ -96,7 +96,7 @@ from vk_utils import VKClient, find_vk_groups, get_vk_posts, get_vk_posts_in_gro
 from user_manager import (
     register_user, set_vk_token, get_vk_token, get_user, 
     get_next_available_account, update_account_usage, update_user_last_used,
-    get_users_dict, verify_api_key, get_active_accounts
+    get_users_dict, verify_api_key, get_active_accounts, init_db
 )
 from media_utils import init_scheduler, close_scheduler
 from admin_panel import (
@@ -110,6 +110,10 @@ from admin_panel import (
     get_telegram_account as admin_get_telegram_account, get_vk_account as admin_get_vk_account
 )
 from account_manager import initialize_stats_manager, stats_manager
+
+# Инициализируем базу данных при запуске приложения
+init_db()
+logger.info("База данных инициализирована при запуске")
 
 # Telegram клиенты для каждого аккаунта
 telegram_clients = {}
@@ -365,42 +369,21 @@ async def auth_middleware(request: Request, platform: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Инициализируем менеджера статистики аккаунтов
-    account_stats_manager = initialize_stats_manager(vk_pool, telegram_pool)
-    await account_stats_manager.start()
-    logger.info("Менеджер статистики аккаунтов запущен")
+    # Инициализируем базу данных при запуске
+    from user_manager import init_db
+    init_db()
+    logger.info("База данных инициализирована")
     
-    # Инициализируем S3 клиент для обработки медиа
+    # Другие действия при запуске
+    initialize_stats_manager()
+    
+    # Инициализация планировщика
     init_scheduler()
     
-    # Планируем периодическую синхронизацию статистики Redis с SQLite
-    stats_sync_scheduler = AsyncIOScheduler()
-    stats_sync_scheduler.add_job(
-        sync_all_accounts_stats,
-        IntervalTrigger(minutes=15),  # Синхронизация каждые 15 минут
-        id='redis_stats_sync'
-    )
-    stats_sync_scheduler.start()
-    logger.info("Запланирована периодическая синхронизация статистики Redis с SQLite")
-    
+    # Здесь приложение работает
     yield
     
-    # Останавливаем планировщик синхронизации
-    stats_sync_scheduler.shutdown()
-    logger.info("Планировщик синхронизации статистики остановлен")
-    
-    # Проводим финальную синхронизацию статистики
-    sync_all_accounts_stats()
-    logger.info("Выполнена финальная синхронизация статистики Redis с SQLite")
-    
-    # Останавливаем менеджера статистики
-    await account_stats_manager.stop()
-    logger.info("Менеджер статистики аккаунтов остановлен")
-    
-    # Отключаем все клиенты Telegram
-    await telegram_pool.disconnect_all()
-    
-    # Закрываем планировщик
+    # Очистка при завершении
     close_scheduler()
 
 app = FastAPI(lifespan=lifespan)
@@ -2068,70 +2051,115 @@ async def admin_accounts_stats(request: Request):
         raise HTTPException(status_code=401, detail="Invalid admin key")
     
     # Используем SQLite для получения основной информации об аккаунтах
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.getenv('DB_PATH', 'users.db'))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Получаем все аккаунты VK
-    cursor.execute('''
-        SELECT 
-            id, 
-            user_api_key, 
-            token, 
-            proxy, 
-            status, 
-            is_active, 
-            request_limit,
-            user_id,
-            user_name,
-            error_message
-        FROM vk_accounts
-    ''')
-    vk_accounts = [dict(row) for row in cursor.fetchall()]
+    # Проверяем существование таблиц
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in cursor.fetchall()]
+    logger.info(f"Доступные таблицы в базе данных: {', '.join(tables)}")
     
-    # Получаем все аккаунты Telegram
-    cursor.execute('''
-        SELECT 
-            id, 
-            user_api_key, 
-            phone, 
-            proxy, 
-            status, 
-            is_active, 
-            request_limit,
-            api_id,
-            api_hash
-        FROM telegram_accounts
-    ''')
-    telegram_accounts = [dict(row) for row in cursor.fetchall()]
+    vk_accounts = []
+    telegram_accounts = []
+    
+    # Получаем все аккаунты VK, если таблица существует
+    if 'vk_accounts' in tables:
+        try:
+            cursor.execute('''
+                SELECT 
+                    id, 
+                    user_api_key, 
+                    token, 
+                    proxy, 
+                    status, 
+                    is_active, 
+                    request_limit,
+                    user_id,
+                    user_name,
+                    error_message
+                FROM vk_accounts
+            ''')
+            vk_accounts = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Ошибка при запросе VK аккаунтов: {e}")
+    else:
+        logger.warning("Таблица vk_accounts не найдена в базе данных")
+    
+    # Получаем все аккаунты Telegram, если таблица существует
+    if 'telegram_accounts' in tables:
+        try:
+            cursor.execute('''
+                SELECT 
+                    id, 
+                    user_api_key, 
+                    phone, 
+                    proxy, 
+                    status, 
+                    is_active, 
+                    request_limit,
+                    api_id,
+                    api_hash
+                FROM telegram_accounts
+            ''')
+            telegram_accounts = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Ошибка при запросе Telegram аккаунтов: {e}")
+    else:
+        logger.warning("Таблица telegram_accounts не найдена в базе данных")
     
     conn.close()
     
-    # Дополняем данные статистикой из Redis
-    for account in vk_accounts:
-        account['login'] = account.get('user_name', 'Нет данных')
-        account['active'] = account.get('is_active', 1) == 1
+    # Дополняем данные статистикой из Redis, если доступен
+    if redis_client:
+        # Обработка VK аккаунтов
+        for account in vk_accounts:
+            account['login'] = account.get('user_name', 'Нет данных')
+            account['active'] = account.get('is_active', 1) == 1
+            
+            # Получаем актуальную статистику из Redis
+            try:
+                redis_stats = get_account_stats_redis(account['id'], 'vk')
+                if redis_stats:
+                    account['requests_count'] = redis_stats.get('requests_count', 0)
+                    account['last_used'] = redis_stats.get('last_used')
+                else:
+                    account['requests_count'] = 0
+                    account['last_used'] = None
+            except Exception as e:
+                logger.error(f"Ошибка при получении статистики из Redis для VK аккаунта {account['id']}: {e}")
+                account['requests_count'] = 0
+                account['last_used'] = None
         
-        # Получаем актуальную статистику из Redis
-        redis_stats = get_account_stats_redis(account['id'], 'vk')
-        if redis_stats:
-            account['requests_count'] = redis_stats.get('requests_count', 0)
-            account['last_used'] = redis_stats.get('last_used')
-        else:
+        # Обработка Telegram аккаунтов
+        for account in telegram_accounts:
+            account['login'] = account.get('phone', 'Нет данных')
+            account['active'] = account.get('is_active', 1) == 1
+            
+            # Получаем актуальную статистику из Redis
+            try:
+                redis_stats = get_account_stats_redis(account['id'], 'telegram')
+                if redis_stats:
+                    account['requests_count'] = redis_stats.get('requests_count', 0)
+                    account['last_used'] = redis_stats.get('last_used')
+                else:
+                    account['requests_count'] = 0
+                    account['last_used'] = None
+            except Exception as e:
+                logger.error(f"Ошибка при получении статистики из Redis для Telegram аккаунта {account['id']}: {e}")
+                account['requests_count'] = 0
+                account['last_used'] = None
+    else:
+        # Если Redis недоступен, инициализируем значения по умолчанию
+        for account in vk_accounts:
+            account['login'] = account.get('user_name', 'Нет данных')
+            account['active'] = account.get('is_active', 1) == 1
             account['requests_count'] = 0
             account['last_used'] = None
-    
-    # Для каждого Telegram аккаунта добавляем логин и проверяем активность
-    for account in telegram_accounts:
-        account['login'] = account.get('phone', 'Нет данных')
-        account['active'] = account.get('is_active', 1) == 1
-        
-        # Получаем актуальную статистику из Redis
-        redis_stats = get_account_stats_redis(account['id'], 'telegram')
-        if redis_stats:
-            account['requests_count'] = redis_stats.get('requests_count', 0)
-            account['last_used'] = redis_stats.get('last_used')
-        else:
+            
+        for account in telegram_accounts:
+            account['login'] = account.get('phone', 'Нет данных')
+            account['active'] = account.get('is_active', 1) == 1
             account['requests_count'] = 0
             account['last_used'] = None
     

@@ -59,6 +59,8 @@ def init_db():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
+    logger.info(f"Инициализируем базу данных по пути: {db_path}")
+    
     # Создаем таблицу пользователей
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
@@ -93,12 +95,6 @@ def init_db():
     )
     ''')
     
-    # Добавляем недостающие столбцы к таблице telegram_accounts
-    check_and_add_column(cursor, "telegram_accounts", "session_string", "TEXT")
-    check_and_add_column(cursor, "telegram_accounts", "phone_code_hash", "TEXT")
-    check_and_add_column(cursor, "telegram_accounts", "is_active", "INTEGER DEFAULT 1")
-    check_and_add_column(cursor, "telegram_accounts", "request_limit", "INTEGER DEFAULT 1000")
-    
     # Создаем таблицу аккаунтов VK
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS vk_accounts (
@@ -121,21 +117,48 @@ def init_db():
     )
     ''')
     
-    # Добавляем недостающие столбцы к таблице vk_accounts
-    check_and_add_column(cursor, "vk_accounts", "user_id", "INTEGER")
-    check_and_add_column(cursor, "vk_accounts", "user_name", "TEXT")
-    check_and_add_column(cursor, "vk_accounts", "error_message", "TEXT")
-    check_and_add_column(cursor, "vk_accounts", "error_code", "INTEGER")
-    check_and_add_column(cursor, "vk_accounts", "last_checked_at", "TEXT")
-    check_and_add_column(cursor, "vk_accounts", "is_active", "INTEGER DEFAULT 1")
-    check_and_add_column(cursor, "vk_accounts", "request_limit", "INTEGER DEFAULT 1000")
+    # Проверяем, что таблицы созданы
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in cursor.fetchall()]
+    logger.info(f"Таблицы в базе данных: {', '.join(tables)}")
+    
+    # Добавляем недостающие столбцы только если таблицы существуют
+    if 'telegram_accounts' in tables:
+        check_and_add_column(cursor, "telegram_accounts", "session_string", "TEXT")
+        check_and_add_column(cursor, "telegram_accounts", "phone_code_hash", "TEXT")
+        check_and_add_column(cursor, "telegram_accounts", "is_active", "INTEGER DEFAULT 1")
+        check_and_add_column(cursor, "telegram_accounts", "request_limit", "INTEGER DEFAULT 1000")
+    
+    if 'vk_accounts' in tables:
+        check_and_add_column(cursor, "vk_accounts", "user_id", "INTEGER")
+        check_and_add_column(cursor, "vk_accounts", "user_name", "TEXT")
+        check_and_add_column(cursor, "vk_accounts", "error_message", "TEXT")
+        check_and_add_column(cursor, "vk_accounts", "error_code", "INTEGER")
+        check_and_add_column(cursor, "vk_accounts", "last_checked_at", "TEXT")
+        check_and_add_column(cursor, "vk_accounts", "is_active", "INTEGER DEFAULT 1")
+        check_and_add_column(cursor, "vk_accounts", "request_limit", "INTEGER DEFAULT 1000")
     
     conn.commit()
+    
+    # Проверяем структуру таблиц после инициализации
+    for table in ['users', 'telegram_accounts', 'vk_accounts']:
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        logger.info(f"Структура таблицы {table}: {', '.join(column_names)}")
+    
     conn.close()
+    logger.info("Инициализация базы данных завершена")
 
 def check_and_add_column(cursor, table_name, column_name, column_type):
     """Проверяет наличие столбца в таблице и добавляет его, если он отсутствует."""
     try:
+        # Проверяем, существует ли таблица
+        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+        if not cursor.fetchone():
+            logger.info(f"Таблица {table_name} не существует, пропускаем добавление столбца {column_name}")
+            return
+            
         # Получаем информацию о столбцах таблицы
         cursor.execute(f"PRAGMA table_info({table_name})")
         columns = cursor.fetchall()
