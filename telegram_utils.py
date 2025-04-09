@@ -22,10 +22,18 @@ import aiohttp
 import json
 import ssl
 from telethon.tl.types import InputPeerUser, InputPeerChat
+from urllib.parse import urlparse
+import traceback
+
+# Определим перечисление для типов прокси, так как ProxyType недоступен в Telethon
+class ProxyType:
+    HTTP = 'http'
+    SOCKS4 = 'socks4'
+    SOCKS5 = 'socks5'
 
 # Импортируем пулы клиентов
 try:
-    from app import telegram_pool, vk_pool
+    from pools import telegram_pool, vk_pool
 except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("Не удалось импортировать пулы клиентов из app.py. Возможны проблемы с ротацией аккаунтов.")
@@ -91,16 +99,30 @@ def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
     if not proxy:
         return "None"
     
-    # Если в прокси есть логин/пароль, то скрываем их
-    if '@' in proxy:
-        scheme = proxy.split('://')[0] if '://' in proxy else 'http'
-        rest = proxy.split('://')[1] if '://' in proxy else proxy
+    try:
+        # Нормализуем прокси URL
+        proxy_url = proxy
+        if '://' not in proxy_url:
+            proxy_url = 'http://' + proxy_url
         
-        parts = rest.split('@')
-        host_part = parts[1]
-        # Возвращаем только схему и хост:порт, скрывая данные авторизации
-        return f"{scheme}://***@{host_part}"
-    return proxy
+        # Если в прокси есть логин/пароль, то скрываем их
+        if '@' in proxy_url:
+            scheme_auth, host_part = proxy_url.split('@', 1)
+            
+            if '://' in scheme_auth:
+                scheme, auth = scheme_auth.split('://', 1)
+                scheme = scheme + '://'
+            else:
+                scheme = 'http://'
+                auth = scheme_auth
+                
+            # Возвращаем только схему и хост:порт, скрывая данные авторизации
+            return f"{scheme}***@{host_part}"
+            
+        return proxy_url
+    except Exception:
+        # В случае ошибки возвращаем исходную строку
+        return proxy
 
 class TelegramClientWrapper:
     def __init__(self, client: TelegramClient, account_id: str, api_key: Optional[str] = None):
@@ -116,9 +138,9 @@ class TelegramClientWrapper:
         proxy_dict = getattr(client.session, 'proxy', None)
         self.has_proxy = proxy_dict is not None
         if self.has_proxy:
-            self.proxy_type = proxy_dict.get('proxy_type', 'unknown')
-            host = proxy_dict.get('addr', 'unknown')
-            port = proxy_dict.get('port', 'unknown')
+            self.proxy_type = proxy_dict.get('proxy_type', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
+            host = proxy_dict.get('addr', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
+            port = proxy_dict.get('port', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
             self.proxy_str = f"{self.proxy_type}://{host}:{port}"
             logger.info(f"Клиент {account_id} использует прокси: {sanitize_proxy_for_logs(self.proxy_str)}")
         else:
@@ -155,14 +177,18 @@ class TelegramClientWrapper:
         if self.api_key:
             try:
                 # Используем Redis для обновления статистики аккаунтов
-                try:
-                    from redis_utils import update_account_usage_redis
-                    update_account_usage_redis(self.api_key, self.account_id, "telegram")
-                except ImportError:
-                    # Если Redis не доступен, используем обычное обновление
-                    update_account_usage(self.api_key, self.account_id, "telegram")
-            except Exception as e:
-                logger.error(f"Ошибка при обновлении статистики использования: {e}")
+                from redis_utils import update_account_usage_redis
+                result = await update_account_usage_redis(self.api_key, self.account_id, "telegram")
+                if isinstance(result, bool):
+                    if result:
+                        logger.info(f"Статистика использования для аккаунта {self.account_id} успешно обновлена в Redis.")
+                elif result is not None:
+                    logger.warning(f"Неожиданный результат от update_account_usage_redis: {result}")
+            except ImportError:
+                # Если Redis не доступен, используем обычное обновление
+                from user_manager import update_account_usage
+                await update_account_usage(self.api_key, self.account_id, "telegram")
+                logger.info(f"Статистика использования для аккаунта {self.account_id} обновлена через user_manager.")
         
         # Логируем информацию о запросе с учетом прокси
         proxy_info = f" через прокси {sanitize_proxy_for_logs(self.proxy_str)}" if self.has_proxy else " без прокси"
@@ -237,10 +263,12 @@ class TelegramClientWrapper:
                 # Используем Redis для обновления статистики аккаунтов
                 try:
                     from redis_utils import update_account_usage_redis
-                    update_account_usage_redis(self.api_key, self.account_id, "telegram")
+                    await update_account_usage_redis(self.api_key, self.account_id, "telegram")
                 except ImportError:
-                    # Если Redis не доступен, используем обычное обновление
-                    update_account_usage(self.api_key, self.account_id, "telegram")
+                    logger.warning("Модуль redis_utils не найден, используется синхронное обновление статистики")
+                    # Если Redis не доступен, используем обычное обновление (синхронное)
+                    from user_manager import update_account_usage
+                    await update_account_usage(self.api_key, self.account_id, "telegram")
             except Exception as e:
                 logger.error(f"Ошибка при обновлении статистики использования: {e}")
         
@@ -293,7 +321,7 @@ async def start_client(client: TelegramClient) -> None:
     """Запускает клиент Telegram."""
     try:
         # Получаем информацию о прокси, если он установлен
-        proxy_dict = getattr(client.session, 'proxy', None)
+        proxy_dict = getattr(client, '_proxy', None)
         proxy_info = ""
         if proxy_dict:
             proxy_type = proxy_dict.get('proxy_type', 'unknown')
@@ -302,26 +330,38 @@ async def start_client(client: TelegramClient) -> None:
             proxy_str = f"{proxy_type}://{host}:{port}"
             proxy_info = f" с прокси {sanitize_proxy_for_logs(proxy_str)}"
         
-        logger.info(f"Запуск клиента Telegram {client.session.filename}{proxy_info}")
+        session_filename = getattr(client.session, 'filename', 'unknown') if client.session else 'unknown'
+        logger.info(f"Запуск клиента Telegram {session_filename}{proxy_info}")
         try:
+            # Подключаем клиент без установки атрибутов, которые могут не существовать
             await client.connect()
-            logger.info(f"Клиент Telegram {client.session.filename} успешно подключен")
+            session_filename = getattr(client.session, 'filename', 'unknown') if client.session else 'unknown'
+            logger.info(f"Клиент Telegram {session_filename} успешно подключен")
         except Exception as e:
             error_msg = str(e).lower()
             if proxy_dict and ("proxy" in error_msg or "socks" in error_msg or "connection" in error_msg):
-                logger.error(f"Ошибка соединения с прокси при запуске клиента {client.session.filename}: {e}")
+                session_filename = getattr(client.session, 'filename', 'unknown') if client.session else 'unknown'
+                logger.error(f"Ошибка соединения с прокси при запуске клиента {session_filename}: {e}")
                 
                 # Если возникла ошибка прокси, пробуем подключиться без прокси как запасной вариант
-                logger.warning(f"Пробуем запустить клиент {client.session.filename} без прокси после ошибки")
-                client._proxy = None
+                logger.warning(f"Пробуем запустить клиент {session_filename} без прокси после ошибки")
+                if client.is_connected():
+                    client.disconnect()
+                client.set_proxy({})
                 await client.connect()
-                logger.info(f"Клиент Telegram {client.session.filename} успешно подключен без прокси")
-            else:
+                session_filename = getattr(client.session, 'filename', 'unknown') if client.session else 'unknown'
+                logger.info(f"Клиент Telegram {session_filename} успешно подключен без прокси")
                 logger.error(f"Ошибка при запуске клиента: {e}")
                 raise
                 
-        await client.start()
-        logger.info(f"Клиент Telegram {client.session.filename} успешно запущен")
+        # Вместо полного client.start(), который запрашивает номер телефона интерактивно,
+        # мы только проверяем авторизацию и инициализируем сессию
+        if await client.is_user_authorized():
+            session_filename = getattr(client.session, 'filename', 'unknown') if client.session else 'unknown'
+            logger.info(f"Клиент Telegram {session_filename} успешно запущен и авторизован")
+        else:
+            session_filename = getattr(client.session, 'filename', 'unknown') if client.session else 'unknown'
+            logger.info(f"Клиент Telegram {session_filename} запущен, требуется авторизация")
     except Exception as e:
         logger.error(f"Ошибка при запуске клиента Telegram: {e}")
         raise
@@ -348,7 +388,7 @@ async def _find_channels_with_account(client: TelegramClient, keywords: List[str
     """Вспомогательная функция для поиска каналов с одним аккаунтом."""
     # Используем словарь для хранения уникальных каналов по ID
     unique_channels = {}
-    wrapper = TelegramClientWrapper(client, client.session.filename)
+    wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
     
     for keyword in keywords:
         try:
@@ -378,11 +418,16 @@ async def _find_channels_with_account(client: TelegramClient, keywords: List[str
                             
                         # Получаем полное инфо для проверки количества участников
                         try:
-                            # Используем класс GetFullChannelRequest напрямую через клиент
-                            full_request = functions.channels.GetFullChannelRequest(
-                                channel=chat
-                            )
-                            full_chat = await client(full_request)
+                            # Используем id и access_hash из объекта chat
+                            if chat.access_hash is not None:
+                                input_channel = types.InputChannel(channel_id=chat.id, access_hash=chat.access_hash)
+                                full_request = functions.channels.GetFullChannelRequest(
+                                    channel=input_channel # Передаем созданный InputChannel
+                                )
+                                full_chat = await client(full_request)
+                            else:
+                                logger.warning(f"Не удалось получить полную информацию о канале {chat.title} (ID: {chat.id}), так как access_hash отсутствует")
+                                continue
                             
                             members_count = full_chat.full_chat.participants_count
                             if members_count >= min_members:
@@ -501,8 +546,12 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
                         
                         if account_client:
                             # Подключаем клиента, если это необходимо
-                            if telegram_pool is not None and hasattr(telegram_pool, 'connect_client'):
-                                await telegram_pool.connect_client(account_id)
+                            if telegram_pool is not None:
+                                try:
+                                    await telegram_pool.connect_client(account_id) # type: ignore
+                                except AttributeError:
+                                    logger.warning("Метод connect_client отсутствует в telegram_pool.")
+                                # Можно добавить обработку других исключений, если connect_client может их вызвать
                             
                             # Добавляем задачу для текущего аккаунта и его каналы
                             task = asyncio.create_task(
@@ -541,7 +590,7 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
         
         # Стандартный метод с одним аккаунтом
         logger.info("Использование стандартного метода с одним аккаунтом для trending posts")
-        wrapper = TelegramClientWrapper(client, client.session.filename)
+        wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
         
         for channel_id in flat_channel_ids:
             if not isinstance(channel_id, str) and not isinstance(channel_id, int):
@@ -561,133 +610,157 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
                         logger.error(f"Ошибка при получении input_entity для {channel_id}: {e}")
                         continue
                     
+                    # --- ВОССТАНОВИТЬ ПРОВЕРКУ ЗДЕСЬ ---
+                    if input_peer is None:
+                         logger.warning(f"Не удалось получить input_peer для {channel_id}, пропуск.")
+                         continue
+
                     # 2. Запрашиваем полную информацию о канале
                     # Передаем тип запроса functions.channels.GetFullChannelRequest
                     full_chat_result = await wrapper._make_group_request(functions.channels.GetFullChannelRequest, input_peer)
                     
+                    # --- И ЭТУ ПРОВЕРКУ ТОЖЕ ---
+                    if not full_chat_result:
+                        logger.warning(f"Не удалось получить результат GetFullChannelRequest для {channel_id}")
+                        continue # Пропускаем этот канал
+
+                    # --- И ЭТУ ПРОВЕРКУ ТОЖЕ ---
+                    if not hasattr(full_chat_result, 'chats') or not full_chat_result.chats:
+                        logger.warning(f"Результат GetFullChannelRequest не содержит chats для {channel_id}")
+                        continue # Пропускаем этот канал, если результат невалидный
+
                     # 3. Извлекаем нужную сущность чата (канал)
                     chat_entity = None
-                    for chat_res in full_chat_result.chats:
-                        # Сравниваем ID
+                    for chat_res in full_chat_result.chats: # Теперь безопасно
+                        # Сравниваем ID (теперь input_peer точно не None)
                         if hasattr(input_peer, 'channel_id') and str(chat_res.id) == str(input_peer.channel_id):
                              chat_entity = chat_res
                              break
-                        elif hasattr(input_peer, 'user_id') and str(chat_res.id) == str(input_peer.user_id): # На случай, если передали ID юзера
+                        elif hasattr(input_peer, 'user_id') and str(chat_res.id) == str(input_peer.user_id):
                              chat_entity = chat_res
                              break
-                        elif hasattr(input_peer, 'chat_id') and str(chat_res.id) == str(input_peer.chat_id): # На случай, если передали ID чата
+                        elif hasattr(input_peer, 'chat_id') and str(chat_res.id) == str(input_peer.chat_id):
                              chat_entity = chat_res
                              break
 
-                    
                     if not chat_entity:
                          logger.error(f"Не удалось найти сущность чата для {channel_id} в результате GetFullChannelRequest")
-                         continue 
-                    
+                         continue
+
                     # Используем имя и username из найденной сущности
                     channel_username = getattr(chat_entity, 'username', None)
                     channel_title = getattr(chat_entity, 'title', 'Unknown Title')
-                    
+
                     # Получаем количество подписчиков (или используем 0, если не найдено)
-                    subscribers = channel_members_cache.get(str(channel_id), 0) 
+                    subscribers = channel_members_cache.get(str(channel_id), 0)
+                    # Дополнительно пытаемся получить из full_chat, если в кэше нет
                     if not subscribers and hasattr(full_chat_result, 'full_chat') and hasattr(full_chat_result.full_chat, 'participants_count'):
-                        subscribers = full_chat_result.full_chat.participants_count
-                    
+                         try:
+                             subscribers = full_chat_result.full_chat.participants_count
+                             channel_members_cache[str(channel_id)] = subscribers # Обновляем кэш
+                         except AttributeError:
+                             logger.warning(f"Не удалось получить participants_count из full_chat для {channel_id}")
+                             subscribers = 10 # Ставим минимум, если не удалось
+
                     # Обеспечим, чтобы подписчиков было хотя бы 10 для логарифма
                     subscribers_for_calc = max(subscribers, 10)
-                    
-                    # Шаг 1: Получаем и фильтруем посты
+
+                    # Инициализируем список для постов этого канала
                     filtered_posts = []
-                    
-                    # Запрашиваем messages через универсальную обертку
-                    # Передаем метод клиента client.get_messages
-                    posts_result = await wrapper._make_request(client.get_messages, 
-                                                           input_peer, 
+
+                    # --- ВОЗВРАЩАЕМ ПОЛУЧЕНИЕ СООБЩЕНИЙ ОТДЕЛЬНО ---
+                    posts_result = await wrapper._make_request(client.get_messages,
+                                                           input_peer,
                                                            limit=100)  # Получаем больше постов для фильтрации
-                    
-                    # Фильтруем посты по дате и критериям
-                    for post in posts_result:
-                        # Проверяем, что пост содержит хоть какой-то текст
-                        if not post.message:
-                            continue
-                        
-                        # Фильтр по просмотрам
-                        views = getattr(post, 'views', 0)
-                        if min_views is not None and views < min_views:
-                            continue
-                            
-                        # Фильтр по дате
-                        post_date = post.date.replace(tzinfo=None)
-                        if post_date < cutoff_date:
-                            continue
-                        
-                        # Фильтры по дополнительным параметрам
-                        reactions = len(post.reactions.results) if post.reactions else 0
-                        if min_reactions is not None and reactions < min_reactions:
-                            continue
-                            
-                        comments = post.replies.replies if post.replies else 0
-                        if min_comments is not None and comments < min_comments:
-                            continue
-                            
-                        forwards = post.forwards or 0
-                        if min_forwards is not None and forwards < min_forwards:
-                            continue
-                        
-                        # Рассчитываем engagement score
-                        post_data = {
-                            'id': post.id,
-                            'channel_id': str(channel_id),
-                            'channel_title': channel_title,
-                            'channel_username': channel_username,
-                            'subscribers': subscribers,
-                            'text': post.message,
-                            'views': views,
-                            'reactions': reactions,
-                            'comments': comments,
-                            'forwards': forwards,
-                            'date': post.date.isoformat(),
-                            'media': []
-                        }
-                        
-                        # Формируем URL в зависимости от типа ID канала
-                        if channel_username:
-                            post_data['url'] = f"https://t.me/{channel_username}/{post.id}"
-                        else: 
-                            channel_id_for_url = abs(getattr(chat_entity, 'id', 0))
-                            post_data['url'] = f"https://t.me/c/{channel_id_for_url}/{post.id}"
-                        
-                        # Обрабатываем медиа
-                        if post.media:
-                            # Используем instant-генерацию ссылок вместо get_media_info
-                            if non_blocking:
-                                # Импортируем функции из media_utils
-                                from media_utils import generate_media_links_with_album, process_media_later
-                                
-                                # Получаем ссылки на медиа мгновенно, включая альбомы
-                                media_urls = await generate_media_links_with_album(client, post)
-                                if media_urls:
-                                    post_data['media'] = media_urls
-                                    
-                                    # Запускаем обработку медиа асинхронно в фоне
-                                    asyncio.create_task(process_media_later(client, post, api_key))
+
+                    # --- ПРОВЕРКА posts_result ОСТАЕТСЯ ЗДЕСЬ ---
+                    if posts_result is not None:
+                        # Фильтруем посты по дате и критериям
+                        for post in posts_result: # Теперь posts_result не None
+                            # Проверяем, что пост содержит хоть какой-то текст
+                            if not post.message:
+                                continue
+
+                            # Фильтр по просмотрам
+                            views = getattr(post, 'views', 0)
+                            if min_views is not None and views < min_views:
+                                continue
+
+                            # Фильтр по дате
+                            post_date = post.date.replace(tzinfo=None)
+                            if post_date < cutoff_date:
+                                continue
+
+                            # Фильтры по дополнительным параметрам
+                            reactions = len(post.reactions.results) if post.reactions else 0
+                            if min_reactions is not None and reactions < min_reactions:
+                                continue
+
+                            comments = post.replies.replies if post.replies else 0
+                            if min_comments is not None and comments < min_comments:
+                                continue
+
+                            forwards = post.forwards or 0
+                            if min_forwards is not None and forwards < min_forwards:
+                                continue
+
+                            # Рассчитываем engagement score
+                            post_data = {
+                                'id': post.id,
+                                'channel_id': str(channel_id),
+                                'channel_title': getattr(chat_entity, 'title', getattr(chat_entity, 'first_name', 'Unknown')),
+                                'channel_username': channel_username, # Теперь определено выше
+                                'subscribers': subscribers, # Теперь определено выше
+                                'text': post.message,
+                                'views': views,
+                                'reactions': reactions,
+                                'comments': comments,
+                                'forwards': forwards,
+                                'date': post.date.isoformat(),
+                                'media': []
+                            }
+
+                            # Формируем URL в зависимости от типа ID канала
+                            if channel_username:
+                                post_data['url'] = f"https://t.me/{channel_username}/{post.id}"
                             else:
-                                # В режиме блокировки используем стандартный метод
-                                from media_utils import get_media_info
-                                # Для вызова get_media_info нужно создать информацию о сообщении в формате API
-                                media_info = await get_media_info(client, post, non_blocking=non_blocking)
-                                if media_info and 'media_urls' in media_info:
-                                    post_data["media"] = media_info.get('media_urls', [])
-                        
-                        # Вычисляем общий score для тренда
-                        raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
-                        trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0
-                        
-                        post_data['trend_score'] = trend_score
-                        filtered_posts.append(post_data)
-                    
+                                channel_id_for_url = abs(getattr(chat_entity, 'id', 0)) # chat_entity теперь определено выше
+                                post_data['url'] = f"https://t.me/c/{channel_id_for_url}/{post.id}"
+
+                            # Обрабатываем медиа
+                            if post.media:
+                                # Используем instant-генерацию ссылок вместо get_media_info
+                                if non_blocking:
+                                    # Импортируем функции из media_utils
+                                    from media_utils import generate_media_links_with_album, process_media_later
+
+                                    # Получаем ссылки на медиа мгновенно, включая альбомы
+                                    media_urls = await generate_media_links_with_album(client, post)
+                                    if media_urls:
+                                        post_data['media'] = media_urls
+
+                                        # Запускаем обработку медиа асинхронно в фоне
+                                        asyncio.create_task(process_media_later(client, post, api_key))
+                                else:
+                                    # В режиме блокировки используем стандартный метод
+                                    from media_utils import get_media_info
+                                    # Для вызова get_media_info нужно создать информацию о сообщении в формате API
+                                    media_info = await get_media_info(client, post, non_blocking=non_blocking)
+                                    if media_info and 'media_urls' in media_info:
+                                        post_data["media"] = media_info.get('media_urls', [])
+
+                            # Вычисляем общий score для тренда
+                            raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
+                            trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0 # subscribers_for_calc теперь определено выше
+
+                            post_data['trend_score'] = trend_score
+                            filtered_posts.append(post_data) # filtered_posts теперь определено выше
+                    else:
+                         logger.warning(f"Не удалось получить сообщения (posts_result is None) для {channel_id}")
+
                     # Берем только нужное количество лучших постов из этого канала
-                    top_posts = sorted(filtered_posts, key=lambda x: x.get('trend_score', 0), reverse=True)[:posts_per_channel]
+                    # (этот код выполнится, даже если posts_result был None, filtered_posts останется пустым)
+                    top_posts = sorted(filtered_posts, key=lambda x: x.get('trend_score', 0), reverse=True)[:posts_per_channel] # filtered_posts теперь определено выше
                     all_posts.extend(top_posts)
             except Exception as e:
                 logger.error(f"Ошибка при обработке канала {channel_id}: {e}")
@@ -702,7 +775,7 @@ async def get_trending_posts(client: TelegramClient, channel_ids: List[int], day
 
 async def _process_channels_for_trending(client, channel_ids, cutoff_date, posts_per_channel, min_views, min_reactions, min_comments, min_forwards, api_key=None, non_blocking=False):
     """Вспомогательная функция для параллельной обработки каналов и получения трендовых постов."""
-    wrapper = TelegramClientWrapper(client, client.session.filename)
+    wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
     channel_posts = []
     
     for channel_id in channel_ids:
@@ -737,9 +810,8 @@ async def _process_channels_for_trending(client, channel_ids, cutoff_date, posts
                         subscribers = 1000  # Значение по умолчанию, если не удалось получить число подписчиков
             except Exception as e:
                 logger.error(f"Ошибка при получении информации о канале {channel_id}: {e}")
-                channel_title = f"Channel {channel_id}"
-                channel_username = None
-                subscribers = 1000  # Значение по умолчанию
+                # Убираем установку значений по умолчанию, так как пропускаем итерацию
+                continue # <-- Добавляем continue здесь
             
             # Устанавливаем минимальное значение подписчиков для логарифма
             subscribers_for_calc = max(subscribers, 10)
@@ -790,7 +862,7 @@ async def _process_channels_for_trending(client, channel_ids, cutoff_date, posts
                 post_data = {
                     'id': post.id,
                     'channel_id': str(channel_id),
-                    'channel_title': channel_title,
+                    'channel_title': getattr(chat_entity, 'title', getattr(chat_entity, 'first_name', 'Unknown')),
                     'channel_username': channel_username,
                     'subscribers': subscribers,
                     'text': post.message,
@@ -804,10 +876,12 @@ async def _process_channels_for_trending(client, channel_ids, cutoff_date, posts
                 
                 # Формируем URL
                 if channel_username:
-                    post_data['url'] = f"https://t.me/{channel_username}/{post.id}"
-                else: 
-                    channel_id_for_url = abs(getattr(chat_entity, 'id', 0))
-                    post_data['url'] = f"https://t.me/c/{channel_id_for_url}/{post.id}"
+                    if channel_username:
+                        post_data['url'] = f"https://t.me/{channel_username}/{post.id}"
+                    else:
+                        chat_entity = await client.get_entity(channel_id)
+                        channel_id_for_url = abs(chat_entity.id)
+                        post_data['url'] = f"https://t.me/c/{channel_id_for_url}/{post.id}"
                 
                 # Обрабатываем медиа
                 if post.media:
@@ -849,7 +923,7 @@ async def _process_channels_for_trending(client, channel_ids, cutoff_date, posts
 
 async def _process_groups_for_posts(client, group_ids, max_posts, cutoff_date, min_views, api_key=None, non_blocking=False):
     """Вспомогательная функция для параллельной обработки групп."""
-    wrapper = TelegramClientWrapper(client, client.session.filename)
+    wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
     group_posts = []
     
     for group_id in group_ids:
@@ -881,9 +955,8 @@ async def _process_groups_for_posts(client, group_ids, max_posts, cutoff_date, m
                         subscribers = 1000  # Значение по умолчанию
             except Exception as e:
                 logger.warning(f"Ошибка при получении информации о канале {group_id}: {e}")
-                channel_title = f"Channel {group_id}"
-                channel_username = None
-                subscribers = 1000  # Значение по умолчанию
+                # Убираем установку значений по умолчанию, так как пропускаем итерацию
+                continue # <-- Добавляем continue здесь
             
             # Устанавливаем минимальное значение подписчиков для расчета
             subscribers_for_calc = max(subscribers, 10) # Минимум 10 участников для логарифма
@@ -906,6 +979,7 @@ async def _process_groups_for_posts(client, group_ids, max_posts, cutoff_date, m
             if channel_username:
                 url_template = f"https://t.me/{channel_username}/{{id}}"
             else:
+                assert channel_entity is not None # Добавляем assert здесь
                 url_template = f"https://t.me/c/{abs(channel_entity.id)}/{{id}}"
             
             # Обрабатываем посты
@@ -974,14 +1048,20 @@ async def process_media_file(media):
             media_type = "photo"
         elif isinstance(media, types.MessageMediaDocument):
             document = media.document
-            if document.mime_type.startswith('video/'):
-                media_type = "video"
-            elif document.mime_type.startswith('image/'):
-                media_type = "image"
-            elif document.mime_type.startswith('audio/'):
-                media_type = "audio"
+            if document and hasattr(document, 'mime_type'):
+                mime_type = getattr(document, 'mime_type', '')
+                if mime_type.startswith('video/'):
+                    media_type = "video"
+                elif mime_type.startswith('image/'):
+                    media_type = "image"
+                elif mime_type.startswith('audio/'):
+                    media_type = "audio"
+                else:
+                     # Если mime_type есть, но не подходит, или getattr вернул ''
+                    media_type = "document"
             else:
-                media_type = "document"
+                # Если document или mime_type отсутствуют или пустые
+                media_type = "document" # или "unknown"
                 
         return {
             "type": media_type,
@@ -992,37 +1072,68 @@ async def process_media_file(media):
         return None
 
 # Функция для создания Telegram клиента
-async def create_telegram_client(session_name, api_id, api_hash, proxy=None):
-    """Создает и настраивает клиент Telegram с файловой сессией"""
-    # Используем файловую сессию вместо StringSession
-    logger.info(f"Создаем клиент с файловой сессией: {session_name}")
-    
-    # Валидируем прокси, если он указан
-    proxy_type = None
-    if proxy:
-        is_valid, proxy_type = validate_proxy(proxy)
-        if is_valid:
-            logger.info(f"Установка прокси {sanitize_proxy_for_logs(proxy)} для клиента {session_name}")
-        else:
-            logger.warning(f"Некорректный формат прокси: {sanitize_proxy_for_logs(proxy)}. Клиент будет создан без прокси.")
-            proxy = None
-    
-    client = TelegramClient(
-        session_name,  # Путь к файлу сессии (без .session)
-        api_id,
-        api_hash
-    )
-    
-    # Устанавливаем прокси, если он валидный
-    if proxy and proxy_type:
-        try:
-            client.set_proxy(proxy)
-            logger.info(f"Прокси {sanitize_proxy_for_logs(proxy)} успешно установлен для клиента {session_name}")
-        except Exception as e:
-            logger.error(f"Ошибка при установке прокси {sanitize_proxy_for_logs(proxy)}: {e}")
-            logger.warning(f"Клиент {session_name} будет работать без прокси")
+async def create_telegram_client(session_path: str, api_id: int, api_hash: str, proxy: Optional[str] = None) -> TelegramClient:
+    """Создает клиент Telegram с указанными параметрами."""
+    try:
+        # Настройка прокси
+        proxy_config = None
+        if proxy:
+            logger.info(f"Настройка прокси для клиента {session_path}: {sanitize_proxy_for_logs(proxy)}")
+            # Нормализуем формат прокси
+            if '://' not in proxy:
+                proxy = 'socks5://' + proxy
+                
+            # Проверка формата прокси
+            is_valid, proxy_type = validate_proxy(proxy)
+            if not is_valid:
+                logger.error(f"Неверный формат прокси: {sanitize_proxy_for_logs(proxy)}")
+                raise ValueError(f"Неверный формат прокси: {sanitize_proxy_for_logs(proxy)}")
+            
+            # Простое определение типа прокси для Telethon
+            proxy_parsed = urlparse(proxy)
+            
+            # Определим тип прокси на основе URL
+            proxy_type_str = 'socks5'
+            if proxy.startswith('http://') or proxy.startswith('https://'):
+                proxy_type_str = 'http'
+            elif proxy.startswith('socks4://'):
+                proxy_type_str = 'socks4'
+            
+            # Создаем конфиг прокси
+            proxy_config = {
+                'proxy_type': proxy_type_str,
+                'addr': proxy_parsed.hostname or '',
+                'port': proxy_parsed.port or 1080
+            }
+            
+            # Добавляем учетные данные, если они есть
+            if proxy_parsed.username and proxy_parsed.password:
+                proxy_config['username'] = proxy_parsed.username
+                proxy_config['password'] = proxy_parsed.password
         
-    return client
+        # Создаем клиент с запретом интерактивного ввода
+        logger.info(f"Создание клиента Telegram с сессией {session_path}")
+        client = TelegramClient(
+            session_path,
+            api_id,
+            api_hash,
+            proxy=proxy_config if proxy_config else {},
+            device_model="Social Scraper",
+            system_version="1.0",
+            app_version="1.0",
+            lang_code="ru",
+            system_lang_code="ru",
+            connection_retries=3,  # Запрещаем бесконечные попытки
+            retry_delay=1,  # Минимальная задержка между попытками
+            auto_reconnect=False,  # Запрещаем автоматическое переподключение
+            loop=asyncio.get_event_loop()
+        )
+        
+        return client
+    except Exception as e:
+        logger.error(f"Ошибка при создании клиента Telegram: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 async def _process_media_async(client, message, post_data):
     """Асинхронно обрабатывает медиа и обновляет данные поста."""
@@ -1043,7 +1154,7 @@ async def _process_media_async(client, message, post_data):
 async def get_posts_in_channels(client: TelegramClient, channel_ids: List[Union[int, str]], keywords: Optional[List[str]] = None, count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
     """Получает посты из каналов по ключевым словам."""
     posts = []
-    wrapper = TelegramClientWrapper(client, client.session.filename)
+    wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
     
     for channel_id in channel_ids:
         try:
@@ -1073,7 +1184,7 @@ async def get_posts_in_channels(client: TelegramClient, channel_ids: List[Union[
                         post_data = {
                             "id": message.id,
                             "channel_id": channel_id,
-                            "channel_title": channel.title,
+                            "channel_title": getattr(channel, 'title', getattr(channel, 'first_name', 'Unknown')),
                             "text": message.message,
                             "views": views,
                             "date": message.date.isoformat(),
@@ -1100,7 +1211,7 @@ async def get_posts_in_channels(client: TelegramClient, channel_ids: List[Union[
 async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str], post_keywords: List[str], count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
     """Получает посты из каналов по ключевым словам для групп и постов."""
     posts = []
-    wrapper = TelegramClientWrapper(client, client.session.filename)
+    wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
     
     for group_keyword in group_keywords:
         try:
@@ -1152,3 +1263,67 @@ async def get_posts_by_period(client, group_ids: List[Union[int, str]], max_post
     except Exception as e:
         logger.error(f"Ошибка при получении постов: {e}")
         return []
+
+async def validate_proxy_connection(proxy: Optional[str]) -> Tuple[bool, str]:
+    """
+    Валидирует строку прокси и проверяет соединение с сервером Telegram.
+    
+    Args:
+        proxy: Строка с прокси в формате scheme://host:port или scheme://user:password@host:port
+        
+    Returns:
+        Tuple[bool, str]: (валиден ли прокси, сообщение)
+    """
+    if not proxy:
+        return False, "Прокси не указан"
+    
+    # Проверяем формат прокси
+    is_valid, proxy_type = validate_proxy(proxy)
+    if not is_valid:
+        return False, "Неверный формат прокси"
+    
+    # Нормализуем прокси URL
+    if '://' not in proxy:
+        if proxy_type == 'socks5':
+            proxy = 'socks5://' + proxy
+        elif proxy_type == 'socks4':
+            proxy = 'socks4://' + proxy
+        else:
+            proxy = 'http://' + proxy
+    
+    # Проверяем, установлена ли библиотека aiohttp-socks
+    try:
+        import aiohttp
+        
+        # Для HTTP/HTTPS прокси можно использовать стандартный aiohttp
+        if proxy.startswith(('http://', 'https://')):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get('https://api.telegram.org', proxy=proxy, timeout=10) as response:
+                        if response.status == 200:
+                            return True, "Прокси работает"
+                        else:
+                            return False, f"Ошибка соединения: HTTP {response.status}"
+            except Exception as e:
+                return False, f"Ошибка соединения: {str(e)}"
+        
+        # Для SOCKS прокси нужна библиотека aiohttp-socks
+        # Проверяем, установлена ли она
+        try:
+            from aiohttp_socks import ProxyConnector
+            
+            # Если библиотека установлена, используем её
+            connector = ProxyConnector.from_url(proxy)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get('https://api.telegram.org', timeout=10) as response:
+                    if response.status == 200:
+                        return True, "Прокси работает"
+                    else:
+                        return False, f"Ошибка соединения: HTTP {response.status}"
+        except ImportError:
+            # Если библиотека не установлена, вернем соответствующее сообщение
+            return False, "Необходимо установить библиотеку aiohttp-socks для работы с SOCKS прокси"
+        except Exception as e:
+            return False, f"Ошибка соединения: {str(e)}"
+    except Exception as e:
+        return False, f"Ошибка при проверке прокси: {str(e)}"

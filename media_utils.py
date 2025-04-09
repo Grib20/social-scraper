@@ -17,7 +17,6 @@ import io
 from aiojobs import create_scheduler
 from dotenv import load_dotenv
 from typing import Union, Callable, Any, Optional, List, Dict
-import sqlite3
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -655,7 +654,7 @@ async def download_media_parallel(media_info_list, api_key, max_workers=5):
         list: Список результатов обработки медиа
     """
     # Импортируем здесь, чтобы избежать циклических импортов
-    from app import telegram_pool
+    from pools import telegram_pool
     
     # Настраиваем семафор для контроля числа параллельных задач
     download_semaphore = asyncio.Semaphore(max_workers)

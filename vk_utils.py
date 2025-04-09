@@ -6,7 +6,7 @@ from vk_api.exceptions import ApiError
 from dotenv import load_dotenv
 import os
 import aiohttp
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union, Any, Tuple
 from datetime import datetime, timedelta
 from media_utils import get_media_info as telegram_get_media_info
 from user_manager import get_active_accounts, update_account_usage
@@ -35,8 +35,12 @@ try:
         logger.info(f"Подключение к Redis по URL: {REDIS_URL.split('@')[0]}@...")
         redis_client = redis.from_url(REDIS_URL)
         # Проверка соединения
-        redis_client.ping()
-        logger.info("Успешное подключение к Redis")
+        if redis_client:
+            redis_client.ping()
+            logger.info("Успешное подключение к Redis")
+        else:
+            logger.warning("Не удалось создать клиент Redis")
+            redis_client = None
     else:
         logger.warning("REDIS_URL не задан, использую локальный кэш")
         redis_client = None
@@ -62,15 +66,123 @@ def validate_proxy(proxy: Optional[str]) -> bool:
     
     # Проверяем схему прокси
     valid_schemes = ['http://', 'https://', 'socks4://', 'socks5://']
-    has_valid_scheme = any(proxy.startswith(scheme) for scheme in valid_schemes)
     
-    # Если схема не указана, по умолчанию считаем http
+    # Если схема не указана, предполагаем http://
+    normalized_proxy = proxy
+    has_valid_scheme = any(proxy.startswith(scheme) for scheme in valid_schemes)
     if not has_valid_scheme:
-        proxy = f'http://{proxy}'
+        normalized_proxy = f'http://{proxy}'
+    
+    try:
+        # Базовая проверка на формат
+        if '@' in normalized_proxy:
+            # С аутентификацией (user:pass@host:port)
+            auth_part, host_part = normalized_proxy.split('@', 1)
+            scheme = auth_part.split('://', 1)[0] + '://' if '://' in auth_part else 'http://'
+            if not '://' in auth_part:
+                auth_part = auth_part  # без схемы
+            else:
+                auth_part = auth_part.split('://', 1)[1]  # удаляем схему
+                
+            if ':' not in auth_part or ':' not in host_part:
+                return False
+                
+            # Проверяем порт
+            host, port = host_part.split(':', 1)
+            try:
+                port_num = int(port)
+                if port_num <= 0 or port_num > 65535:
+                    return False
+            except ValueError:
+                return False
+        else:
+            # Без аутентификации (host:port)
+            if '://' in normalized_proxy:
+                scheme, host_port = normalized_proxy.split('://', 1)
+                scheme += '://'
+            else:
+                host_port = normalized_proxy
+                scheme = 'http://'
+            
+            if ':' not in host_port:
+                return False
+                
+            # Проверяем порт
+            host, port = host_port.split(':', 1)
+            try:
+                port_num = int(port)
+                if port_num <= 0 or port_num > 65535:
+                    return False
+            except ValueError:
+                return False
+        
+        return True
+    except Exception:
+        # В случае ошибки возвращаем False вместо строки
+        return False
+
+async def validate_proxy_connection(proxy: Optional[str]) -> Tuple[bool, str]:
+    """
+    Валидирует строку прокси и проверяет соединение.
+    
+    Args:
+        proxy: Строка с прокси в формате scheme://host:port или scheme://user:password@host:port
+        
+    Returns:
+        Tuple[bool, str]: (валиден ли прокси, сообщение)
+    """
+    if not proxy:
+        return False, "Прокси не указан"
     
     # Проверяем формат прокси
-    proxy_pattern = r'^(https?://|socks[45]://)(([^:@]+)(:[^@]+)?@)?([^:@]+)(:(\d+))$'
-    return bool(re.match(proxy_pattern, proxy))
+    if not validate_proxy(proxy):
+        return False, "Неверный формат прокси"
+    
+    # Нормализуем прокси URL
+    if '://' not in proxy:
+        proxy = 'http://' + proxy
+    
+    # Проверяем соединение
+    try:
+        import aiohttp
+        
+        # Для HTTP/HTTPS прокси можно использовать стандартный aiohttp
+        if proxy.startswith(('http://', 'https://')):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("https://api.vk.com/method/users.get", 
+                                        params={"v": "5.131"}, 
+                                        proxy=proxy, 
+                                        timeout=10) as response:
+                        if response.status == 200:
+                            return True, "Прокси работает"
+                        else:
+                            return False, f"Ошибка соединения: HTTP {response.status}"
+            except Exception as e:
+                return False, f"Ошибка соединения: {str(e)}"
+        
+        # Для SOCKS прокси нужна библиотека aiohttp-socks
+        # Проверяем, установлена ли она
+        try:
+            from aiohttp_socks import ProxyConnector
+            
+            # Если библиотека установлена, используем её
+            connector = ProxyConnector.from_url(proxy)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get("https://api.vk.com/method/users.get", 
+                                     params={"v": "5.131"}, 
+                                     timeout=10) as response:
+                    if response.status == 200:
+                        return True, "Прокси работает"
+                    else:
+                        return False, f"Ошибка соединения: HTTP {response.status}"
+        except ImportError:
+            # Если библиотека не установлена, вернем соответствующее сообщение
+            return False, "Необходимо установить библиотеку aiohttp-socks для работы с SOCKS прокси"
+        except Exception as e:
+            return False, f"Ошибка соединения: {str(e)}"
+    except Exception as e:
+        return False, f"Ошибка при проверке прокси: {str(e)}"
 
 def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
     """
@@ -85,16 +197,30 @@ def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
     if not proxy:
         return "None"
     
+    try:
+        # Нормализуем прокси URL
+        proxy_url = proxy
+        if '://' not in proxy_url:
+            proxy_url = 'http://' + proxy_url
+    
     # Если в прокси есть логин/пароль, то скрываем их
-    if '@' in proxy:
-        scheme = proxy.split('://')[0] if '://' in proxy else 'http'
-        rest = proxy.split('://')[1] if '://' in proxy else proxy
-        
-        parts = rest.split('@')
-        host_part = parts[1]
+        if '@' in proxy_url:
+            scheme_auth, host_part = proxy_url.split('@', 1)
+            
+            if '://' in scheme_auth:
+                scheme, auth = scheme_auth.split('://', 1)
+                scheme = scheme + '://'
+            else:
+                scheme = 'http://'
+                auth = scheme_auth
+                
         # Возвращаем только схему и хост:порт, скрывая данные авторизации
-        return f"{scheme}://***@{host_part}"
-    return proxy
+            return f"{scheme}***@{host_part}"
+            
+        return proxy_url
+    except Exception:
+        # В случае ошибки возвращаем исходную строку
+        return proxy
 
 class VKClient:
     def __init__(self, access_token: str, proxy: Optional[str] = None, account_id: Optional[str] = None, api_key: Optional[str] = None):
@@ -202,8 +328,32 @@ class VKClient:
                 # Сначала пробуем с прокси, если он задан и валиден
                 if self.proxy and proxy_valid:
                     try:
-                        async with self.session.get(f"{self.base_url}/{method}", params=request_params, proxy=self.proxy) as response:
-                            return await self._process_response(response, method, params)
+                        # Нормализуем формат прокси для aiohttp
+                        proxy_url = self.proxy
+                        if '://' not in proxy_url:
+                            proxy_url = 'http://' + proxy_url
+                            
+                        # Для HTTP/HTTPS прокси можно использовать стандартный aiohttp
+                        if proxy_url.startswith(('http://', 'https://')):
+                            async with self.session.get(f"{self.base_url}/{method}", params=request_params, proxy=proxy_url) as response:
+                                return await self._process_response(response, method, params)
+                        else:
+                            # Для SOCKS прокси нужна библиотека aiohttp-socks
+                            # Проверяем, установлена ли она
+                            try:
+                                from aiohttp_socks import ProxyConnector
+                                
+                                # Используем ProxyConnector для SOCKS прокси
+                                connector = ProxyConnector.from_url(proxy_url)
+                                async with aiohttp.ClientSession(connector=connector) as proxy_session:
+                                    async with proxy_session.get(f"{self.base_url}/{method}", params=request_params) as response:
+                                        return await self._process_response(response, method, params)
+                            except ImportError:
+                                # Если библиотека не установлена, логируем предупреждение и продолжаем без прокси
+                                logger.warning(f"Библиотека aiohttp-socks не установлена, но требуется для SOCKS прокси. Продолжаем без прокси.")
+                                # Пробуем запрос без прокси
+                                async with self.session.get(f"{self.base_url}/{method}", params=request_params) as response:
+                                    return await self._process_response(response, method, params)
                     except aiohttp.ClientProxyConnectionError as e:
                         logger.error(f"Ошибка подключения через прокси {proxy_info}: {e}")
                         logger.warning(f"Пробуем запрос без прокси после ошибки")
@@ -221,6 +371,20 @@ class VKClient:
                 logger.error(f"Ошибка при выполнении запроса к VK API: {e}")
                 logger.error(f"Трассировка: {tb}")
                 return {}
+
+    async def test_connection(self) -> bool:
+        """
+        Проверяет работоспособность клиента VK путем тестового запроса.    
+        Returns:
+        bool: True если соединение работает, False в противном случае
+        """
+        try:
+            # Пробуем выполнить простой запрос к API
+            result = await self._make_request("users.get", {})
+            return "response" in result
+        except Exception as e:
+            logger.error(f"Ошибка при проверке соединения VK: {e}")
+            return False
     
     async def _process_response(self, response, method, params):
         """Обрабатывает ответ от API VK."""
@@ -259,7 +423,7 @@ class VKClient:
         
         self.requests_count += 1
         if self.account_id and self.api_key:
-            update_account_usage(self.api_key, self.account_id, "vk")
+            await update_account_usage(self.api_key, self.account_id, "vk")
         
         return result
 
@@ -386,6 +550,10 @@ class VKClient:
             
             # Получаем активные аккаунты
             from user_manager import get_active_accounts
+            # Проверяем, что api_key не None перед передачей в функцию
+            if self.api_key is None:
+                logger.error("API ключ не установлен")
+                return []
             active_accounts = await get_active_accounts(self.api_key, "vk")
             if not active_accounts:
                 logger.warning("Нет доступных аккаунтов")
@@ -970,8 +1138,9 @@ async def find_vk_groups_parallel(vk, keywords, min_members=10000, max_count=20,
     logger.info(f"Начинаем параллельный поиск групп по ключевым словам: {keywords}")
     
     # Получаем активные аккаунты VK, если передан API ключ
-    if api_key:
-        try:
+    try:
+        # Получаем активные аккаунты VK, если передан API ключ
+        if api_key:
             from user_manager import get_active_accounts
             active_accounts = await get_active_accounts(api_key, "vk")
             
@@ -1029,14 +1198,20 @@ async def find_vk_groups_parallel(vk, keywords, min_members=10000, max_count=20,
                     return result
             else:
                 logger.info(f"Использование одного аккаунта для поиска: найдено {len(active_accounts) if active_accounts else 0} аккаунтов")
-        except Exception as e:
-            logger.error(f"Ошибка при параллельном поиске групп: {e}")
-            # Продолжаем выполнение с одним клиентом
+                return await find_vk_groups(vk, keywords, min_members, max_count)
+    
     
     # Если не смогли использовать параллельный поиск, 
     # используем стандартный метод с одним клиентом
-    logger.info("Использование стандартного метода поиска с одним аккаунтом")
-    return await find_vk_groups(vk, keywords, min_members, max_count)
+        logger.info("Использование стандартного метода поиска с одним аккаунтом")
+        return await find_vk_groups(vk, keywords, min_members, max_count)
+    except Exception as e:
+        logger.error(f"Ошибка при параллельном поиске групп: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # В случае ошибки параллельного поиска, откатываемся к стандартному
+        logger.warning("Откат к стандартному методу поиска из-за ошибки в параллельном")
+        return await find_vk_groups(vk, keywords, min_members, max_count)
 
 async def find_groups_by_keywords(vk, keywords, min_members=10000, max_count=20, api_key=None):
     """
@@ -1053,4 +1228,8 @@ async def find_groups_by_keywords(vk, keywords, min_members=10000, max_count=20,
         list: Отсортированный список уникальных групп, отвечающих критериям
     """
     logger.info(f"Вызов find_groups_by_keywords для поиска групп ВК по ключевым словам: {keywords}")
-    return await find_vk_groups_parallel(vk, keywords, min_members, max_count, api_key)
+    result = await find_vk_groups_parallel(vk, keywords, min_members, max_count, api_key)
+    # Если результат bool или None, вернуть пустой список
+    if isinstance(result, bool) or result is None:
+        return []
+    return result

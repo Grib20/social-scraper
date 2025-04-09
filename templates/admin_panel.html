@@ -1,11 +1,10 @@
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Админ-панель</title>
-    <link rel="stylesheet" href="/static/css/admin.css">
-    <link rel="stylesheet" href="/static/css/stats.css">
+{% extends "base.html" %}
+
+{% block title %}Админ-панель{% endblock %}
+
+{% block head %}
+    <link rel="stylesheet" href="{{ url_for('static', path='css/admin.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='css/stats.css') }}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         /* Принудительные стили для исправления ширины карточки */
@@ -48,8 +47,9 @@
             border: 1px solid var(--border-color) !important;
         }
     </style>
-</head>
-<body>
+{% endblock %}
+
+{% block content %}
     <div class="container">
         <header class="admin-header">
             <h1><i class="fas fa-shield-alt"></i> Админ-панель</h1>
@@ -124,7 +124,7 @@
     <div id="telegramModal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="closeModal('telegramModal')">&times;</span>
-            <h3><i class="fab fa-telegram"></i> Добавить Telegram аккаунт</h3>
+            <h3  id="telegramModalTitle"><i class="fab fa-telegram"></i> Добавить Telegram аккаунт</h3>
             <form id="addTelegramForm">
                 <div class="form-group">
                     <label for="api_id"><i class="fas fa-key"></i> API ID:</label>
@@ -145,48 +145,25 @@
                     <input type="text" id="proxy" name="proxy" placeholder="socks5://user:pass@host:port">
                     <small>Укажите прокси в формате socks5://user:pass@host:port</small>
                 </div>
-                <button type="submit"><i class="fas fa-plus-circle"></i> Добавить аккаунт</button>
-            </form>
-            
-            <!-- Форма для загрузки файла сессии -->
-            <div class="form-separator">
-                <span>или</span>
-            </div>
-            <form id="uploadSessionForm">
-                <h4><i class="fas fa-file-upload"></i> Загрузить существующую сессию</h4>
                 <div class="form-group">
-                    <label for="upload_api_id"><i class="fas fa-key"></i> API ID:</label>
-                    <input type="text" id="upload_api_id" name="api_id" required placeholder="12345678">
-                </div>
-                <div class="form-group">
-                    <label for="upload_api_hash"><i class="fas fa-hashtag"></i> API Hash:</label>
-                    <input type="text" id="upload_api_hash" name="api_hash" required placeholder="a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6">
-                </div>
-                <div class="form-group">
-                    <label for="upload_phone"><i class="fas fa-phone"></i> Номер телефона:</label>
-                    <input type="text" id="upload_phone" name="phone" required placeholder="+79XXXXXXXXX">
-                </div>
-                <div class="form-group">
-                    <label for="upload_proxy"><i class="fas fa-network-wired"></i> Прокси (опционально):</label>
-                    <input type="text" id="upload_proxy" name="proxy" placeholder="socks5://user:pass@host:port">
-                </div>
-                <div class="form-group">
-                    <label for="session_file"><i class="fas fa-file"></i> Файл сессии:</label>
-                    <input type="file" id="session_file" name="session_file" required>
+                    <label for="session_file"><i class="fas fa-file"></i> Файл сессии (опционально):</label>
+                    <input type="file" id="session_file" name="session_file">
                     <small>Загрузите файл .session для авторизованного аккаунта</small>
                 </div>
-                <button type="submit"><i class="fas fa-upload"></i> Загрузить сессию</button>
+                <button type="submit"><i class="fas fa-plus-circle"></i> Добавить аккаунт</button>
             </form>
             
             <!-- Блок для ввода кода авторизации -->
             <div id="telegramAuthBlock" style="display:none;">
                 <h4><i class="fas fa-shield-alt"></i> Авторизация Telegram</h4>
                 <p id="authStatus">Введите код авторизации, отправленный на ваш телефон:</p>
-                <div class="form-group">
-                    <label for="auth_code"><i class="fas fa-lock"></i> Код авторизации:</label>
-                    <input type="text" id="auth_code" placeholder="12345">
-                </div>
-                <button id="submitAuthCode" class="auth-btn"><i class="fas fa-check"></i> Подтвердить код</button>
+                <form id="telegramAuthForm" onsubmit="submitAuthCode(event)">
+                    <div class="form-group">
+                        <label for="authCode"><i class="fas fa-lock"></i> Код авторизации:</label>
+                        <input type="text" id="authCode" name="code" placeholder="12345" required>
+                    </div>
+                    <button type="submit" id="submitAuthCodeBtn" class="auth-btn"><i class="fas fa-check"></i> Подтвердить код</button>
+                </form>
             </div>
             
             <!-- Блок для ввода пароля двухфакторной аутентификации -->
@@ -223,7 +200,14 @@
         </div>
     </div>
 
-    <script src="/static/js/admin.js"></script>
+    <!-- Модальное окно логов -->
+    <div id="logsModal" class="modal">
+        <!-- ... existing code ... -->
+    </div>
+{% endblock %}
+
+{% block scripts %}
+    <script src="{{ url_for('static', path='js/admin.js') }}"></script>
     <script>
         // Функция выхода
         function logout() {
@@ -365,6 +349,44 @@
                 resetTelegramModal();
             }
         }
+        
+        // Функция для сброса состояния модального окна Telegram
+        function resetTelegramModal() {
+            // Сбрасываем форму добавления аккаунта
+            const addForm = document.getElementById('addTelegramForm');
+            if (addForm) {
+                addForm.reset();
+                addForm.style.display = 'block';
+            }
+            
+            // Скрываем блок авторизации
+            const authBlock = document.getElementById('telegramAuthBlock');
+            if (authBlock) {
+                authBlock.style.display = 'none';
+            }
+            
+            // Сбрасываем статус авторизации
+            const authStatus = document.getElementById('authStatus');
+            if (authStatus) {
+                authStatus.textContent = 'Введите код авторизации, отправленный на ваш телефон:';
+            }
+            
+            // Скрываем блок 2FA
+            const twoFABlock = document.getElementById('telegram2FABlock');
+            if (twoFABlock) {
+                twoFABlock.style.display = 'none';
+            }
+            
+            // Сбрасываем значения полей авторизации
+            const authCode = document.getElementById('authCode');
+            if (authCode) {
+                authCode.value = '';
+            }
+            
+            const twoFAPassword = document.getElementById('two_fa_password');
+            if (twoFAPassword) {
+                twoFAPassword.value = '';
+            }
+        }
     </script>
-</body>
-</html> 
+{% endblock %} 

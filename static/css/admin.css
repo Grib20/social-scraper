@@ -2138,4 +2138,14 @@ button i {
 
 .last-usage-value.not-used {
     color: #F44336;
+}
+
+/* Стили для кнопки исправления токенов */
+.fix-token-btn {
+    background-color: #4a76a8 !important; /* Цвет VK */
+    color: white !important;
+}
+
+.fix-token-btn:hover {
+    background-color: #3a5c88 !important;
 } 

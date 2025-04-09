@@ -1,0 +1,13 @@
+<!-- ... existing code ... -->
+                    <input type="text" id="telegramCodeInput" placeholder="Введите код из Telegram">
+                    <div class="input-group" id="telegramPasswordGroup" style="display: none;">
+                        <label for="telegramPasswordInput">Пароль 2FA (если требуется):</label>
+                        <input type="password" id="telegramPasswordInput" placeholder="Введите пароль 2FA">
+                    </div>
+                    <button onclick="submitTelegramCode()" class="modal-button primary">
+                        <i class="fas fa-check"></i> Подтвердить
+                    </button>
+                    <button onclick="closeTelegramAuthCodeModal()" class="modal-button secondary">
+                        <i class="fas fa-times"></i> Отмена
+                    </button>
+<!-- ... existing code ... -->
