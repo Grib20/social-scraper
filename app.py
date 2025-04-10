@@ -26,7 +26,6 @@ import csv
 import json
 import traceback
 from typing import List, Dict, Any, Optional, Union, Tuple
-from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -39,6 +38,8 @@ from redis_utils import update_account_usage_redis
 import user_manager
 import media_utils
 import asyncpg
+from pydantic import BaseModel, Field 
+from user_manager import get_db_pool
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -109,14 +110,13 @@ if not os.getenv("BASE_URL"):
 from telegram_utils import (
     start_client, find_channels, 
     get_trending_posts, get_posts_in_channels, 
-    get_posts_by_keywords, get_posts_by_period, 
-    get_album_messages
+    get_posts_by_keywords, get_album_messages
 )
 from vk_utils import VKClient, find_vk_groups, get_vk_posts, get_vk_posts_in_groups
 from user_manager import (
-    register_user, set_vk_token, get_db_connection, get_vk_token, get_user, 
+    get_db_pool, register_user, set_vk_token, get_db_connection, get_vk_token, get_user, 
     get_next_available_account, update_account_usage, update_user_last_used,
-    get_users_dict, verify_api_key, get_active_accounts, init_db
+    get_users_dict, verify_api_key, get_active_accounts
 )
 from media_utils import init_scheduler, close_scheduler
 from admin_panel import (
@@ -505,48 +505,158 @@ async def get_admin_stats(request: Request):
     stats = await get_system_stats()
     return stats
 
-@app.get("/admin/users")
-async def get_users(request: Request):
-    # Пытаемся получить ключ из заголовка
-    admin_key = request.headers.get("X-Admin-Key")
+# Определим модели Pydantic для четкой структуры ответа
+class VKAccountInfo(BaseModel):
+    id: str
+    user_api_key: str # Добавим для ясности, хотя frontend может не использовать
+    token: str | None = None 
+    user_name: str | None = None
+    proxy: str | None = None
+    status: str = 'unknown'
+    is_active: bool = False
+    added_at: Any | None = None 
+
+class TelegramAccountInfo(BaseModel):
+    id: str
+    user_api_key: str # Добавим для ясности
+    phone: str | None = None
+    api_id: str | None = None 
+    api_hash: str | None = None 
+    proxy: str | None = None
+    status: str = 'unknown'
+    is_active: bool = False
+    added_at: Any | None = None
+
+class UserInfo(BaseModel):
+    id: str # Это будет api_key пользователя
+    username: str
+    api_key: str | None = None # Можно дублировать или убрать, если id достаточно
+    vk_accounts: List[VKAccountInfo] = []
+    telegram_accounts: List[TelegramAccountInfo] = []
+
+# Эндпоинт для получения списка пользователей с их аккаунтами
+# Эндпоинт для получения списка пользователей с их аккаунтами
+@app.get("/admin/users", response_model=List[UserInfo])
+async def get_users_with_accounts(request: Request):
+    """Получает список всех пользователей с их VK и Telegram аккаунтами."""
+    admin_key_header = request.headers.get("Authorization")
+    if not admin_key_header or not admin_key_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Отсутствует или неверный формат Bearer токена")
     
-    # Если ключа нет в заголовке, пытаемся получить из cookie
-    if not admin_key:
-        admin_key = request.cookies.get("admin_key")
-    
-    if not admin_key or not await verify_admin_key(admin_key):
-        raise HTTPException(status_code=401, detail="Invalid admin key")
-    
-    # Получаем пользователей напрямую из PostgreSQL
-    pool = await user_manager.get_db_pool()
-    if not pool:
-        logger.error("Не удалось получить пул соединений к БД для /admin/users")
-        raise HTTPException(status_code=500, detail="Ошибка сервера: База данных недоступна")
-        
-    users_list = []
+    token = admin_key_header.split(" ")[1]
+    if not await verify_admin_key(token):
+        raise HTTPException(status_code=401, detail="Неверный админ-ключ")
+
+    pool = await get_db_pool()
+    # Используем api_key как ключ словаря
+    users_data: Dict[str, Dict[str, Any]] = {} 
+
     try:
         async with pool.acquire() as conn:
-            user_records = await conn.fetch("SELECT api_key, username, created_at, last_used, vk_token FROM users")
-            # Преобразуем записи в словари, совместимые с предыдущим форматом
+            # 1. Получаем всех пользователей, используя api_key
+            users_query = "SELECT api_key, username FROM users ORDER BY username" # Запрашиваем api_key и username
+            user_records = await conn.fetch(users_query)
+
+            if not user_records:
+                logger.info("Пользователи не найдены.")
+                return []
+
+            # Инициализируем словарь пользователей
+            api_keys_list = [] # Список API ключей для запросов аккаунтов
             for record in user_records:
-                users_list.append({
-                    "id": record['api_key'], # Используем api_key как id для совместимости с фронтендом
-                    "api_key": record['api_key'],
+                api_key = record['api_key'] # Получаем api_key
+                api_keys_list.append(api_key) 
+                users_data[api_key] = {
+                    # Заполняем UserInfo.id значением api_key
+                    "id": api_key, 
                     "username": record['username'],
-                    "created_at": record['created_at'].isoformat() if record['created_at'] else None,
-                    "last_used": record['last_used'].isoformat() if record['last_used'] else None,
-                    "vk_token": "******" if record['vk_token'] else None # Не отдаем токен в списке
-                    # Добавьте поля telegram_accounts и vk_accounts, если они нужны фронтенду (потребуются доп. запросы)
-                })
-            logger.info(f"Получено {len(users_list)} пользователей из БД.")
+                    "api_key": api_key, # Дублируем для поля api_key в UserInfo
+                    "vk_accounts": [],
+                    "telegram_accounts": []
+                }
+                
+            if not api_keys_list: 
+                return []
+
+            # 2. Получаем все VK аккаунты для этих пользователей
+            # Фильтруем по user_api_key, используя список api_keys_list
+            # ANY($1::text[]) или ANY($1::varchar[]) в зависимости от точного типа в БД
+            vk_query = """
+                SELECT id, user_api_key, token, user_name, proxy, status, is_active, added_at 
+                FROM vk_accounts 
+                WHERE user_api_key = ANY($1::text[]) 
+                ORDER BY added_at DESC
+            """
+            # Передаем список API ключей
+            vk_records = await conn.fetch(vk_query, api_keys_list) 
             
+            for record in vk_records:
+                user_api_key = record['user_api_key'] 
+                if user_api_key in users_data:
+                    masked_token = maskToken(record['token']) if record['token'] else None
+                    users_data[user_api_key]["vk_accounts"].append({
+                        "id": str(record['id']), # ID аккаунта VK
+                        "user_api_key": user_api_key, # Связь с пользователем
+                        "token": masked_token,
+                        "user_name": record['user_name'],
+                        "proxy": record['proxy'],
+                        "status": record['status'],
+                        "is_active": record['is_active'],
+                        "added_at": record['added_at'] 
+                    })
+
+            # 3. Получаем все Telegram аккаунты для этих пользователей
+            # Фильтруем по user_api_key
+            tg_query = """
+                SELECT id, user_api_key, phone, proxy, status, is_active, added_at 
+                FROM telegram_accounts 
+                WHERE user_api_key = ANY($1::text[])
+                ORDER BY added_at DESC
+            """
+             # Передаем список API ключей
+            tg_records = await conn.fetch(tg_query, api_keys_list)
+            
+            for record in tg_records:
+                user_api_key = record['user_api_key'] 
+                if user_api_key in users_data:
+                    users_data[user_api_key]["telegram_accounts"].append({
+                        "id": str(record['id']), # ID аккаунта Telegram
+                        "user_api_key": user_api_key, # Связь с пользователем
+                        "phone": record['phone'],
+                        "proxy": record['proxy'],
+                        "status": record['status'],
+                        "is_active": record['is_active'],
+                        "added_at": record['added_at'],
+                        "api_id": None, # Не передаем на фронт
+                        "api_hash": None # Не передаем на фронт
+                    })
+
+        # Преобразуем словарь users_data в список объектов UserInfo
+        result_list = [UserInfo(**user_info) for user_info in users_data.values()]
+        
+        logger.info(f"Успешно получены данные для {len(result_list)} пользователей.")
+        return result_list
+
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при получении пользователей и аккаунтов: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}") 
     except Exception as e:
-        logger.error(f"Ошибка при получении списка пользователей из БД: {e}", exc_info=True)
-         raise HTTPException(status_code=500, detail="Ошибка получения данных пользователей")
-    
-    # Логику проверки/генерации API ключей убираем, т.к. ключ генерируется в register_user
-            
-    return users_list
+        logger.error(f"Неизвестная ошибка при получении пользователей: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера при получении пользователей")
+
+
+
+# Вспомогательная функция маскировки токена (если ее нет)
+def maskToken(token: str | None) -> str | None:
+    """Маскирует VK токен, оставляя видимыми только часть символов."""
+    if not token:
+        return None
+    if token.startswith("vk1.a.") and len(token) > 15:
+         return token[:8] + "..." + token[-4:]
+    elif len(token) > 8:
+        return token[:4] + "..." + token[-4:]
+    else:
+        return token
 
 @app.get("/admin/users/{api_key}", dependencies=[Security(verify_admin_key)])
 async def admin_user(api_key: str):
@@ -579,8 +689,8 @@ async def delete_user_by_id(user_id: str, request: Request):
                 
                 if not user_exists:
                     logger.error(f"Пользователь с ID {user_id} не найден в базе данных для удаления")
-            raise HTTPException(status_code=404, detail="Пользователь не найден")
-        
+                    raise HTTPException(status_code=404, detail="Пользователь не найден")
+                
                 logger.info(f"Пользователь {user_id} найден, удаляем связанные аккаунты и пользователя...")
                 
                 # Удаляем связанные аккаунты (внешние ключи с ON DELETE CASCADE должны сработать, но для явности можно оставить)
@@ -588,7 +698,7 @@ async def delete_user_by_id(user_id: str, request: Request):
                 vk_deleted = await conn.execute('DELETE FROM vk_accounts WHERE user_api_key = $1', user_id)
                 logger.info(f"Удалено telegram аккаунтов: {tg_deleted.split()[-1]}, vk аккаунтов: {vk_deleted.split()[-1]}") # Извлекаем количество из строки 'DELETE N'
         
-        # Затем удаляем самого пользователя
+                # Затем удаляем самого пользователя
                 delete_result = await conn.execute('DELETE FROM users WHERE api_key = $1', user_id)
                 user_deleted = int(delete_result.split()[-1]) # Извлекаем количество из строки 'DELETE N'
         
@@ -603,7 +713,7 @@ async def delete_user_by_id(user_id: str, request: Request):
     except HTTPException as e:
         # Перенаправляем ошибку 404
         if e.status_code == 404:
-        raise e
+            raise e
         # Логируем другие HTTP ошибки
         logger.error(f"HTTP ошибка при удалении пользователя {user_id}: {e.detail}", exc_info=True)
         raise HTTPException(status_code=e.status_code, detail=f"Ошибка при удалении пользователя: {e.detail}")
@@ -655,13 +765,13 @@ async def register_user_endpoint(request: Request):
     # Создаем нового пользователя с помощью функции из user_manager
     try:
         # Предполагаем, что register_user теперь асинхронная и работает с БД
-    api_key = await register_user(username, password)
+        api_key = await register_user(username, password)
         if not api_key:
-             logger.error(f"Функция register_user не вернула api_key для пользователя {username}")
-             raise HTTPException(status_code=500, detail="Не удалось создать пользователя")
+            logger.error(f"Функция register_user не вернула api_key для пользователя {username}")
+            raise HTTPException(status_code=500, detail="Не удалось создать пользователя")
     
         logger.info(f"Успешно зарегистрирован пользователь {username} с api_key {api_key}")
-    return {"id": api_key, "username": username, "api_key": api_key}
+        return {"id": api_key, "username": username, "api_key": api_key}
         
     except Exception as e:
         logger.error(f"Ошибка при вызове register_user для пользователя {username}: {e}", exc_info=True)
@@ -1147,7 +1257,7 @@ async def add_telegram_account_endpoint(request: Request):
                 
                 # Получаем информацию о пользователе, чтобы убедиться, что сессия действительно работает
                 me = await client.get_me()
-                logger.info(f"Успешно получена информация о пользователе: {me.id}")
+                logger.info(f"Успешно получена информация о пользователе: {getattr(me, 'id', getattr(me, 'user_id', str(me)))}")
             
             # Исправляем ошибку: client.disconnect() может не быть корутиной
             if asyncio.iscoroutinefunction(client.disconnect):
@@ -1285,36 +1395,30 @@ async def verify_telegram_code(request: Request):
         logger.error("account_id или code отсутствуют в запросе на верификацию")
         raise HTTPException(400, "Необходимы account_id и code")
 
-    # Используем асинхронное подключение к базе данных
-    conn = await get_db_connection()
+    # Используем пул соединений для PostgreSQL
+    pool = await get_db_connection()
     
     # Получаем все необходимые данные, включая phone_code_hash
-    query = 'SELECT phone, api_id, api_hash, session_file, proxy, phone_code_hash FROM telegram_accounts WHERE id = ?'
-    account = await conn.execute(query, (account_id,))
-    account = await account.fetchone()
-    # conn НЕ закрываем здесь, он понадобится для обновления статуса
-
-    if not account:
+    query = 'SELECT phone, api_id, api_hash, session_file, proxy, phone_code_hash FROM telegram_accounts WHERE id = $1'
+    account_record = await pool.fetchrow(query, account_id)
+    
+    if not account_record:
         logger.error(f"Аккаунт {account_id} не найден для верификации кода")
-        await conn.close()
         raise HTTPException(404, "Аккаунт не найден")
 
-    account_dict = dict(account)
-    phone = account_dict.get("phone")
-    api_id_str = account_dict.get("api_id")
-    api_hash = account_dict.get("api_hash")
-    session_file = account_dict.get("session_file")
-    proxy = account_dict.get("proxy")
-    phone_code_hash = account_dict.get("phone_code_hash") # Получаем сохраненный хэш
+    phone = account_record['phone']
+    api_id_str = account_record['api_id']
+    api_hash = account_record['api_hash']
+    session_file = account_record['session_file']
+    proxy = account_record['proxy']
+    phone_code_hash = account_record['phone_code_hash'] # Получаем сохраненный хэш
 
     if not all([phone, api_id_str, api_hash, session_file]):
         logger.error(f"Неполные данные для верификации кода аккаунта {account_id}")
-        await conn.close()
         raise HTTPException(400, "Неполные данные аккаунта для верификации")
 
     if not phone_code_hash:
          logger.error(f"Отсутствует phone_code_hash для аккаунта {account_id}. Невозможно верифицировать код.")
-         await conn.close()
          raise HTTPException(400, "Сначала нужно запросить код авторизации (phone_code_hash отсутствует)")
     try:
         api_id = int(api_id_str) if api_id_str is not None else None
@@ -1322,13 +1426,12 @@ async def verify_telegram_code(request: Request):
             raise ValueError("api_id не может быть None")
     except (ValueError, TypeError):
         logger.error(f"Неверный формат api_id {api_id_str} для верификации кода аккаунта {account_id}")
-        await conn.close()
         raise HTTPException(400, f"Неверный формат api_id: {api_id_str}")
 
     client = None
     try:
         logger.info(f"Создание клиента для верификации кода, сессия: {session_file}")
-        client = await telegram_utils.create_telegram_client(session_file, api_id, api_hash, proxy)
+        client = await telegram_utils.create_telegram_client(str(session_file), api_id, str(api_hash), proxy)
 
         logger.info(f"Подключение клиента для верификации кода аккаунта {account_id}")
         await client.connect()
@@ -1338,21 +1441,18 @@ async def verify_telegram_code(request: Request):
             try:
                 logger.info(f"Попытка входа с кодом для аккаунта {account_id}")
                 # Используем phone_code_hash из базы данных
-                user = await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                user = await client.sign_in(str(phone), code, phone_code_hash=phone_code_hash)
                 logger.info(f"Вход с кодом для {account_id} успешен.")
             except SessionPasswordNeededError:
                 logger.info(f"Для аккаунта {account_id} требуется пароль 2FA")
                 if not password:
                     # Если пароль нужен, но не предоставлен, возвращаем специальный статус
                     logger.warning(f"Пароль 2FA не предоставлен для {account_id}, но он требуется.")
-                    await conn.close()
                     # Обновляем статус, чтобы UI знал, что нужен пароль
                     try:
-                        conn_update = await get_db_connection()
-                        update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-                        await conn_update.execute(update_query, ('pending_2fa', account_id))
-                        await conn_update.commit()
-                        await conn_update.close()
+                        async with pool.acquire() as conn:
+                            update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                            await conn.execute(update_query, 'pending_2fa', account_id)
                     except Exception as db_err:
                         logger.error(f"Не удалось обновить статус на 'pending_2fa' для {account_id}: {db_err}")
 
@@ -1363,63 +1463,49 @@ async def verify_telegram_code(request: Request):
                     logger.info(f"Вход с паролем 2FA для {account_id} успешен.")
                 except PasswordHashInvalidError:
                     logger.error(f"Неверный пароль 2FA для аккаунта {account_id}")
-                    await conn.close()
                     # Не меняем статус, чтобы можно было попробовать снова ввести пароль
                     raise HTTPException(status_code=400, detail="Неверный пароль 2FA")
                 except Exception as e_pwd:
                     logger.error(f"Ошибка при входе с паролем 2FA для {account_id}: {str(e_pwd)}", exc_info=True)
-                    await conn.close()
                     # Статус 'error' при других ошибках пароля
                     try:
-                        conn_update = await get_db_connection()
-                        update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-                        await conn_update.execute(update_query, ('error', account_id))
-                        await conn_update.commit()
-                        await conn_update.close()
+                        async with pool.acquire() as conn:
+                            update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                            await conn.execute(update_query, 'error', account_id)
                     except Exception as db_err:
                         logger.error(f"Не удалось обновить статус на 'error' после ошибки 2FA для {account_id}: {db_err}")
                     raise HTTPException(status_code=500, detail=f"Ошибка при входе с паролем 2FA: {str(e_pwd)}")
 
             except PhoneCodeInvalidError as e_code:
                  logger.error(f"Ошибка кода (PhoneCodeInvalidError) для аккаунта {account_id}: {str(e_code)}")
-                 await conn.close()
                  # Статус 'pending_code' - код неверный или истек, нужно запросить новый
                  try:
-                     conn_update = await get_db_connection()
-                     update_query = 'UPDATE telegram_accounts SET status = ?, phone_code_hash = NULL WHERE id = ?'
-                     await conn_update.execute(update_query, ('pending_code', account_id))
-                     await conn_update.commit()
-                     await conn_update.close()
+                     async with pool.acquire() as conn:
+                         update_query = 'UPDATE telegram_accounts SET status = $1, phone_code_hash = NULL WHERE id = $2'
+                         await conn.execute(update_query, 'pending_code', account_id)
                  except Exception as db_err:
                      logger.error(f"Не удалось обновить статус на 'pending_code' после ошибки кода для {account_id}: {db_err}")
                  raise HTTPException(status_code=400, detail=f"Ошибка кода: {str(e_code)}")
             except PhoneCodeExpiredError as e_code:
                  logger.error(f"Ошибка кода (PhoneCodeExpiredError) для аккаунта {account_id}: {str(e_code)}")
-                 await conn.close()
                  # Статус 'pending_code' - код неверный или истек, нужно запросить новый
                  try:
-                     conn_update = await get_db_connection()
-                     update_query = 'UPDATE telegram_accounts SET status = ?, phone_code_hash = NULL WHERE id = ?'
-                     await conn_update.execute(update_query, ('pending_code', account_id))
-                     await conn_update.commit()
-                     await conn_update.close()
+                     async with pool.acquire() as conn:
+                         update_query = 'UPDATE telegram_accounts SET status = $1, phone_code_hash = NULL WHERE id = $2'
+                         await conn.execute(update_query, 'pending_code', account_id)
                  except Exception as db_err:
                      logger.error(f"Не удалось обновить статус на 'pending_code' после ошибки кода для {account_id}: {db_err}")
                  raise HTTPException(status_code=400, detail=f"Ошибка кода: {str(e_code)}")
             except FloodWaitError as e_flood:
                  logger.error(f"Ошибка FloodWait при верификации кода для {account_id}: ждите {e_flood.seconds} секунд")
-                 await conn.close()
                  raise HTTPException(status_code=429, detail=f"Слишком много попыток. Попробуйте через {e_flood.seconds} секунд.")
             except Exception as e_signin:
                  logger.error(f"Непредвиденная ошибка при входе для аккаунта {account_id}: {str(e_signin)}", exc_info=True)
-                 await conn.close()
                  # Статус 'error' при других ошибках входа
                  try:
-                     conn_update = await get_db_connection()
-                     update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-                     await conn_update.execute(update_query, ('error', account_id))
-                     await conn_update.commit()
-                     await conn_update.close()
+                     async with pool.acquire() as conn:
+                         update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                         await conn.execute(update_query, 'error', account_id)
                  except Exception as db_err:
                      logger.error(f"Не удалось обновить статус на 'error' после ошибки входа для {account_id}: {db_err}")
                  raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при входе: {str(e_signin)}")
@@ -1430,10 +1516,12 @@ async def verify_telegram_code(request: Request):
         # Если мы дошли сюда, значит авторизация прошла успешно
         logger.info(f"Аккаунт {account_id} успешно авторизован/верифицирован.")
         # Обновляем статус на 'active' и очищаем phone_code_hash
-        update_query = "UPDATE telegram_accounts SET status = ?, phone_code_hash = NULL WHERE id = ?"
-        await conn.execute(update_query, ('active', account_id))
-        await conn.commit()
-        await conn.close()
+        try:
+            async with pool.acquire() as conn:
+                update_query = "UPDATE telegram_accounts SET status = $1, phone_code_hash = NULL WHERE id = $2"
+                await conn.execute(update_query, 'active', account_id)
+        except Exception as db_err:
+            logger.error(f"Не удалось обновить статус на 'active' для {account_id}: {db_err}")
 
         user_info = {}
         if user:
@@ -1452,23 +1540,22 @@ async def verify_telegram_code(request: Request):
 
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в процессе верификации для {account_id}: {str(e)}", exc_info=True)
-        if conn: # Закрываем соединение, если оно еще открыто
-            await conn.close()
         # Статус 'error' при глобальных ошибках
         try:
-            conn_update = await get_db_connection()
-            update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-            await conn_update.execute(update_query, ('error', account_id))
-            await conn_update.commit()
-            await conn_update.close()
+            async with pool.acquire() as conn:
+                update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                await conn.execute(update_query, 'error', account_id)
         except Exception as db_err:
              logger.error(f"Не удалось обновить статус на 'error' после глобальной ошибки верификации для {account_id}: {db_err}")
 
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при верификации: {str(e)}")
     finally:
-        if client and client.is_connected():
-            await client.disconnect()
-            logger.info(f"Клиент для верификации кода аккаунта {account_id} отключен.")
+        if client:
+            if hasattr(client, 'is_connected') and callable(client.is_connected):
+                is_connected = client.is_connected()
+                if is_connected:
+                    client.disconnect()
+                    logger.info(f"Клиент для верификации кода аккаунта {account_id} отключен.")
 
 @app.post("/api/telegram/verify-2fa")
 async def verify_telegram_2fa(request: Request):
@@ -1502,7 +1589,7 @@ async def verify_telegram_2fa(request: Request):
         async with pool.acquire() as conn:
             async with conn.transaction():
                 # Находим аккаунт по ID, используя asyncpg синтаксис
-    query = '''
+                query = '''
                     SELECT api_id, api_hash, phone, proxy, session_file 
                     FROM telegram_accounts 
                     WHERE id = $1
@@ -1530,24 +1617,24 @@ async def verify_telegram_2fa(request: Request):
                 # if proxy:
                 #     client.set_proxy(proxy)
         
-        await client.connect()
+                await client.connect()
                 # Пытаемся войти с паролем (Telethon сам обработает, если пароль не нужен)
                 await client.sign_in(phone=phone, password=password) # Передаем и телефон на всякий случай
                 logger.info(f"Telethon sign_in выполнен успешно для аккаунта {account_id}")
         
                 # Обновляем статус аккаунта в той же транзакции
-        update_query = '''
-            UPDATE telegram_accounts
+                update_query = '''
+                    UPDATE telegram_accounts
                     SET status = $1
                     WHERE id = $2
                 '''
                 update_result = await conn.execute(update_query, 'active', account_id)
                 
                 if 'UPDATE 1' not in update_result:
-                     # Это маловероятно, так как мы только что нашли запись
-                     logger.error(f"Не удалось обновить статус для аккаунта {account_id} после 2FA")
-                     # Транзакция откатится
-                     raise HTTPException(status_code=500, detail="Не удалось обновить статус аккаунта")
+                    # Это маловероятно, так как мы только что нашли запись
+                    logger.error(f"Не удалось обновить статус для аккаунта {account_id} после 2FA")
+                    # Транзакция откатится
+                    raise HTTPException(status_code=500, detail="Не удалось обновить статус аккаунта")
                 
                 logger.info(f"Статус аккаунта {account_id} обновлен на 'active' в БД.")
                 # Транзакция закоммитится автоматически при выходе из блока 'async with conn.transaction()'
@@ -1567,8 +1654,8 @@ async def verify_telegram_2fa(request: Request):
         logger.warning(f"Ошибка авторизации Telethon (неверный пароль?) для аккаунта {account_id}: {auth_err}")
         raise HTTPException(status_code=400, detail=f"Ошибка авторизации: Неверный пароль.")
     except FloodWaitError as flood_err:
-         logger.warning(f"FloodWaitError при верификации 2FA для аккаунта {account_id}: {flood_err}")
-         raise HTTPException(status_code=429, detail=f"Слишком много попыток. Подождите {flood_err.seconds} секунд.")
+        logger.warning(f"FloodWaitError при верификации 2FA для аккаунта {account_id}: {flood_err}")
+        raise HTTPException(status_code=429, detail=f"Слишком много попыток. Подождите {flood_err.seconds} секунд.")
     except Exception as e:
         # Логируем другие ошибки (Telethon, DB и т.д.)
         logger.error(f"Непредвиденная ошибка при верификации 2FA для аккаунта {account_id}: {e}", exc_info=True)
@@ -1584,7 +1671,7 @@ async def verify_telegram_2fa(request: Request):
                     client.disconnect()
                 logger.info(f"Клиент Telethon для аккаунта {account_id} отключен после верификации 2FA.")
             except Exception as disc_err:
-                 logger.error(f"Ошибка при отключении клиента Telethon для аккаунта {account_id}: {disc_err}", exc_info=True)
+                logger.error(f"Ошибка при отключении клиента Telethon для аккаунта {account_id}: {disc_err}", exc_info=True)
         # Соединение с БД закрывается автоматически блоком 'async with pool.acquire()'
 
 @app.delete("/api/telegram/accounts/{account_id}")
@@ -1605,46 +1692,47 @@ async def delete_telegram_account_endpoint(request: Request, account_id: str):
         raise HTTPException(400, "ID пользователя не указан")
     
     # Находим аккаунт по ID
-    from user_manager import get_db_connection
-    conn = await get_db_connection()
+    from user_manager import get_db_pool
+    pool = await get_db_pool()
     
-    query = '''
-        SELECT * FROM telegram_accounts 
-        WHERE id = ? 
-    '''
-    account = await conn.execute(query, (account_id,))
-    account = await account.fetchone()
-    
-    if not account:
-        await conn.close()
-        raise HTTPException(404, "Аккаунт с указанным ID не найден")
-    
-    # Преобразуем объект sqlite3.Row в словарь
-    account_dict = dict(account)
-    account_id = account_dict['id']
-    session_file = account_dict.get('session_file')
-    
-    # Удаляем файл сессии, если он есть
-    if session_file:
-        session_path = f"{session_file}.session"
-        if os.path.exists(session_path):
-            os.remove(session_path)
-        # Проверяем, пуста ли директория пользователя, и если да, удаляем её
-        user_dir = os.path.dirname(session_file)
-        if os.path.exists(user_dir) and not os.listdir(user_dir):
-            os.rmdir(user_dir)
-            logger.info(f"Удалена пустая директория: {user_dir}")
-    
-    # Удаляем аккаунт из базы данных
-    await conn.execute('''
-        DELETE FROM telegram_accounts 
-        WHERE id = ?
-    ''', (account_id,))
-    
-    await conn.commit()
-    await conn.close()
-    
-    return {"status": "success"}
+    try:
+        async with pool.acquire() as conn:
+            # Находим аккаунт по ID
+            query = '''
+                SELECT * FROM telegram_accounts 
+                WHERE id = $1 
+            '''
+            account = await conn.fetchrow(query, account_id)
+            
+            if not account:
+                raise HTTPException(404, "Аккаунт с указанным ID не найден")
+            
+            # Преобразуем объект Record в словарь
+            account_dict = dict(account)
+            session_file = account_dict.get('session_file')
+            
+            # Удаляем файл сессии, если он есть
+            if session_file:
+                session_path = f"{session_file}.session"
+                if os.path.exists(session_path):
+                    os.remove(session_path)
+                # Проверяем, пуста ли директория пользователя, и если да, удаляем её
+                user_dir = os.path.dirname(session_file)
+                if os.path.exists(user_dir) and not os.listdir(user_dir):
+                    os.rmdir(user_dir)
+                    logger.info(f"Удалена пустая директория: {user_dir}")
+            
+            # Удаляем аккаунт из базы данных
+            delete_query = '''
+                DELETE FROM telegram_accounts 
+                WHERE id = $1
+            '''
+            await conn.execute(delete_query, account_id)
+            
+            return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Ошибка при удалении Telegram аккаунта {account_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка при удалении аккаунта: {str(e)}")
 
 @app.put("/api/telegram/accounts/{account_id}")
 async def update_telegram_account(account_id: str, request: Request):
@@ -1660,19 +1748,19 @@ async def update_telegram_account(account_id: str, request: Request):
    
     # 2. Получить данные из тела запроса
     try:
-    data = await request.json()
-    new_proxy = data.get('proxy') # Может быть None или пустой строкой
+        data = await request.json()
+        new_proxy = data.get('proxy')  # Может быть None или пустой строкой
         # Валидация прокси, если нужно
         if new_proxy:
             from telegram_utils import validate_proxy
             is_valid, _ = validate_proxy(new_proxy)
             if not is_valid:
-                 raise HTTPException(status_code=400, detail="Неверный формат прокси")
+                raise HTTPException(status_code=400, detail="Неверный формат прокси")
                  
     except json.JSONDecodeError:
         logger.error(f"Ошибка декодирования JSON при обновлении прокси TG {account_id}")
         raise HTTPException(status_code=400, detail="Некорректный формат JSON")
-    except HTTPException as http_exc: # Перебрасываем свои HTTP ошибки (например, от валидации прокси)
+    except HTTPException as http_exc:  # Перебрасываем свои HTTP ошибки (например, от валидации прокси)
         raise http_exc
     except Exception as e:
         logger.error(f"Ошибка при получении/валидации данных для обновления прокси TG {account_id}: {e}")
@@ -1723,143 +1811,154 @@ async def update_telegram_account(account_id: str, request: Request):
 async def add_vk_account_endpoint(request: Request):
     """Добавляет новый VK аккаунт."""
     logger.info("Начало обработки запроса на добавление VK аккаунта")
-    auth_header = request.headers.get('authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        logger.error("API ключ не предоставлен или в неверном формате")
-        raise HTTPException(status_code=401, detail="API ключ обязателен")
-    admin_key = auth_header.split(' ')[1]
-    
-    # Получаем ID пользователя, для которого добавляется аккаунт
-    user_id = request.headers.get('X-User-Id')
-    if not user_id:
-        logger.error("ID пользователя не указан")
-        raise HTTPException(status_code=400, detail="ID пользователя не указан")
-    
-    # Проверяем админ-ключ
-    if not await verify_admin_key(admin_key):
-        logger.error(f"Неверный админ-ключ: {admin_key}")
-        raise HTTPException(status_code=401, detail="Неверный админ-ключ")
-    
-    logger.info(f"Админ-ключ верифицирован, обрабатываем данные аккаунта для пользователя {user_id}")
-    
-    # Получаем данные из JSON тела запроса
+    from fastapi import UploadFile
     try:
-        data = await request.json()
-        token = data.get('token')
-        proxy = data.get('proxy') # Может быть None
-    except json.JSONDecodeError:
-        logger.error("Ошибка декодирования JSON при добавлении VK аккаунта")
-        raise HTTPException(status_code=400, detail="Некорректный формат JSON")
-
-    # Проверяем наличие и тип токена
-    if not token or not isinstance(token, str):
-        logger.error("Токен VK обязателен и должен быть строкой")
-        raise HTTPException(status_code=400, detail="Токен VK обязателен и должен быть строкой")
-    
-    # Проверяем тип прокси
-    if proxy is not None and not isinstance(proxy, str):
-        logger.error("Поле proxy должно быть строкой или null")
-        raise HTTPException(status_code=400, detail="Поле proxy должно быть строкой или null")
-    
-    # Проверяем формат токена
-    if not token.startswith('vk1.a.'):
-        logger.error("Неверный формат токена VK, должен начинаться с vk1.a.")
-        raise HTTPException(status_code=400, detail="Неверный формат токена VK, должен начинаться с vk1.a.")
-    
-    # Валидируем прокси, если он указан
-    if proxy:
-        logger.info(f"Проверка прокси для VK: {proxy}")
-        from vk_utils import validate_proxy
-        is_valid = validate_proxy(proxy) # vk_utils.validate_proxy принимает str | None
+        # Обрабатываем как form-data
+        form_data = await request.form()
+        token = form_data.get("token")
+        proxy = form_data.get("proxy", "")
+        user_id = form_data.get("userId")
         
-        if not is_valid:
-            logger.error(f"Неверный формат прокси: {proxy}")
-            raise HTTPException(status_code=400, detail="Неверный формат прокси")
+        # Получаем admin_key из заголовков
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            admin_key = auth_header.split(' ')[1]
+        else:
+            admin_key = request.cookies.get("admin_key")
+        
+        if not admin_key:
+            logger.error("Admin ключ не предоставлен")
+            raise HTTPException(status_code=401, detail="Admin ключ обязателен")
+            
+        if not user_id:
+            logger.error("ID пользователя не указан")
+            raise HTTPException(status_code=400, detail="ID пользователя не указан")
+            
+        if not token:
+            logger.error("Токен VK не указан")
+            raise HTTPException(status_code=400, detail="Токен VK обязателен")
+        
+        # Проверяем админ-ключ
+        if not await verify_admin_key(admin_key):
+            logger.error(f"Неверный админ-ключ: {admin_key}")
+            raise HTTPException(status_code=401, detail="Неверный админ-ключ")
+        
+        if isinstance(token, UploadFile):
+            token_data = await token.read()
+            token_str = token_data.decode('utf-8') if isinstance(token_data, bytes) else str(token_data)
+        else:
+            token_str = str(token) if token is not None else ""
 
-    # Генерируем ID аккаунта
-    account_id = str(uuid.uuid4())
-    
-    # Шифруем токен
-    try:
-        from user_manager import cipher
-        encrypted_token = cipher.encrypt(token.encode()).decode()
+        if proxy and isinstance(proxy, UploadFile):
+            proxy_data = await proxy.read()
+            proxy_str = proxy_data.decode('utf-8') if isinstance(proxy_data, bytes) else str(proxy_data)
+        else:
+            proxy_str = str(proxy) if proxy is None else ""
+        
+        logger.info(f"Админ-ключ верифицирован, обрабатываем данные аккаунта для пользователя {user_id}")
+        
+        # Проверяем формат токена
+
+
+        if not isinstance(token_str, str) or not token_str.startswith('vk1.a.'):
+            logger.error("Неверный формат токена VK")
+            raise HTTPException(status_code=400, detail="Неверный формат токена VK")
+        
+        # Валидируем прокси, если он указан
+        if proxy:
+            logger.info(f"Проверка прокси для VK: {proxy}")
+            from vk_utils import validate_proxy
+            is_valid = validate_proxy(proxy_str)
+            
+            if not is_valid:
+                logger.error(f"Неверный формат прокси: {proxy}")
+                raise HTTPException(status_code=400, detail="Неверный формат прокси")
+
+        # Генерируем ID аккаунта
+        account_id = str(uuid.uuid4())
+        
+        # Проверяем токен через VK API
+        vk_user_id = None
+        vk_user_name = None
+        status = "pending"
+        error_message = None
+        error_code = None
+        
+        try:
+            # Используем прокси при создании клиента, если он указан и валиден
+            from vk_utils import VKClient
+            
+            # Передаем исходный, нешифрованный токен и проверенный proxy
+            token_str_safe = str(token_str) if token_str is not None else None
+            proxy_str_safe = str(proxy_str) if proxy_str is not None else None
+            if token_str_safe is None:
+                raise HTTPException(status_code=400, detail="Не указан токен VK")
+
+            async with VKClient(token_str_safe, proxy_str_safe, account_id, admin_key) as vk:
+                result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
+                if "response" in result and result["response"]:
+                    vk_user_info = result["response"][0]
+                    vk_user_id = vk_user_info.get('id')
+                    vk_user_name = vk_user_info.get('first_name', '') + ' ' + vk_user_info.get('last_name', '')
+                    status = "active"
+                    logger.info(f"Токен VK успешно проверен для пользователя {vk_user_id} ({vk_user_name})")
+                else:
+                    error_info = result.get('error', {})
+                    error_message = error_info.get('error_msg', 'Неизвестная ошибка VK API')
+                    error_code = error_info.get('error_code')
+                    status = "error"
+                    logger.error(f"Ошибка проверки токена VK: {error_message} (Код: {error_code})")
+                    
         except Exception as e:
-        logger.error(f"Ошибка шифрования токена VK: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Ошибка сервера при обработке токена")
-    
-    # Подготавливаем данные для сохранения
-    account_data = {
-        "id": account_id,
-        "token": encrypted_token, # Передаем зашифрованный токен
-        "proxy": proxy,
-        "status": "pending", # Изначально статус ожидания проверки
-        "requests_count": 0,
-        "last_request_time": None,
-        "added_at": datetime.now(timezone.utc).isoformat(), # Добавляем время добавления
-        "user_id": None, # Будет определено после проверки токена
-        "user_name": None,
-        "error_message": None,
-        "error_code": None,
-        "last_checked_at": None,
-        "is_active": True, # По умолчанию активен
-        "request_limit": 1000 # Значение по умолчанию
-    }
-
-    # Проверяем токен через VK API
-    vk_user_id = None
-    vk_user_name = None
-    try:
-        # Используем прокси при создании клиента, если он указан и валиден
-        from vk_utils import VKClient
-        # Передаем исходный, нешифрованный токен и проверенный proxy
-        async with VKClient(token, proxy, account_id, admin_key) as vk:
-            result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
-            if "response" in result and result["response"]:
-                vk_user_info = result["response"][0]
-                vk_user_id = vk_user_info.get('id')
-                vk_user_name = vk_user_info.get('first_name', '') + ' ' + vk_user_info.get('last_name', '')
-                account_data["status"] = "active"
-                account_data["user_id"] = vk_user_id
-                account_data["user_name"] = vk_user_name.strip()
-                account_data["error_message"] = None
-                account_data["error_code"] = None
-                logger.info(f"Токен VK успешно проверен для пользователя {vk_user_id} ({vk_user_name})")
-            else:
-                error_info = result.get('error', {})
-                error_msg = error_info.get('error_msg', 'Неизвестная ошибка VK API')
-                error_code = error_info.get('error_code')
-                account_data["status"] = "error"
-                account_data["error_message"] = error_msg
-                account_data["error_code"] = error_code
-                logger.error(f"Ошибка проверки токена VK: {error_msg} (Код: {error_code})")
-                # Не прерываем добавление, просто сохраняем аккаунт со статусом error
-                
-    except Exception as e:
-        logger.error(f"Исключение при проверке токена VK через API: {e}", exc_info=True)
-        account_data["status"] = "error"
-        account_data["error_message"] = f"Ошибка подключения или API: {str(e)[:200]}" # Ограничиваем длину
-        # Не прерываем добавление
+            logger.error(f"Исключение при проверке токена VK через API: {e}", exc_info=True)
+            status = "error"
+            error_message = f"Ошибка подключения или API: {str(e)[:200]}"
         
-    # Обновляем время последней проверки
-    account_data["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-
-    # Добавляем аккаунт в базу данных через функцию admin_panel
-    try:
-        # Предполагаем, что admin_add_vk_account корректно работает с asyncpg
-        await admin_add_vk_account(user_id, account_data)
-        logger.info(f"VK аккаунт {account_id} добавлен для пользователя {user_id} со статусом {account_data['status']}")
-        
-        return {
-            "account_id": account_id,
-            "status": account_data["status"],
+        # Подготавливаем данные для сохранения
+        account_data = {
+            "token": token,
+            "proxy": proxy,
+            "status": status,
             "vk_user_id": vk_user_id,
             "vk_user_name": vk_user_name,
-            "message": "VK аккаунт добавлен" + (" (требует проверки)." if account_data["status"] != "active" else ".")
+            "error_message": error_message,
+            "error_code": error_code
         }
-    except Exception as db_e:
-        logger.error(f"Ошибка при вызове admin_add_vk_account для VK аккаунта {account_id}: {db_e}", exc_info=True)
-        # В случае ошибки базы данных при добавлении, возвращаем 500
-        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при добавлении VK аккаунта")
+
+        # Используем правильную функцию add_vk_account с двумя аргументами
+        try:
+            from user_manager import add_vk_account
+            # Функция возвращает bool, а не словарь
+            user_id_str = str(user_id) if user_id is not None else ""
+            success = await add_vk_account(user_id_str, account_data)
+            
+            if not success:
+                logger.error(f"Ошибка при добавлении VK аккаунта")
+                raise HTTPException(status_code=500, detail="Не удалось добавить VK аккаунт")
+                
+            logger.info(f"VK аккаунт {account_id} добавлен для пользователя {user_id} со статусом {status}")
+            
+            return {
+                "success": True,
+                "account_id": account_id,
+                "status": status,
+                "vk_user_id": vk_user_id,
+                "vk_user_name": vk_user_name,
+                "message": "VK аккаунт добавлен" + (" (требует проверки)." if status != "active" else ".")
+            }
+            
+        except asyncpg.PostgresError as db_err:
+            logger.error(f"Ошибка PostgreSQL при добавлении VK аккаунта: {db_err}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+        except Exception as db_e:
+            logger.error(f"Ошибка при добавлении VK аккаунта {account_id}: {db_e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Ошибка при добавлении VK аккаунта: {str(db_e)}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при добавлении VK аккаунта: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {str(e)}")
 
 @app.get("/api/vk/accounts")
 async def get_vk_accounts(request: Request):
@@ -2196,7 +2295,7 @@ async def resend_telegram_code(request: Request, account_id: str):
         # Отключаем клиент, если он был создан
         if client:
             try:
-                if hasattr(client, 'is_connected') and await client.is_connected():
+                if hasattr(client, 'is_connected') and client.is_connected():
                     if asyncio.iscoroutinefunction(client.disconnect):
                         await client.disconnect()
                     else:
@@ -2219,11 +2318,8 @@ async def check_vk_account_status(request: Request, account_id: str):
         logger.error("Неверный админ-ключ")
         raise HTTPException(401, "Неверный админ-ключ")
 
-    from user_manager import get_db_pool, cipher
-    from datetime import datetime
-    from vk_utils import VKClient
-    import traceback # Для детального логгирования
-    import asyncpg # Для обработки ошибок PostgreSQL
+    from user_manager import get_db_pool, cipher # Эти импорты можно вынести наверх файла
+    from vk_utils import VKClient # Этот импорт тоже
 
     token: Optional[str] = None
     proxy: Optional[str] = None
@@ -2231,12 +2327,15 @@ async def check_vk_account_status(request: Request, account_id: str):
     status: str = "unknown"
     error_message: Optional[str] = None
     error_code: int = 0
-    last_checked_at = datetime.now().isoformat()
+    # Определяем текущее время как объект datetime один раз
+    last_checked_at_dt = datetime.now(timezone.utc) # <--- ИЗМЕНЕНО: теперь объект datetime
 
     pool = await get_db_pool()
     if not pool:
         logger.error(f"Не удалось получить пул соединений для проверки статуса VK {account_id}")
         raise HTTPException(500, "Ошибка сервера: База данных недоступна")
+
+    decrypted_token_for_update: Optional[str] = None # Переменная для хранения расшифрованного токена для обновления
 
     try:
         async with pool.acquire() as conn:
@@ -2253,16 +2352,15 @@ async def check_vk_account_status(request: Request, account_id: str):
                 proxy = account_record['proxy']
                 current_status = account_record['status']
 
-                # Проверяем наличие токена и расшифровываем его
                 if not token_value:
                     logger.warning(f"Токен отсутствует в БД для аккаунта {account_id}")
                     status = "error"
                     error_message = "Токен отсутствует в БД"
                 elif token_value.startswith('vk1.a.'):
-                    logger.info(f"Токен для {account_id} не зашифрован.")
+                    logger.info(f"Токен для {account_id} не зашифрован (или уже обновлен).")
                     token = token_value
+                    decrypted_token_for_update = token # Сохраняем для обновления
                 else:
-                    # Пытаемся расшифровать
                     try:
                         logger.info(f"Пытаемся расшифровать токен для {account_id}")
                         decrypted_token = cipher.decrypt(token_value.encode()).decode()
@@ -2270,21 +2368,15 @@ async def check_vk_account_status(request: Request, account_id: str):
                         if decrypted_token.startswith('vk1.a.'):
                             logger.info(f"Токен для {account_id} успешно расшифрован.")
                             token = decrypted_token
-                            # Обновляем токен в БД
-                            logger.info(f"Обновляем расшифрованный токен в БД для {account_id}")
-                            await conn.execute('UPDATE vk_accounts SET token = $1 WHERE id = $2', token, account_id)
+                            decrypted_token_for_update = token # Сохраняем расшифрованный токен для обновления
                         else:
-                            # Проверяем двойное шифрование
                             try:
                                 logger.info(f"Проверка двойного шифрования для {account_id}")
                                 decrypted_twice = cipher.decrypt(decrypted_token.encode()).decode()
                                 if decrypted_twice.startswith('vk1.a.'):
                                     logger.info(f"Токен для {account_id} был зашифрован дважды.")
                                     token = decrypted_twice
-                                    # Обновляем токен в БД с однократным шифрованием
-                                    encrypted_once = cipher.encrypt(token.encode()).decode()
-                                    logger.info(f"Обновляем корректно зашифрованный токен в БД для {account_id}")
-                                    await conn.execute('UPDATE vk_accounts SET token = $1 WHERE id = $2', encrypted_once, account_id)
+                                    decrypted_token_for_update = token # Сохраняем правильно расшифрованный токен
                                 else:
                                     logger.error(f"Невалидный формат токена после двойной расшифровки для {account_id}")
                                     status = "error"
@@ -2300,7 +2392,7 @@ async def check_vk_account_status(request: Request, account_id: str):
                         error_message = f"Ошибка расшифровки токена: {str(decrypt_error)}"
 
                 # --- Шаг 2: Проверка через API VK (если есть токен и нет ошибки) ---
-                if token and status == "unknown":  # Только если токен есть и ошибки расшифровки не было
+                if token and status == "unknown":
                     try:
                         logger.info(f"Проверка токена через VK API для {account_id}")
                         async with VKClient(token, proxy) as vk:
@@ -2318,27 +2410,26 @@ async def check_vk_account_status(request: Request, account_id: str):
                     except Exception as api_e:
                         logger.error(f"Ошибка при проверке токена VK API для {account_id}: {api_e}")
                         error_message = str(api_e)
-                        # Определяем статус по ошибке API
+                        # Определяем статус по ошибке API (логика остается)
+                        # ... (код определения error_code и status по api_e) ...
                         if "error_code" in error_message:
                             try:
                                 error_code = int(error_message.split("error_code")[1].split(":")[1].strip().split(",")[0])
-                            except:
-                                pass
-
+                            except: pass
                         if "Токен недействителен" in error_message or "access_token has expired" in error_message or error_code == 5:
-                            status = "invalid"
+                             status = "invalid"
                         elif "Ключ доступа сообщества недействителен" in error_message or error_code == 27:
-                            status = "invalid"
+                             status = "invalid"
                         elif "Пользователь заблокирован" in error_message or error_code == 38:
-                            status = "banned"
+                             status = "banned"
                         elif "Превышен лимит запросов" in error_message or error_code == 29:
-                            status = "rate_limited"
+                             status = "rate_limited"
                         elif "Требуется валидация" in error_message or error_code == 17:
-                            status = "validation_required"
-                        else:
-                            status = "error"
-                elif status == "unknown":  # Если токена не было изначально
-                    status = "error"  # Устанавливаем ошибку, если статус еще не был установлен
+                             status = "validation_required"
+                        else: status = "error"
+
+                elif status == "unknown":
+                    status = "error"
                     if not error_message:
                         error_message = "Токен отсутствует или не удалось расшифровать"
 
@@ -2346,18 +2437,27 @@ async def check_vk_account_status(request: Request, account_id: str):
                 user_id_to_save = user_info.get('id') if user_info else None
                 user_name_to_save = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip() if user_info else None
                 
+                # Обновляем is_active на основе статуса
+                is_active_bool = status == "active"
+
+                # Обновляем и токен, если он был успешно расшифрован или изначально был верным
                 update_query = '''
                     UPDATE vk_accounts SET
                         status = $1, user_id = $2, user_name = $3,
-                        error_message = $4, error_code = $5, last_checked_at = $6
-                    WHERE id = $7
+                        error_message = $4, error_code = $5, last_checked_at = $6,
+                        is_active = $7, token = $8 
+                    WHERE id = $9
                 '''
                 await conn.execute(
                     update_query,
-                    status, user_id_to_save, user_name_to_save, 
-                    error_message, error_code, last_checked_at, account_id
+                    status, user_id_to_save, user_name_to_save,
+                    error_message, error_code,
+                    last_checked_at_dt, # <--- ИЗМЕНЕНО: передаем объект datetime
+                    is_active_bool, # Обновляем is_active
+                    decrypted_token_for_update, # Обновляем токен
+                    account_id
                 )
-                logger.info(f"Статус аккаунта {account_id} обновлен на '{status}' в БД.")
+                logger.info(f"Статус аккаунта {account_id} обновлен на '{status}' в БД (токен также обновлен при необходимости).")
                 # Транзакция закоммитится автоматически
 
         # --- Возвращаем результат ---
@@ -2369,28 +2469,26 @@ async def check_vk_account_status(request: Request, account_id: str):
                 response_data["user_info"] = user_info
             return response_data
 
-    except HTTPException as http_exc:  # Пробрасываем HTTP исключения
+    except HTTPException as http_exc:
         raise http_exc
     except asyncpg.PostgresError as db_err:
         logger.error(f"Ошибка PostgreSQL при проверке статуса VK {account_id}: {db_err}", exc_info=True)
         raise HTTPException(500, f"Ошибка базы данных: {str(db_err)}")
     except Exception as final_e:
-        # Логируем любую другую ошибку
         logger.error(f"Непредвиденная ошибка в check_vk_account_status для {account_id}: {final_e}\n{traceback.format_exc()}")
         
-        # Попытаемся обновить статус на 'error' в отдельной транзакции
         try:
             async with pool.acquire() as conn_err:
                 async with conn_err.transaction():
                     error_update_query = '''
                         UPDATE vk_accounts 
-                        SET status = $1, 
-                            error_message = $2, 
-                            last_checked_at = $3 
+                        SET status = $1, error_message = $2, last_checked_at = $3, is_active = FALSE 
                         WHERE id = $4 AND status != $1
                     '''
                     error_msg = f"Внутренняя ошибка: {str(final_e)[:150]}"
-                    await conn_err.execute(error_update_query, 'error', error_msg, datetime.now().isoformat(), account_id)
+                    # Используем новый объект datetime для блока ошибки
+                    error_time_dt = datetime.now(timezone.utc) # <--- ИЗМЕНЕНО: объект datetime
+                    await conn_err.execute(error_update_query, 'error', error_msg, error_time_dt, account_id)
                     logger.info(f"Установлен статус 'error' для VK аккаунта {account_id} после исключения.")
         except Exception as update_err:
             logger.error(f"Не удалось обновить статус на 'error' для VK {account_id}: {update_err}")
@@ -2401,15 +2499,20 @@ async def check_vk_account_status(request: Request, account_id: str):
 async def shutdown_event():
     """Обработчик закрытия приложения."""
     logger.info("Приложение завершает работу, отключаем все клиенты Telegram")
-    # Проверяем наличие метода disconnect_all у telegram_pool
-    if hasattr(telegram_pool, 'disconnect_all'):
-        await telegram_pool.disconnect_all()
-    else:
-        # Альтернативный способ отключения клиентов
-        if hasattr(telegram_pool, 'clients'):
-            for client in telegram_pool.clients:
+    
+    # Отключаем все клиенты
+    if hasattr(telegram_pool, 'clients'):
+        for client_id, client in telegram_pool.clients.items():
+            try:
                 if hasattr(client, 'disconnect'):
-                    await client.disconnect()
+                    if asyncio.iscoroutinefunction(client.disconnect):
+                        await client.disconnect()
+                    else:
+                        client.disconnect()
+                    logger.debug(f"Клиент {client_id} отключен")
+            except Exception as e:
+                logger.warning(f"Ошибка при отключении клиента {client_id}: {e}")
+    
     logger.info("Все клиенты Telegram отключены")
 
 # Добавим эндпоинт для получения расширенной статистики аккаунтов
@@ -2806,11 +2909,11 @@ async def get_accounts_statistics_detailed(request: Request):
                         phone, 
                         status, 
                         requests_count, 
-                        extract(epoch from last_request_time) as last_request_time
+                        last_request_time
                     FROM telegram_accounts 
                     WHERE user_api_key = $1
                 ''', user_api_key)
-                
+
                 # Получаем VK аккаунты пользователя
                 vk_accounts = await conn.fetch('''
                     SELECT 
@@ -2819,7 +2922,7 @@ async def get_accounts_statistics_detailed(request: Request):
                         user_name, 
                         status, 
                         requests_count, 
-                        extract(epoch from last_request_time) as last_request_time
+                        last_request_time
                     FROM vk_accounts 
                     WHERE user_api_key = $1
                 ''', user_api_key)
@@ -2899,100 +3002,121 @@ async def api_trending_posts_extended(request: Request, data: dict):
     Получение трендовых постов с расширенными параметрами фильтрации 
     и поддержкой медиа-альбомов.
     """
-    # Инициализируем планировщик медиа
-    from media_utils import init_scheduler
-    await init_scheduler()
-    
-    platform = data.get('platform', 'telegram')
-    channel_ids = data.get('channel_ids', [])
-    if not channel_ids:
-        raise HTTPException(status_code=400, detail="ID каналов обязательны")
-    
-    # Параметры фильтрации
-    days_back = data.get('days_back', 7)
-    posts_per_channel = data.get('posts_per_channel', 10)
-    min_views = data.get('min_views')
-    min_reactions = data.get('min_reactions')
-    min_comments = data.get('min_comments')
-    min_forwards = data.get('min_forwards')
-    
-    # Получение API ключа из заголовка
-    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not api_key:
-        raise HTTPException(status_code=401, detail="API ключ не указан")
-    
-    if platform == 'telegram':
-        # Получаем следующий доступный аккаунт
-        from user_manager import get_next_available_account
+    try:
+        # Инициализируем планировщик медиа
+        from media_utils import init_scheduler
+        await init_scheduler()
         
-        account = get_next_available_account(api_key, "telegram")
-        if not account:
-            raise HTTPException(status_code=400, detail="Нет доступных аккаунтов Telegram")
+        platform = data.get('platform', 'telegram')
+        channel_ids = data.get('channel_ids', [])
+        if not channel_ids:
+            raise HTTPException(status_code=400, detail="ID каналов обязательны")
         
-        # Получаем клиент
-        client = await auth_middleware(request, 'telegram')
+        # Параметры фильтрации
+        days_back = data.get('days_back', 7)
+        posts_per_channel = data.get('posts_per_channel', 10)
+        min_views = data.get('min_views')
+        min_reactions = data.get('min_reactions')
+        min_comments = data.get('min_comments')
+        min_forwards = data.get('min_forwards')
         
-        # Получаем трендовые посты с расширенными параметрами
-        posts = await get_trending_posts(
-            client, 
-            channel_ids, 
-            days_back=days_back, 
-            posts_per_channel=posts_per_channel,
-            min_views=min_views,
-            min_reactions=min_reactions,
-            min_comments=min_comments,
-            min_forwards=min_forwards,
-            api_key=api_key,
-            non_blocking=True  # Устанавливаем non_blocking=True для более быстрого ответа
-        )
+        # Получение API ключа из заголовка
+        api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not api_key:
+            raise HTTPException(status_code=401, detail="API ключ не указан")
         
-        # Обновляем статистику использования аккаунта
-        await update_account_usage(api_key, account["id"], "telegram")
-        
-        return posts
-    elif platform == 'vk':
-        # Здесь можно добавить аналогичную логику для VK
-        raise HTTPException(status_code=501, detail="Расширенные параметры пока не поддерживаются для VK")
-    else:
-        raise HTTPException(status_code=400, detail="Платформа не поддерживается")
+        if platform == 'telegram':
+            # Получаем следующий доступный аккаунт
+            from user_manager import get_next_available_account
+            
+            account = await get_next_available_account(api_key, "telegram")
+            if not account:
+                raise HTTPException(status_code=400, detail="Нет доступных аккаунтов Telegram")
+            
+            # Получаем клиент
+            client = await auth_middleware(request, 'telegram')
+            
+            # Получаем трендовые посты с расширенными параметрами
+            posts = await get_trending_posts(
+                client, 
+                channel_ids, 
+                days_back=days_back, 
+                posts_per_channel=posts_per_channel,
+                min_views=min_views,
+                min_reactions=min_reactions,
+                min_comments=min_comments,
+                min_forwards=min_forwards,
+                api_key=api_key,
+                non_blocking=True  # Устанавливаем non_blocking=True для более быстрого ответа
+            )
+            
+            # Обновляем статистику использования аккаунта
+            await update_account_usage(api_key, account["id"], "telegram")
+            
+            return posts
+        elif platform == 'vk':
+            # Здесь можно добавить аналогичную логику для VK
+            raise HTTPException(status_code=501, detail="Расширенные параметры пока не поддерживаются для VK")
+        else:
+            raise HTTPException(status_code=400, detail="Платформа не поддерживается")
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при получении трендовых постов: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при получении трендовых постов: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {str(e)}")
 
 @app.post("/api/media/upload")
 async def api_media_upload(request: Request):
+    import uuid
+    import os
+    from fastapi import UploadFile
+    local_path = None
     """
     Загрузка медиафайлов в хранилище S3.
     
     Поддерживает загрузку изображений и видео,
     создаёт превью для больших файлов и оптимизирует изображения.
     """
-    # Инициализируем планировщик медиа
-    from media_utils import init_scheduler
-    await init_scheduler()
-    
-    # Получение API ключа из заголовка
-    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not api_key:
-        raise HTTPException(status_code=401, detail="API ключ не указан")
-    
-    # Проверяем наличие файла
-    form = await request.form()
-    if "file" not in form:
-        raise HTTPException(status_code=400, detail="Файл не найден в запросе")
-    
-    file = form["file"]
-    
-    # Генерируем уникальное имя файла
-    import uuid
-    import os
-    file_id = str(uuid.uuid4())
-    file_ext = os.path.splitext(file.filename)[1]
-    s3_filename = f"media/{file_id}{file_ext}"
-    local_path = f"temp_{file_id}{file_ext}"
-    
-    # Сохраняем файл на диск
     try:
-        with open(local_path, "wb") as buffer:
+        # Инициализируем планировщик медиа
+        from media_utils import init_scheduler
+        await init_scheduler()
+        
+        # Получение API ключа из заголовка
+        api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not api_key:
+            raise HTTPException(status_code=401, detail="API ключ не указан")
+        
+        # Проверяем наличие файла
+        form = await request.form()
+        if "file" not in form:
+            raise HTTPException(status_code=400, detail="Файл не найден в запросе")
+        
+        file = form["file"]
+        
+        # Генерируем уникальное имя файла
+        
+        file_id = str(uuid.uuid4())
+        if isinstance(file, UploadFile) and file.filename:
+            filename = str(file.filename)
+            file_ext = os.path.splitext(filename)[1]
+        else:
+            file_ext = '.bin'  # Расширение по умолчанию
+        s3_filename = f"media/{file_id}{file_ext}"
+        local_path = f"temp_{file_id}{file_ext}"
+        
+        # Сохраняем файл на диск
+        if isinstance(file, UploadFile):
             content = await file.read()
-            buffer.write(content)
+            with open(local_path, "wb") as buffer:
+                buffer.write(content)
+        else:
+            # Обработка случая, когда file это строка (путь к файлу)
+            file_path = str(file)
+            with open(file_path, "rb") as source_file:
+                with open(local_path, "wb") as buffer:
+                    buffer.write(source_file.read())
         
         # Импортируем и используем функции из media_utils
         from media_utils import upload_to_s3, S3_LINK_TEMPLATE
@@ -3039,12 +3163,19 @@ async def api_media_upload(request: Request):
                 "message": "Не удалось загрузить файл",
                 "error": "upload_failed"
             }
-    except Exception as e:
+    except asyncpg.PostgresError as db_err:
         # Удаляем локальный файл в случае ошибки
-        if os.path.exists(local_path):
+        if local_path is not None and os.path.exists(local_path):
             os.remove(local_path)
         
-        logger.error(f"Ошибка при загрузке файла: {e}")
+        logger.error(f"Ошибка PostgreSQL при загрузке файла: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        # Удаляем локальный файл в случае ошибки
+        if local_path is not None and os.path.exists(local_path):
+            os.remove(local_path)
+        
+        logger.error(f"Ошибка при загрузке файла: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Ошибка при загрузке файла: {str(e)}")
 
 @app.get("/api/admin/test-vk-tokens")
@@ -3059,19 +3190,21 @@ async def test_vk_tokens(request: Request):
         raise HTTPException(status_code=401, detail="Invalid admin key")
     
     try:
-        from user_manager import get_db_connection, cipher
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        from user_manager import get_db_pool, cipher
+        pool = await get_db_pool()
+        if not pool:
+            logger.error("Не удалось получить пул соединений к БД")
+            raise HTTPException(status_code=500, detail="Ошибка сервера: База данных недоступна")
         
         # Получаем все VK аккаунты
-        cursor.execute("SELECT id, token, user_api_key FROM vk_accounts")
-        accounts = cursor.fetchall()
+        async with pool.acquire() as conn:
+            accounts = await conn.fetch("SELECT id, token, user_api_key FROM vk_accounts")
         
         results = []
         for account in accounts:
-            account_id = account[0]
-            token = account[1]
-            user_api_key = account[2]
+            account_id = account['id']
+            token = account['token']
+            user_api_key = account['user_api_key']
             
             result = {
                 "account_id": account_id,
@@ -3101,8 +3234,6 @@ async def test_vk_tokens(request: Request):
             
             results.append(result)
         
-        conn.close()
-        
         # Проверяем настройки шифрования
         from user_manager import ENCRYPTION_KEY
         encryption_key_info = {
@@ -3115,6 +3246,9 @@ async def test_vk_tokens(request: Request):
             "accounts": results,
             "encryption_key_info": encryption_key_info
         }
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при тестировании токенов VK: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
     except Exception as e:
         import traceback
         logger.error(f"Ошибка при тестировании токенов VK: {str(e)}")
@@ -3217,108 +3351,102 @@ async def check_proxy(request: Request):
     if not admin_key or not await verify_admin_key(admin_key):
         raise HTTPException(status_code=401, detail="Неверный admin ключ")
     
-    data = await request.json()
-    platform = data.get("platform")
-    account_id = data.get("account_id")
-    
-    if not platform or not account_id:
-        raise HTTPException(status_code=400, detail="Требуются platform и account_id")
-    
     try:
-        from user_manager import get_db_connection
+        data = await request.json()
+        platform = data.get("platform")
+        account_id = data.get("account_id")
+        
+        if not platform or not account_id:
+            raise HTTPException(status_code=400, detail="Требуются platform и account_id")
+        
+        from user_manager import get_db_pool
+        pool = await get_db_pool()
         
         if platform == "telegram":
             # Получаем данные аккаунта Telegram
-            conn = await get_db_connection()
-            query = "SELECT * FROM telegram_accounts WHERE id = ?"
-            account_result = await conn.execute(query, (account_id,))
-            account = await account_result.fetchone()
-            
-            if not account:
-                await conn.close()
-                raise HTTPException(status_code=404, detail="Аккаунт не найден")
-            
-            # Преобразуем в словарь
-            account_dict = dict(account)
-            
-            # Проверяем наличие прокси
-            proxy = account_dict.get("proxy")
-            if not proxy:
-                await conn.close()
-                return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
-            
-            # Валидируем прокси
-            from telegram_utils import validate_proxy
-            is_valid, proxy_type = validate_proxy(proxy)
-            
-            if not is_valid:
-                await conn.close()
-                return {"valid": False, "message": "Неверный формат прокси"}
-            
-            # Попытка подключения с прокси
-            try:
-                from telegram_utils import create_telegram_client
-                client = await create_telegram_client(
-                    session_file=f"check_proxy_{account_dict['id']}",
-                    api_id=int(account_dict['api_id']),
-                    api_hash=account_dict['api_hash'],
-                    proxy=proxy
-                )
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM telegram_accounts WHERE id = $1", account_id)
                 
-                # Пробуем подключиться
-                await client.connect()
-                if await client.is_connected():
-                    await client.disconnect()
-                    await conn.close()
-                    return {"valid": True, "message": f"Успешное подключение через {proxy_type} прокси"}
-                else:
-                    await conn.close()
-                    return {"valid": False, "message": "Не удалось подключиться через прокси"}
-            except Exception as e:
-                await conn.close()
-                return {"valid": False, "message": f"Ошибка подключения: {str(e)}"}
+                if not row:
+                    raise HTTPException(status_code=404, detail="Аккаунт не найден")
                 
+                # Преобразуем в словарь
+                account_dict = dict(row)
+                
+                # Проверяем наличие прокси
+                proxy = account_dict.get("proxy")
+                if not proxy:
+                    return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
+                
+                # Валидируем прокси
+                from telegram_utils import validate_proxy
+                is_valid, proxy_type = validate_proxy(proxy)
+                
+                if not is_valid:
+                    return {"valid": False, "message": "Неверный формат прокси"}
+                
+                # Попытка подключения с прокси
+                try:
+                    from telegram_utils import create_telegram_client
+                    client = await create_telegram_client(
+                        session_path=f"check_proxy_{account_dict['id']}",
+                        api_id=int(account_dict['api_id']),
+                        api_hash=account_dict['api_hash'],
+                        proxy=proxy
+                    )
+                    
+                    # Пробуем подключиться
+                    await client.connect()
+                    is_connected = client.is_connected()  # Не используем await, так как метод не корутина
+                    if is_connected:
+                        client.disconnect()  # Не используем await, так как метод не корутина
+                        return {"valid": True, "message": f"Успешное подключение через {proxy_type} прокси"}
+                    else:
+                        return {"valid": False, "message": "Не удалось подключиться через прокси"}
+                except Exception as e:
+                    return {"valid": False, "message": f"Ошибка подключения: {str(e)}"}
+                    
         elif platform == "vk":
             # Получаем данные аккаунта VK
-            conn = await get_db_connection()
-            query = "SELECT * FROM vk_accounts WHERE id = ?"
-            account_result = await conn.execute(query, (account_id,))
-            account = await account_result.fetchone()
-            
-            if not account:
-                await conn.close()
-                raise HTTPException(status_code=404, detail="Аккаунт не найден")
-            
-            # Преобразуем в словарь
-            account_dict = dict(account)
-            
-            # Проверяем наличие прокси
-            proxy = account_dict.get("proxy")
-            if not proxy:
-                await conn.close()
-                return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
-            
-            # Валидируем прокси
-            from vk_utils import validate_proxy, validate_proxy_connection
-            
-            # Сначала проверяем формат
-            is_valid = validate_proxy(proxy)
-            if not is_valid:
-                await conn.close()
-                return {"valid": False, "message": "Неверный формат прокси"}
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM vk_accounts WHERE id = $1", account_id)
+                
+                if not row:
+                    raise HTTPException(status_code=404, detail="Аккаунт не найден")
+                
+                # Преобразуем в словарь
+                account_dict = dict(row)
+                
+                # Проверяем наличие прокси
+                proxy = account_dict.get("proxy")
+                if not proxy:
+                    return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
+                
+                # Валидируем прокси
+                from vk_utils import validate_proxy, validate_proxy_connection
+                
+                # Сначала проверяем формат
+                is_valid = validate_proxy(proxy)
+                if not is_valid:
+                    return {"valid": False, "message": "Неверный формат прокси"}
             
             # Затем проверяем соединение
-            await conn.close()
             is_valid, message = await validate_proxy_connection(proxy)
             return {"valid": is_valid, "message": message}
         else:
             raise HTTPException(status_code=400, detail="Неизвестная платформа")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Некорректный формат JSON")
+    except asyncpg.PostgresError as e:
+        logger.error(f"Ошибка PostgreSQL при проверке прокси: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(e)}")
     except Exception as e:
-        logger.error(f"Ошибка при проверке прокси: {e}")
+        logger.error(f"Ошибка при проверке прокси: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
 
+
 @app.post("/api/admin/update-proxy")
-async def updateupdate_proxy(request: Request):
+async def update_proxy(request: Request):
     """Обновляет прокси для указанного аккаунта."""
     auth_header = request.headers.get('authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
@@ -3330,100 +3458,93 @@ async def updateupdate_proxy(request: Request):
     if not await verify_admin_key(admin_key):
         raise HTTPException(401, "Неверный админ-ключ")
     
-    data = await request.json()
-    platform = data.get("platform")
-    account_id = data.get("account_id")
-    user_id = data.get("user_id")
-    proxy = data.get("proxy")
-    
-    if not all([platform, account_id, user_id]):
-        raise HTTPException(status_code=400, detail="Требуются platform, account_id и user_id")
-    
     try:
-        from user_manager import get_db_connection, update_telegram_account, update_vk_account
+        data = await request.json()
+        platform = data.get("platform")
+        account_id = data.get("account_id")
+        user_id = data.get("user_id")
+        proxy = data.get("proxy")
         
-        conn = await get_db_connection()
+        if not all([platform, account_id, user_id]):
+            raise HTTPException(status_code=400, detail="Требуются platform, account_id и user_id")
+        
+        from user_manager import get_db_pool, update_telegram_account, update_vk_account
+        
+        pool = await get_db_pool()
         
         if platform == "telegram":
-            query = 'SELECT * FROM telegram_accounts WHERE id = ?'
-            result = await conn.execute(query, (account_id,))
-            account = await result.fetchone()
-            
-            if not account:
-                await conn.close()
-                raise HTTPException(status_code=404, detail="Аккаунт не найден")
-            
-            if proxy is None:
-                account_data = {"proxy": ""}
-                update_result = await update_telegram_account(user_id, account_id, account_data)
-                
-                if not update_result:
-                    await conn.close()
-                    raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
-                
-                await conn.close()
-                return {"success": True, "message": "Прокси успешно удален"}
-            
-            from telegram_utils import validate_proxy
-            is_valid, _ = validate_proxy(proxy)
-            
-            if not is_valid:
-                await conn.close()
-                raise HTTPException(status_code=400, detail="Неверный формат прокси")
-            
-            account_data = {"proxy": proxy}
-            update_result = await update_telegram_account(user_id, account_id, account_data)
-            
-            if not update_result:
-                await conn.close()
-                raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
-            
-            await conn.close()
-            return {"success": True, "message": "Прокси успешно обновлен"}
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow('SELECT * FROM telegram_accounts WHERE id = $1', account_id)
+                    
+                    if not row:
+                        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+                    
+                    if proxy is None:
+                        account_data = {"proxy": ""}
+                        update_result = await update_telegram_account(user_id, account_id, account_data)
+                        
+                        if not update_result:
+                            raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
+                        
+                        return {"success": True, "message": "Прокси успешно удален"}
+                    
+                    from telegram_utils import validate_proxy
+                    is_valid, _ = validate_proxy(proxy)
+                    
+                    if not is_valid:
+                        raise HTTPException(status_code=400, detail="Неверный формат прокси")
+                    
+                    account_data = {"proxy": proxy}
+                    update_result = await update_telegram_account(user_id, account_id, account_data)
+                    
+                    if not update_result:
+                        raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
+                    
+                    return {"success": True, "message": "Прокси успешно обновлен"}
             
         elif platform == "vk":
-            query = 'SELECT * FROM vk_accounts WHERE id = ?'
-            result = await conn.execute(query, (account_id,))
-            account = await result.fetchone()
-            
-            if not account:
-                await conn.close()
-                raise HTTPException(status_code=404, detail="Аккаунт не найден")
-            
-            if proxy is None:
-                account_data = {"proxy": ""}
-                update_result = await update_vk_account(user_id, account_id, account_data)
-                
-                if not update_result:
-                    await conn.close()
-                    raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
-                
-                await conn.close()
-                return {"success": True, "message": "Прокси успешно удален"}
-            
-            from vk_utils import validate_proxy
-            is_valid = validate_proxy(proxy)
-            
-            if not is_valid:
-                await conn.close()
-                raise HTTPException(status_code=400, detail="Неверный формат прокси")
-            
-            account_data = {"proxy": proxy}
-            update_result = await update_vk_account(user_id, account_id, account_data)
-            
-            if not update_result:
-                await conn.close()
-                raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
-            
-            await conn.close()
-            return {"success": True, "message": "Прокси успешно обновлен"}
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow('SELECT * FROM vk_accounts WHERE id = $1', account_id)
+                    
+                    if not row:
+                        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+                    
+                    if proxy is None:
+                        account_data = {"proxy": ""}
+                        update_result = await update_vk_account(user_id, account_id, account_data)
+                        
+                        if not update_result:
+                            raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
+                        
+                        return {"success": True, "message": "Прокси успешно удален"}
+                    
+                    from vk_utils import validate_proxy
+                    is_valid = validate_proxy(proxy)
+                    
+                    if not is_valid:
+                        raise HTTPException(status_code=400, detail="Неверный формат прокси")
+                    
+                    account_data = {"proxy": proxy}
+                    update_result = await update_vk_account(user_id, account_id, account_data)
+                    
+                    if not update_result:
+                        raise HTTPException(status_code=404, detail="Не удалось обновить аккаунт")
+                    
+                    return {"success": True, "message": "Прокси успешно обновлен"}
         
         else:
-            await conn.close()
             raise HTTPException(status_code=400, detail="Неизвестная платформа")
             
+    except json.JSONDecodeError:
+        logger.error("Ошибка декодирования JSON при обновлении прокси")
+        raise HTTPException(status_code=400, detail="Некорректный формат JSON")
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при обновлении прокси: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
     except Exception as e:
-        logger.error(f"Ошибка при обновлении прокси: {e}")
+        logger.error(f"Ошибка при обновлении прокси: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
 
 # Добавляем эндпоинт для ручного сброса и проверки статистики аккаунтов (только для админов)
@@ -3483,21 +3604,44 @@ async def reset_accounts_stats(request: Request):
 @app.get("/health")
 async def health_check():
     """Проверка работоспособности сервиса."""
+    db_status = "error"
+    redis_status = "error"
+    
     try:
-        # Проверка подключения к базе данных
-        from user_manager import get_db_connection
-        conn = await get_db_connection()
-        await conn.execute("SELECT 1")
-        await conn.close()
+        # Проверка подключения к базе данных PostgreSQL
+        from user_manager import get_db_pool
+        pool = await get_db_pool()
+        
+        async with pool.acquire() as conn:
+            result = await conn.fetchval("SELECT 1")
+            if result == 1:
+                db_status = "ok"
         
         # Проверка Redis, если доступен
         if redis_client:
-            redis_client.ping()
+            if redis_client.ping():
+                redis_status = "ok"
         
-        return {"status": "ok", "timestamp": datetime.now().isoformat()}
+        # Если база данных недоступна, возвращаем ошибку
+        if db_status != "ok":
+            logger.error("Ошибка подключения к базе данных")
+            raise HTTPException(status_code=500, detail="Ошибка подключения к базе данных")
+        
+        return {
+            "status": "ok", 
+            "components": {
+                "database": db_status,
+                "redis": redis_status
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
     except Exception as e:
-        logger.error(f"Ошибка при проверке работоспособности: {e}")
+        logger.error(f"Ошибка при проверке работоспособности: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Ошибка при проверке работоспособности: {str(e)}")
+
 
 @app.post("/api/admin/fix-vk-tokens")
 async def fix_vk_tokens_endpoint(request: Request):
@@ -3507,12 +3651,34 @@ async def fix_vk_tokens_endpoint(request: Request):
         admin_key = request.cookies.get("admin_key")
     
     if not admin_key or not await verify_admin_key(admin_key):
-        raise HTTPException(status_code=401, detail="Invalid admin key")
+        raise HTTPException(status_code=401, detail="Неверный admin ключ")
     
-    from user_manager import fix_vk_tokens
-    fixed_count = fix_vk_tokens()
-    
-    return {"status": "success", "fixed_count": fixed_count}
+    try:
+        from user_manager import fix_vk_tokens, get_db_pool
+        
+        # Получаем пул соединений для передачи в функцию
+        pool = await get_db_pool()
+        if not pool:
+            logger.error("Не удалось получить пул соединений к БД")
+            raise HTTPException(status_code=500, detail="Ошибка сервера: База данных недоступна")
+        
+        # Вызываем асинхронную функцию для исправления токенов
+        fixed_count = await fix_vk_tokens()
+        
+        # Логируем результат
+        logger.info(f"Исправлено токенов VK: {fixed_count}")
+        
+        return {
+            "status": "success", 
+            "fixed_count": fixed_count,
+            "timestamp": datetime.now().isoformat()
+        }
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при исправлении токенов VK: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        logger.error(f"Ошибка при исправлении токенов VK: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
 
 @app.post("/api/admin/fix-vk-token/{account_id}")
 async def fix_single_vk_token_endpoint(account_id: str, request: Request):
@@ -3522,157 +3688,154 @@ async def fix_single_vk_token_endpoint(account_id: str, request: Request):
         admin_key = request.cookies.get("admin_key")
     
     if not admin_key or not await verify_admin_key(admin_key):
-        raise HTTPException(status_code=401, detail="Invalid admin key")
+        raise HTTPException(status_code=401, detail="Неверный admin ключ")
     
     # Получаем токен из базы данных
-    from user_manager import get_db_connection, cipher
+    from user_manager import get_db_pool, cipher
     from vk_utils import VKClient
     
-    conn = await get_db_connection()
-    
-    query = 'SELECT token, proxy FROM vk_accounts WHERE id = ?'
-    result = await conn.execute(query, (account_id,))
-    account_row = await result.fetchone()
-    
-    if not account_row:
-        await conn.close()
-        raise HTTPException(status_code=404, detail="Account not found")
-    
-    # Преобразуем объект sqlite3.Row в словарь
-    account = dict(account_row)
-    
-    encrypted_token = account["token"]
-    proxy = account["proxy"]
-    fixed = False
-    
-    # Проверяем, зашифрован ли токен
-    if encrypted_token.startswith('vk1.a.'):
-        logger.info(f"Токен для аккаунта {account_id} уже в правильном формате (не зашифрован)")
-        
-        # Проверяем, работает ли токен через API
-        try:
-            async with VKClient(encrypted_token, proxy) as vk:
-                result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
-                if "response" in result:
-                    logger.info(f"Токен для аккаунта {account_id} валиден и работает")
-                    await conn.close()
-                    return {"success": True, "message": "Token is valid and working"}
-                else:
-                    logger.warning(f"Токен для аккаунта {account_id} имеет правильный формат, но не работает в API")
-                    await conn.close()
-                    return {"success": False, "message": "Token format is correct but API validation failed"}
-        except Exception as e:
-            logger.error(f"Ошибка при проверке токена через API: {str(e)}")
-            await conn.close()
-            return {"success": False, "message": f"Error during API validation: {str(e)}"}
-    
     try:
-        # Пытаемся расшифровать токен
-        decrypted_once = cipher.decrypt(encrypted_token.encode()).decode()
+        pool = await get_db_pool()
+        if not pool:
+            logger.error("Не удалось получить пул соединений к БД")
+            raise HTTPException(status_code=500, detail="Ошибка сервера: База данных недоступна")
         
-        # Проверяем, выглядит ли он как валидный токен VK
-        if decrypted_once.startswith('vk1.a.'):
-            # Токен был зашифрован один раз, проверяем его через API
-            logger.info(f"Токен для аккаунта {account_id} был зашифрован один раз, проверяем через API")
+        async with pool.acquire() as conn:
+            query = 'SELECT token, proxy FROM vk_accounts WHERE id = $1'
+            account_row = await conn.fetchrow(query, account_id)
+            
+            if not account_row:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            
+            # Преобразуем объект Record в словарь
+            account = dict(account_row)
+            
+            encrypted_token = account["token"]
+            proxy = account["proxy"]
+            fixed = False
+            
+            # Проверяем, зашифрован ли токен
+            if encrypted_token.startswith('vk1.a.'):
+                logger.info(f"Токен для аккаунта {account_id} уже в правильном формате (не зашифрован)")
+                
+                # Проверяем, работает ли токен через API
+                try:
+                    async with VKClient(encrypted_token, proxy) as vk:
+                        result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
+                        if "response" in result:
+                            logger.info(f"Токен для аккаунта {account_id} валиден и работает")
+                            return {"success": True, "message": "Токен валиден и работает"}
+                        else:
+                            logger.warning(f"Токен для аккаунта {account_id} имеет правильный формат, но не работает в API")
+                            return {"success": False, "message": "Формат токена корректен, но API-валидация не пройдена"}
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке токена через API: {str(e)}")
+                    return {"success": False, "message": f"Ошибка во время API-валидации: {str(e)}"}
             
             try:
-                async with VKClient(decrypted_once, proxy) as vk:
-                    result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
-                    if "response" in result:
-                        logger.info(f"Токен для аккаунта {account_id} валиден и работает")
-                        # Обновляем токен в базе данных, возвращая его к незашифрованному состоянию
-                        update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                        await conn.execute(update_query, (decrypted_once, account_id))
-                        await conn.commit()
-                        fixed = True
-                    else:
-                        logger.warning(f"Расшифрованный токен для аккаунта {account_id} имеет правильный формат, но не работает в API")
-                        # Не меняем токен, так как он не работает
-            except Exception as e:
-                logger.error(f"Ошибка при проверке расшифрованного токена через API: {str(e)}")
-                # Продолжаем попытки исправления несмотря на ошибку API
-        
-        # Если токен не был исправлен, пробуем расшифровать его еще раз
-        if not fixed:
-            try:
-                decrypted_twice = cipher.decrypt(decrypted_once.encode()).decode()
+                # Пытаемся расшифровать токен
+                decrypted_once = cipher.decrypt(encrypted_token.encode()).decode()
                 
-                # Проверяем, выглядит ли двойной расшифрованный токен как валидный
-                if decrypted_twice.startswith('vk1.a.'):
-                    # Токен был зашифрован дважды, проверяем его через API
-                    logger.info(f"Токен для аккаунта {account_id} был зашифрован дважды, проверяем через API")
+                # Проверяем, выглядит ли он как валидный токен VK
+                if decrypted_once.startswith('vk1.a.'):
+                    # Токен был зашифрован один раз, проверяем его через API
+                    logger.info(f"Токен для аккаунта {account_id} был зашифрован один раз, проверяем через API")
                     
                     try:
-                        async with VKClient(decrypted_twice, proxy) as vk:
+                        async with VKClient(decrypted_once, proxy) as vk:
                             result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
                             if "response" in result:
-                                logger.info(f"Дважды расшифрованный токен для аккаунта {account_id} валиден и работает")
-                                # Обновляем токен в базе - используем незашифрованный токен
-                                update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                                await conn.execute(update_query, (decrypted_twice, account_id))
-                                await conn.commit()
+                                logger.info(f"Токен для аккаунта {account_id} валиден и работает")
+                                # Обновляем токен в базе данных, возвращая его к незашифрованному состоянию
+                                update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                await conn.execute(update_query, decrypted_once, account_id)
                                 fixed = True
                             else:
-                                logger.warning(f"Дважды расшифрованный токен имеет правильный формат, но не работает в API")
-                                # Несмотря на ошибку API, обновляем токен если формат правильный
-                                update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                                await conn.execute(update_query, (decrypted_twice, account_id))
-                                await conn.commit()
-                                fixed = True
+                                logger.warning(f"Расшифрованный токен для аккаунта {account_id} имеет правильный формат, но не работает в API")
+                                # Не меняем токен, так как он не работает
                     except Exception as e:
-                        logger.error(f"Ошибка при проверке дважды расшифрованного токена через API: {str(e)}")
-                        # Обновляем токен несмотря на ошибку API, если формат правильный
-                        update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                        await conn.execute(update_query, (decrypted_twice, account_id))
-                        await conn.commit()
-                        fixed = True
-                else:
-                    # Пробуем найти подстроку 'vk1.a.' в дважды расшифрованном токене
-                    if len(decrypted_twice) > 30 and 'vk1.a.' in decrypted_twice:
-                        start_pos = decrypted_twice.find('vk1.a.')
-                        if start_pos >= 0:
-                            token_part = decrypted_twice[start_pos:]
-                            if len(token_part) > 30:
-                                logger.info(f"Извлечение токена из строки для аккаунта {account_id}")
-                                
-                                # Проверяем извлеченный токен через API
-                                try:
-                                    async with VKClient(token_part, proxy) as vk:
-                                        result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
-                                        if "response" in result:
-                                            logger.info(f"Извлеченный токен для аккаунта {account_id} валиден и работает")
-                                            # Обновляем токен в базе
-                                            update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                                            await conn.execute(update_query, (token_part, account_id))
-                                            await conn.commit()
-                                            fixed = True
-                                        else:
-                                            logger.warning(f"Извлеченный токен имеет правильный формат, но не работает в API")
+                        logger.error(f"Ошибка при проверке расшифрованного токена через API: {str(e)}")
+                        # Продолжаем попытки исправления несмотря на ошибку API
+                
+                # Если токен не был исправлен, пробуем расшифровать его еще раз
+                if not fixed:
+                    try:
+                        decrypted_twice = cipher.decrypt(decrypted_once.encode()).decode()
+                        
+                        # Проверяем, выглядит ли двойной расшифрованный токен как валидный
+                        if decrypted_twice.startswith('vk1.a.'):
+                            # Токен был зашифрован дважды, проверяем его через API
+                            logger.info(f"Токен для аккаунта {account_id} был зашифрован дважды, проверяем через API")
+                            
+                            try:
+                                async with VKClient(decrypted_twice, proxy) as vk:
+                                    result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
+                                    if "response" in result:
+                                        logger.info(f"Дважды расшифрованный токен для аккаунта {account_id} валиден и работает")
+                                        # Обновляем токен в базе - используем незашифрованный токен
+                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                        await conn.execute(update_query, decrypted_twice, account_id)
+                                        fixed = True
+                                    else:
+                                        logger.warning(f"Дважды расшифрованный токен имеет правильный формат, но не работает в API")
+                                        # Несмотря на ошибку API, обновляем токен если формат правильный
+                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                        await conn.execute(update_query, decrypted_twice, account_id)
+                                        fixed = True
+                            except Exception as e:
+                                logger.error(f"Ошибка при проверке дважды расшифрованного токена через API: {str(e)}")
+                                # Обновляем токен несмотря на ошибку API, если формат правильный
+                                update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                await conn.execute(update_query, decrypted_twice, account_id)
+                                fixed = True
+                        else:
+                            # Пробуем найти подстроку 'vk1.a.' в дважды расшифрованном токене
+                            if len(decrypted_twice) > 30 and 'vk1.a.' in decrypted_twice:
+                                start_pos = decrypted_twice.find('vk1.a.')
+                                if start_pos >= 0:
+                                    token_part = decrypted_twice[start_pos:]
+                                    if len(token_part) > 30:
+                                        logger.info(f"Извлечение токена из строки для аккаунта {account_id}")
+                                        
+                                        # Проверяем извлеченный токен через API
+                                        try:
+                                            async with VKClient(token_part, proxy) as vk:
+                                                result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
+                                                if "response" in result:
+                                                    logger.info(f"Извлеченный токен для аккаунта {account_id} валиден и работает")
+                                                    # Обновляем токен в базе
+                                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                                    await conn.execute(update_query, token_part, account_id)
+                                                    fixed = True
+                                                else:
+                                                    logger.warning(f"Извлеченный токен имеет правильный формат, но не работает в API")
+                                                    # Обновляем токен несмотря на ошибку API
+                                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                                    await conn.execute(update_query, token_part, account_id)
+                                                    fixed = True
+                                        except Exception as e:
+                                            logger.error(f"Ошибка при проверке извлеченного токена через API: {str(e)}")
                                             # Обновляем токен несмотря на ошибку API
-                                            update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                                            await conn.execute(update_query, (token_part, account_id))
-                                            await conn.commit()
+                                            update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                            await conn.execute(update_query, token_part, account_id)
                                             fixed = True
-                                except Exception as e:
-                                    logger.error(f"Ошибка при проверке извлеченного токена через API: {str(e)}")
-                                    # Обновляем токен несмотря на ошибку API
-                                    update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                                    await conn.execute(update_query, (token_part, account_id))
-                                    await conn.commit()
-                                    fixed = True
-            except Exception as inner_e:
-                logger.error(f"Ошибка при второй расшифровке токена для аккаунта {account_id}: {str(inner_e)}")
-        
-        await conn.close()
-        
-        if fixed:
-            return {"success": True, "message": "Token has been fixed"}
-        else:
-            return {"success": False, "message": "Token could not be fixed, format is invalid"}
+                    except Exception as inner_e:
+                        logger.error(f"Ошибка при второй расшифровке токена для аккаунта {account_id}: {str(inner_e)}")
+                
+                if fixed:
+                    return {"success": True, "message": "Токен был исправлен"}
+                else:
+                    return {"success": False, "message": "Токен не удалось исправить, формат недействителен"}
+            except Exception as e:
+                logger.error(f"Ошибка при первой расшифровке токена для аккаунта {account_id}: {str(e)}")
+                return {"success": False, "message": f"Ошибка во время расшифровки: {str(e)}"}
+                
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при исправлении токена VK: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
     except Exception as e:
-        logger.error(f"Ошибка при первой расшифровке токена для аккаунта {account_id}: {str(e)}")
-        await conn.close()
-        return {"success": False, "message": f"Error during decryption: {str(e)}"}
+        logger.error(f"Непредвиденная ошибка при исправлении токена VK: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
 
 @app.post("/api/admin/normalize-vk-tokens")
 async def normalize_vk_tokens_endpoint(request: Request):
@@ -3684,84 +3847,82 @@ async def normalize_vk_tokens_endpoint(request: Request):
     if not admin_key or not await verify_admin_key(admin_key):
         raise HTTPException(status_code=401, detail="Invalid admin key")
     
-    from user_manager import get_db_connection, cipher
+    from user_manager import get_db_pool, cipher
     
-    conn = await get_db_connection()
+    pool = await get_db_pool()
     
-    # Получаем все токены VK
-    query = 'SELECT id, token FROM vk_accounts'
-    result = await conn.execute(query)
-    account_rows = await result.fetchall()
-    accounts = [dict(row) for row in account_rows]
-    
-    normalized_count = 0
-    skipped_count = 0
-    error_count = 0
-    
-    for account in accounts:
-        account_id = account['id']
-        token_value = account['token']
-        
-        try:
-            # Если токен уже в правильном формате, пропускаем
-            if not token_value:
-                logger.warning(f"Пустой токен для аккаунта {account_id}")
-                skipped_count += 1
-                continue
-                
-            if token_value.startswith('vk1.a.'):
-                logger.info(f"Токен для аккаунта {account_id} уже в правильном формате")
-                skipped_count += 1
-                continue
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Получаем все токены VK
+            query = 'SELECT id, token FROM vk_accounts'
+            rows = await conn.fetch(query)
+            accounts = [dict(row) for row in rows]
             
-            # Пытаемся расшифровать токен
-            try:
-                decrypted_token = cipher.decrypt(token_value.encode()).decode()
+            normalized_count = 0
+            skipped_count = 0
+            error_count = 0
+            
+            for account in accounts:
+                account_id = account['id']
+                token_value = account['token']
                 
-                # Проверяем формат расшифрованного токена
-                if decrypted_token.startswith('vk1.a.'):
-                    # Обновляем токен в базе данных
-                    update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                    await conn.execute(update_query, (decrypted_token, account_id))
-                    normalized_count += 1
-                    logger.info(f"Токен для аккаунта {account_id} успешно нормализован")
-                else:
-                    # Пробуем расшифровать второй раз (токен мог быть зашифрован дважды)
-                    try:
-                        decrypted_twice = cipher.decrypt(decrypted_token.encode()).decode()
+                try:
+                    # Если токен уже в правильном формате, пропускаем
+                    if not token_value:
+                        logger.warning(f"Пустой токен для аккаунта {account_id}")
+                        skipped_count += 1
+                        continue
                         
-                        if decrypted_twice.startswith('vk1.a.'):
+                    if token_value.startswith('vk1.a.'):
+                        logger.info(f"Токен для аккаунта {account_id} уже в правильном формате")
+                        skipped_count += 1
+                        continue
+                    
+                    # Пытаемся расшифровать токен
+                    try:
+                        decrypted_token = cipher.decrypt(token_value.encode()).decode()
+                        
+                        # Проверяем формат расшифрованного токена
+                        if decrypted_token.startswith('vk1.a.'):
                             # Обновляем токен в базе данных
-                            update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                            await conn.execute(update_query, (decrypted_twice, account_id))
+                            update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                            await conn.execute(update_query, decrypted_token, account_id)
                             normalized_count += 1
-                            logger.info(f"Токен для аккаунта {account_id} был расшифрован дважды и успешно нормализован")
+                            logger.info(f"Токен для аккаунта {account_id} успешно нормализован")
                         else:
-                            # Пробуем найти подстроку 'vk1.a.' в дважды расшифрованном токене
-                            if 'vk1.a.' in decrypted_twice:
-                                start_pos = decrypted_twice.find('vk1.a.')
-                                token_part = decrypted_twice[start_pos:]
+                            # Пробуем расшифровать второй раз (токен мог быть зашифрован дважды)
+                            try:
+                                decrypted_twice = cipher.decrypt(decrypted_token.encode()).decode()
                                 
-                                # Обновляем токен в базе данных
-                                update_query = 'UPDATE vk_accounts SET token = ? WHERE id = ?'
-                                await conn.execute(update_query, (token_part, account_id))
-                                normalized_count += 1
-                                logger.info(f"Токен для аккаунта {account_id} был извлечен из строки и успешно нормализован")
-                            else:
-                                logger.warning(f"Не удалось нормализовать токен для аккаунта {account_id}: токен не имеет правильного формата")
+                                if decrypted_twice.startswith('vk1.a.'):
+                                    # Обновляем токен в базе данных
+                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                    await conn.execute(update_query, decrypted_twice, account_id)
+                                    normalized_count += 1
+                                    logger.info(f"Токен для аккаунта {account_id} был расшифрован дважды и успешно нормализован")
+                                else:
+                                    # Пробуем найти подстроку 'vk1.a.' в дважды расшифрованном токене
+                                    if 'vk1.a.' in decrypted_twice:
+                                        start_pos = decrypted_twice.find('vk1.a.')
+                                        token_part = decrypted_twice[start_pos:]
+                                        
+                                        # Обновляем токен в базе данных
+                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                        await conn.execute(update_query, token_part, account_id)
+                                        normalized_count += 1
+                                        logger.info(f"Токен для аккаунта {account_id} был извлечен из строки и успешно нормализован")
+                                    else:
+                                        logger.warning(f"Не удалось нормализовать токен для аккаунта {account_id}: токен не имеет правильного формата")
+                                        error_count += 1
+                            except Exception as e:
+                                logger.error(f"Ошибка при второй расшифровке токена для аккаунта {account_id}: {str(e)}")
                                 error_count += 1
                     except Exception as e:
-                        logger.error(f"Ошибка при второй расшифровке токена для аккаунта {account_id}: {str(e)}")
+                        logger.error(f"Ошибка при расшифровке токена для аккаунта {account_id}: {str(e)}")
                         error_count += 1
-            except Exception as e:
-                logger.error(f"Ошибка при расшифровке токена для аккаунта {account_id}: {str(e)}")
-                error_count += 1
-        except Exception as e:
-            logger.error(f"Ошибка при обработке аккаунта {account_id}: {str(e)}")
-            error_count += 1
-    
-    await conn.commit()
-    await conn.close()
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке аккаунта {account_id}: {str(e)}")
+                    error_count += 1
     
     return {
         "success": True,
@@ -3905,25 +4066,30 @@ async def get_telegram_account_details(request: Request, account_id: str):
     if not await verify_admin_key(admin_key):
         raise HTTPException(401, "Неверный админ-ключ")
     
-    from user_manager import get_db_connection
+    from user_manager import get_db_pool
     
-    # Используем асинхронное подключение к базе данных
-    conn = await get_db_connection()
-    
-    # Получаем данные аккаунта
-    query = 'SELECT * FROM telegram_accounts WHERE id = ?'
-    result = await conn.execute(query, (account_id,))
-    account = await result.fetchone()
-    
-    if not account:
-        await conn.close()
-        raise HTTPException(status_code=404, detail="Аккаунт не найден")
-    
-    # Преобразуем sqlite3.Row в словарь
-    account_dict = dict(account)
-    await conn.close()
-    
-    return account_dict
+    try:
+        # Используем пул соединений
+        pool = await get_db_pool()
+        
+        async with pool.acquire() as conn:
+            # Получаем данные аккаунта
+            query = 'SELECT * FROM telegram_accounts WHERE id = $1'
+            account_record = await conn.fetchrow(query, account_id)
+            
+            if not account_record:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            
+            # Преобразуем Record в словарь
+            account_dict = dict(account_record)
+            
+            return account_dict
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при получении деталей аккаунта Telegram {account_id}: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении деталей аккаунта Telegram {account_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
 @app.get("/api/vk/accounts/{account_id}/details")
 async def get_vk_account_details(request: Request, account_id: str):
@@ -3937,25 +4103,30 @@ async def get_vk_account_details(request: Request, account_id: str):
     if not await verify_admin_key(admin_key):
         raise HTTPException(401, "Неверный админ-ключ")
     
-    from user_manager import get_db_connection
+    from user_manager import get_db_pool
     
-    # Используем асинхронное подключение к базе данных
-    conn = await get_db_connection()
-    
-    # Получаем данные аккаунта
-    query = 'SELECT * FROM vk_accounts WHERE id = ?'
-    result = await conn.execute(query, (account_id,))
-    account = await result.fetchone()
-    
-    if not account:
-        await conn.close()
-        raise HTTPException(status_code=404, detail="Аккаунт не найден")
-    
-    # Преобразуем sqlite3.Row в словарь
-    account_dict = dict(account)
-    await conn.close()
-    
-    return account_dict
+    try:
+        # Используем пул соединений
+        pool = await get_db_pool()
+        
+        async with pool.acquire() as conn:
+            # Получаем данные аккаунта
+            query = 'SELECT * FROM vk_accounts WHERE id = $1'
+            account_record = await conn.fetchrow(query, account_id)
+            
+            if not account_record:
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            
+            # Преобразуем Record в словарь
+            account_dict = dict(account_record)
+            
+            return account_dict
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при получении деталей аккаунта VK {account_id}: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении деталей аккаунта VK {account_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
 @app.post("/api/telegram/accounts/{account_id}/auth")
 async def auth_telegram_code(request: Request, account_id: str):
@@ -3984,163 +4155,200 @@ async def auth_telegram_code(request: Request, account_id: str):
         raise HTTPException(400, "Код должен состоять только из цифр")
     
     # Находим аккаунт по ID
-    from user_manager import get_db_connection
-    conn = await get_db_connection()
+    from user_manager import get_db_pool
     
-    query = '''
-        SELECT * FROM telegram_accounts 
-        WHERE id = ?
-    '''
-    account = await conn.execute(query, (account_id,))
-    account = await account.fetchone()
-    
-    if not account:
-        logger.error(f"Аккаунт с ID {account_id} не найден")
-        await conn.close()
-        raise HTTPException(404, "Аккаунт не найден")
-    
-    # Преобразуем объект sqlite3.Row в словарь
-    account_dict = dict(account)
-    
-    session_file = account_dict["session_file"]
-    api_id = int(account_dict["api_id"])
-    api_hash = account_dict["api_hash"]
-    phone = account_dict["phone"]
-    phone_code_hash = account_dict.get("phone_code_hash")
-    proxy = account_dict.get("proxy")
-    
-    if not phone_code_hash:
-        logger.error(f"Хеш кода не найден для аккаунта {account_id}")
-        await conn.close()
-        raise HTTPException(400, "Хеш кода не найден, пожалуйста, запросите код заново")
-    
-    logger.info(f"Авторизация с кодом {code} для аккаунта {phone} (ID: {account_id})")
+    client = None
     
     try:
-        # Создаем клиент Telegram
-        logger.info(f"Создание клиента Telegram с сессией {session_file}")
-        client = await telegram_utils.create_telegram_client(session_file, api_id, api_hash, proxy)
+        pool = await get_db_pool()
         
-        # Подключаемся к серверам Telegram
-        logger.info(f"Подключение клиента к серверам Telegram")
-        await client.connect()
-        
-        # Проверяем, авторизован ли уже клиент
-        is_authorized = await client.is_user_authorized()
-        
-        if is_authorized:
-            logger.info(f"Клиент уже авторизован для {phone}")
-            await client.disconnect()
-            
-            # Обновляем статус аккаунта
-            update_query = '''
-                UPDATE telegram_accounts
-                SET status = ?
-                WHERE id = ?
-            '''
-            await conn.execute(update_query, ('active', account_id))
-            await conn.commit()
-            await conn.close()
-            
-            return {
-                "account_id": account_id,
-                "status": "success",
-                "message": "Аккаунт уже авторизован"
-            }
-        
-        # Выполняем авторизацию
-        logger.info(f"Выполнение авторизации для аккаунта {phone} с кодом {code}")
-        try:
-            # Авторизуемся с помощью кода
-            await client.sign_in(phone, int(code), phone_code_hash=phone_code_hash)
-            
-            # Если авторизация прошла успешно, обновляем статус аккаунта
-            update_query = '''
-                UPDATE telegram_accounts
-                SET status = ?
-                WHERE id = ?
-            '''
-            await conn.execute(update_query, ('active', account_id))
-            await conn.commit()
-            
-            # Получаем информацию о пользователе для обновления данных аккаунта
-            me = await client.get_me()
-            if me:
-                username = getattr(me, 'username', None)
-                if username:
-                    update_username_query = '''
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Получаем данные аккаунта
+                query = '''
+                    SELECT * FROM telegram_accounts 
+                    WHERE id = $1
+                '''
+                account_record = await conn.fetchrow(query, account_id)
+                
+                if not account_record:
+                    logger.error(f"Аккаунт с ID {account_id} не найден")
+                    raise HTTPException(404, "Аккаунт не найден")
+                
+                # Преобразуем Record в словарь
+                account_dict = dict(account_record)
+                
+                session_file = account_dict["session_file"]
+                api_id = int(account_dict["api_id"])
+                api_hash = account_dict["api_hash"]
+                phone = account_dict["phone"]
+                phone_code_hash = account_dict.get("phone_code_hash")
+                proxy = account_dict.get("proxy")
+                
+                if not phone_code_hash:
+                    logger.error(f"Хеш кода не найден для аккаунта {account_id}")
+                    raise HTTPException(400, "Хеш кода не найден, пожалуйста, запросите код заново")
+                
+                logger.info(f"Авторизация с кодом {code} для аккаунта {phone} (ID: {account_id})")
+                
+                # Создаем клиент Telegram
+                logger.info(f"Создание клиента Telegram с сессией {session_file}")
+                client = await telegram_utils.create_telegram_client(session_file, api_id, api_hash, proxy)
+                
+                # Подключаемся к серверам Telegram
+                logger.info(f"Подключение клиента к серверам Telegram")
+                await client.connect()
+                
+                # Проверяем, авторизован ли уже клиент
+                is_authorized = await client.is_user_authorized()
+                
+                if is_authorized:
+                    logger.info(f"Клиент уже авторизован для {phone}")
+                    # Корректная обработка отключения клиента
+                    try:
+                        if asyncio.iscoroutinefunction(client.disconnect):
+                            await client.disconnect()
+                        else:
+                            client.disconnect()
+                        client = None
+                    except Exception as e:
+                        logger.warning(f"Ошибка при отключении клиента: {e}")
+                    
+                    # Обновляем статус аккаунта
+                    update_query = '''
                         UPDATE telegram_accounts
-                        SET username = ?
-                        WHERE id = ?
+                        SET status = $1
+                        WHERE id = $2
                     '''
-                    await conn.execute(update_username_query, (username, account_id))
-                    await conn.commit()
-            
-            await client.disconnect()
-            logger.info(f"Авторизация успешно выполнена для аккаунта {phone}")
-            
-            await conn.close()
-            return {
-                "account_id": account_id,
-                "status": "success",
-                "message": "Авторизация выполнена успешно"
-            }
-        except SessionPasswordNeededError:
-            # Если для аккаунта настроена двухфакторная аутентификация
-            logger.info(f"Для аккаунта {phone} требуется пароль 2FA")
-            await client.disconnect()
-            
-            # Обновляем статус аккаунта
-            update_query = '''
-                UPDATE telegram_accounts
-                SET status = ?
-                WHERE id = ?
-            '''
-            await conn.execute(update_query, ('pending', account_id))
-            await conn.commit()
-            await conn.close()
-            
-            return {
-                "account_id": account_id,
-                "status": "pending",
-                "requires_2fa": True,
-                "message": "Требуется пароль двухфакторной аутентификации"
-            }
-        except Exception as e:
-            logger.error(f"Ошибка при авторизации: {str(e)}")
-            # Анализируем сообщение об ошибке
-            error_msg = str(e).lower()
-            
-            # Формируем понятное пользователю сообщение об ошибке
-            user_message = "Ошибка при авторизации"
-            
-            if "invalid phone code" in error_msg:
-                user_message = "Неверный код авторизации. Пожалуйста, попробуйте снова или запросите новый код."
-            elif "phone code expired" in error_msg:
-                user_message = "Срок действия кода истек. Пожалуйста, запросите новый код."
-            elif "too many attempts" in error_msg:
-                user_message = "Слишком много попыток ввода кода. Пожалуйста, попробуйте позже."
-            elif "flood" in error_msg:
-                user_message = "Слишком много запросов. Пожалуйста, попробуйте позже."
-            else:
-                user_message = f"Ошибка при авторизации: {str(e)}"
-            
-            await client.disconnect()
-            await conn.close()
-            
-            raise HTTPException(400, user_message)
+                    await conn.execute(update_query, 'active', account_id)
+                    
+                    return {
+                        "account_id": account_id,
+                        "status": "success",
+                        "message": "Аккаунт уже авторизован"
+                    }
+                
+                # Выполняем авторизацию
+                logger.info(f"Выполнение авторизации для аккаунта {phone} с кодом {code}")
+                try:
+                    # Авторизуемся с помощью кода
+                    await client.sign_in(phone, int(code), phone_code_hash=phone_code_hash)
+                    
+                    # Если авторизация прошла успешно, обновляем статус аккаунта
+                    update_query = '''
+                        UPDATE telegram_accounts
+                        SET status = $1
+                        WHERE id = $2
+                    '''
+                    await conn.execute(update_query, 'active', account_id)
+                    
+                    # Получаем информацию о пользователе для обновления данных аккаунта
+                    me = await client.get_me()
+                    if me:
+                        username = getattr(me, 'username', None)
+                        if username:
+                            update_username_query = '''
+                                UPDATE telegram_accounts
+                                SET username = $1
+                                WHERE id = $2
+                            '''
+                            await conn.execute(update_username_query, username, account_id)
+                    
+                    # Корректная обработка отключения клиента
+                    try:
+                        if asyncio.iscoroutinefunction(client.disconnect):
+                            await client.disconnect()
+                        else:
+                            client.disconnect()
+                        client = None
+                    except Exception as e:
+                        logger.warning(f"Ошибка при отключении клиента: {e}")
+                        
+                    logger.info(f"Авторизация успешно выполнена для аккаунта {phone}")
+                    
+                    return {
+                        "account_id": account_id,
+                        "status": "success",
+                        "message": "Авторизация выполнена успешно"
+                    }
+                except SessionPasswordNeededError:
+                    # Если для аккаунта настроена двухфакторная аутентификация
+                    logger.info(f"Для аккаунта {phone} требуется пароль 2FA")
+                    
+                    # Корректная обработка отключения клиента
+                    try:
+                        if client is not None:
+                            if asyncio.iscoroutinefunction(client.disconnect):
+                                await client.disconnect()
+                            else:
+                                client.disconnect()
+                            client = None
+                    except Exception as e:
+                        logger.warning(f"Ошибка при отключении клиента: {e}")
+                    
+                    # Обновляем статус аккаунта
+                    update_query = '''
+                        UPDATE telegram_accounts
+                        SET status = $1
+                        WHERE id = $2
+                    '''
+                    await conn.execute(update_query, 'pending', account_id)
+                    
+                    return {
+                        "account_id": account_id,
+                        "status": "pending",
+                        "requires_2fa": True,
+                        "message": "Требуется пароль двухфакторной аутентификации"
+                    }
+                except Exception as e:
+                    logger.error(f"Ошибка при авторизации: {str(e)}")
+                    # Анализируем сообщение об ошибке
+                    error_msg = str(e).lower()
+                    
+                    # Формируем понятное пользователю сообщение об ошибке
+                    user_message = "Ошибка при авторизации"
+                    
+                    if "invalid phone code" in error_msg:
+                        user_message = "Неверный код авторизации. Пожалуйста, попробуйте снова или запросите новый код."
+                    elif "phone code expired" in error_msg:
+                        user_message = "Срок действия кода истек. Пожалуйста, запросите новый код."
+                    elif "too many attempts" in error_msg:
+                        user_message = "Слишком много попыток ввода кода. Пожалуйста, попробуйте позже."
+                    elif "flood" in error_msg:
+                        user_message = "Слишком много запросов. Пожалуйста, попробуйте позже."
+                    else:
+                        user_message = f"Ошибка при авторизации: {str(e)}"
+                    
+                    # Корректная обработка отключения клиента
+                    try:
+                        if client:
+                            if asyncio.iscoroutinefunction(client.disconnect):
+                                await client.disconnect()
+                            else:
+                                client.disconnect()
+                            client = None
+                    except Exception as disconnect_err:
+                        logger.warning(f"Ошибка при отключении клиента: {disconnect_err}")
+                    
+                    raise HTTPException(400, user_message)
+    except HTTPException:
+        # Пробрасываем HTTPException дальше
+        raise
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при авторизации Telegram-аккаунта {account_id}: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
     except Exception as e:
-        logger.error(f"Ошибка при авторизации с кодом: {str(e)}")
-        await conn.close()
+        logger.error(f"Ошибка при авторизации с кодом: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Ошибка при авторизации: {str(e)}")
 
 # === Эндпоинт для запроса кода авторизации для существующего аккаунта ===
 @app.post("/api/telegram/accounts/{account_id}/request-code")
 async def request_telegram_auth_code(request: Request, account_id: str):
     """Запрашивает новый код авторизации для существующего аккаунта Telegram."""
-    from user_manager import get_db_connection
+    from user_manager import get_db_pool
     from telegram_utils import create_telegram_client
     from telethon import errors
+    
     logger.info(f"Запрос кода авторизации для аккаунта {account_id}")
     auth_header = request.headers.get('authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
@@ -4152,122 +4360,133 @@ async def request_telegram_auth_code(request: Request, account_id: str):
         logger.error("Неверный админ-ключ для запроса кода")
         raise HTTPException(401, "Неверный админ-ключ")
 
-    conn = await get_db_connection()
-    query = 'SELECT phone, api_id, api_hash, session_file, proxy FROM telegram_accounts WHERE id = ?'
-    result = await conn.execute(query, (account_id,))
-    account = await result.fetchone()
-    await conn.close() # Закрываем соединение сразу после получения данных
-
-    if not account:
-        logger.error(f"Аккаунт {account_id} не найден для запроса кода")
-        raise HTTPException(404, "Аккаунт не найден")
-
-    account_dict = dict(account)
-    phone = account_dict.get("phone")
-    api_id_str = account_dict.get("api_id")
-    api_hash = account_dict.get("api_hash")
-    session_file = account_dict.get("session_file")
-    proxy = account_dict.get("proxy")
-
-    if not all([phone, api_id_str, api_hash, session_file]):
-        logger.error(f"Неполные данные для запроса кода аккаунта {account_id}")
-        # Обновляем статус на error, если его еще нет
-        try:
-            conn_update = await get_db_connection()
-            update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ? AND status != ?'
-            await conn_update.execute(update_query, ('error', account_id, 'error'))
-            await conn_update.commit()
-            await conn_update.close()
-        except Exception as db_err:
-            logger.error(f"Не удалось обновить статус на 'error' для {account_id} из-за неполных данных при запросе кода: {db_err}")
-        raise HTTPException(400, "Неполные данные аккаунта (phone, api_id, api_hash, session_file)")
-
-    try:
-        api_id = int(api_id_str)
-    except (ValueError, TypeError):
-        logger.error(f"Неверный формат api_id {api_id_str} для запроса кода аккаунта {account_id}")
-        # Обновляем статус на error
-        try:
-            conn_update = await get_db_connection()
-            update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-            await conn_update.execute(update_query, ('error', account_id))
-            await conn_update.commit()
-            await conn_update.close()
-        except Exception as db_err:
-            logger.error(f"Не удалось обновить статус на 'error' для {account_id} из-за неверного api_id при запросе кода: {db_err}")
-        raise HTTPException(400, f"Неверный формат api_id: {api_id_str}")
-
     client = None
+    
     try:
-        logger.info(f"Создание клиента для запроса кода, сессия: {session_file}")
-        client = await create_telegram_client(session_file, api_id, api_hash, proxy)
+        pool = await get_db_pool()
+        
+        async with pool.acquire() as conn:
+            # Получаем данные аккаунта
+            query = 'SELECT phone, api_id, api_hash, session_file, proxy FROM telegram_accounts WHERE id = $1'
+            account_record = await conn.fetchrow(query, account_id)
+            
+            if not account_record:
+                logger.warning(f"Аккаунт {account_id} не найден при запросе кода")
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+            
+            # Извлекаем необходимые данные
+            phone = account_record.get('phone')
+            api_id_str = account_record.get('api_id')
+            api_hash = account_record.get('api_hash')
+            session_file = account_record.get('session_file')
+            proxy = account_record.get('proxy')
+            
+            # Проверка на неполные данные
+            if not all([phone, api_id_str, api_hash, session_file]):
+                logger.error(f"Неполные данные аккаунта {account_id} для запроса кода")
+                
+                async with conn.transaction():
+                    update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2 AND status != $3'
+                    await conn.execute(update_query, 'error', account_id, 'error')
+                
+                raise HTTPException(status_code=400, detail="Неполные данные аккаунта для запроса кода")
 
-        logger.info(f"Подключение клиента для запроса кода для аккаунта {account_id}")
-        await client.connect()
+            try:
+                api_id = int(api_id_str)
+            except (ValueError, TypeError):
+                logger.error(f"Неверный формат api_id {api_id_str} для запроса кода аккаунта {account_id}")
+                
+                async with conn.transaction():
+                    update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                    await conn.execute(update_query, 'error', account_id)
+                
+                raise HTTPException(status_code=400, detail=f"Неверный формат API ID: {api_id_str}")
 
-        # Проверяем, вдруг уже авторизован?
-        if await client.is_user_authorized():
-             logger.warning(f"Попытка запроса кода для уже авторизованного аккаунта {account_id}")
-             # Обновляем статус на active, если он был другим
-             try:
-                 conn_update = await get_db_connection()
-                 update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ? AND status != ?'
-                 await conn_update.execute(update_query, ('active', account_id, 'active'))
-                 await conn_update.commit()
-                 await conn_update.close()
-             except Exception as db_err:
-                 logger.error(f"Не удалось обновить статус на 'active' для {account_id} при запросе кода: {db_err}")
-             raise HTTPException(400, "Аккаунт уже авторизован")
+            try:
+                logger.info(f"Создание клиента для запроса кода, сессия: {session_file}")
+                client = await create_telegram_client(session_file, api_id, api_hash, proxy)
 
-        logger.info(f"Отправка запроса кода для телефона {phone} (аккаунт {account_id})")
-        sent_code_info = await client.send_code_request(phone)
-        logger.info(f"Запрос кода для {account_id} отправлен успешно. Phone code hash: {sent_code_info.phone_code_hash}")
+                logger.info(f"Подключение клиента для запроса кода для аккаунта {account_id}")
+                await client.connect()
 
-        # Сохраняем phone_code_hash в БД для использования при проверке кода
-        # и обновляем статус на 'pending_code'
-        conn = await get_db_connection()
-        update_query = "UPDATE telegram_accounts SET phone_code_hash = ?, status = ? WHERE id = ?"
-        await conn.execute(update_query, (sent_code_info.phone_code_hash, 'pending_code', account_id))
-        await conn.commit()
-        await conn.close()
+                # Если аккаунт уже авторизован, просто возвращаем успех
+                if await client.is_user_authorized():
+                    logger.info(f"Аккаунт {account_id} уже авторизован, обновляем статус на 'active'")
+                    
+                    async with conn.transaction():
+                        update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2 AND status != $3'
+                        await conn.execute(update_query, 'active', account_id, 'active')
+                    
+                    # Правильно отключаем клиент перед возвратом
+                    if asyncio.iscoroutinefunction(client.disconnect):
+                        await client.disconnect()
+                    else:
+                        client.disconnect()
+                    client = None
+                    
+                    return {
+                        "success": True,
+                        "message": "Аккаунт уже авторизован",
+                        "status": "active"
+                    }
 
-        # Добавляем лог с используемым номером
-        logger.info(f"Успешно запрошен код для номера {phone} (аккаунт {account_id})")
-        return {"message": "Код отправлен успешно", "account_id": account_id, "status": "pending_code"}
+                logger.info(f"Отправка запроса кода для телефона {phone} (аккаунт {account_id})")
+                sent_code_info = await client.send_code_request(phone)
+                logger.info(f"Запрос кода для {account_id} отправлен успешно. Phone code hash: {sent_code_info.phone_code_hash}")
 
-    except errors.FloodWaitError as e:
-        logger.error(f"Ошибка FloodWait при запросе кода для {account_id}: ждите {e.seconds} секунд")
-        raise HTTPException(status_code=429, detail=f"Слишком много запросов. Попробуйте через {e.seconds} секунд.")
-    except errors.PhoneNumberInvalidError:
-        logger.error(f"Неверный номер телефона {phone} для аккаунта {account_id}")
-        # Обновляем статус на 'error'
-        try:
-            conn_update = await get_db_connection()
-            update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-            await conn_update.execute(update_query, ('error', account_id))
-            await conn_update.commit()
-            await conn_update.close()
-        except Exception as db_err:
-             logger.error(f"Не удалось обновить статус на 'error' для {account_id} из-за неверного номера: {db_err}")
-        raise HTTPException(status_code=400, detail="Неверный номер телефона.")
+                # Сохраняем phone_code_hash в БД для использования при проверке кода
+                async with conn.transaction():
+                    update_query = "UPDATE telegram_accounts SET phone_code_hash = $1, status = $2 WHERE id = $3"
+                    await conn.execute(update_query, sent_code_info.phone_code_hash, 'pending_code', account_id)
+
+                # Добавляем лог с используемым номером
+                return {
+                    "success": True,
+                    "message": "Код авторизации запрошен, пожалуйста, введите его",
+                    "phone": phone,
+                    "status": "pending_code"
+                }
+                
+            except errors.PhoneNumberInvalidError:
+                logger.error(f"Неверный номер телефона {phone} для аккаунта {account_id}")
+                
+                async with conn.transaction():
+                    update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                    await conn.execute(update_query, 'error', account_id)
+                
+                raise HTTPException(status_code=400, detail="Неверный номер телефона")
+                
+            except Exception as e:
+                logger.error(f"Ошибка при запросе кода для аккаунта {account_id}: {e}", exc_info=True)
+                
+                async with conn.transaction():
+                    update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                    await conn.execute(update_query, 'error', account_id)
+                
+                raise HTTPException(status_code=500, detail=f"Ошибка при запросе кода: {str(e)}")
+    
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при запросе кода для аккаунта {account_id}: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except HTTPException:
+        raise  # Пробрасываем HTTPException дальше
     except Exception as e:
-        logger.error(f"Непредвиденная ошибка при запросе кода для {account_id}: {str(e)}", exc_info=True)
-        # Обновляем статус на 'error'
-        try:
-            conn_update = await get_db_connection()
-            update_query = 'UPDATE telegram_accounts SET status = ? WHERE id = ?'
-            await conn_update.execute(update_query, ('error', account_id))
-            await conn_update.commit()
-            await conn_update.close()
-        except Exception as db_err:
-             logger.error(f"Не удалось обновить статус на 'error' для {account_id} после ошибки запроса кода: {db_err}")
-
-        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при запросе кода: {str(e)}")
+        logger.error(f"Ошибка при запросе кода для аккаунта {account_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
     finally:
+        # Гарантируем закрытие клиента в случае ошибки
         if client:
-            if hasattr(client, 'is_connected') and callable(client.is_connected) and await client.is_connected():
-                await client.disconnect()
-                logger.info(f"Клиент для запроса кода аккаунта {account_id} отключен.")
+            try:
+                if hasattr(client, 'is_connected') and callable(client.is_connected):
+                    is_connected = client.is_connected()
+                    if is_connected:
+                        if asyncio.iscoroutinefunction(client.disconnect):
+                            await client.disconnect()
+                        else:
+                            client.disconnect()
+                        logger.info(f"Клиент для запроса кода аккаунта {account_id} отключен.")
+            except Exception as e:
+                logger.warning(f"Ошибка при отключении клиента в блоке finally: {e}")
 
 
 # === Эндпоинт для верификации кода и 2FA (модифицирован для использования phone_code_hash) ===
@@ -4475,6 +4694,7 @@ async def request_telegram_auth_code(request: Request, account_id: str):
 # === Эндпоинт для получения списка аккаунтов ===
 @app.get("/api/accounts")
 async def get_accounts(request: Request):
+    """Получает список всех аккаунтов."""
     # Проверяем админ-ключ
     admin_key = request.headers.get("X-Admin-Key")
     if not admin_key:
@@ -4483,31 +4703,38 @@ async def get_accounts(request: Request):
     if not admin_key or not await verify_admin_key(admin_key):
         raise HTTPException(status_code=401, detail="Неверный админ-ключ")
     
-    from user_manager import get_db_connection
-    conn = await get_db_connection()
+    from user_manager import get_db_pool
     
-    # Получаем все аккаунты
-    query = "SELECT id, api_id, api_hash, phone, proxy, session_file, status, phone_code_hash FROM telegram_accounts"
-    result = await conn.execute(query)
-    accounts = await result.fetchall()
-    
-    result = []
-    for account in accounts:
-        account_dict = dict(account)
-        result.append({
-            "id": account_dict["id"],
-            "api_id": account_dict["api_id"],
-            "api_hash": account_dict["api_hash"],
-            "phone": account_dict["phone"],
-            "proxy": account_dict["proxy"],
-            "session_file": account_dict["session_file"],
-            "status": account_dict["status"],
-            "phone_code_hash": account_dict["phone_code_hash"]
-        })
-    
-    await conn.close()
-    
-    return result
+    try:
+        pool = await get_db_pool()
+        
+        async with pool.acquire() as conn:
+            # Получаем все аккаунты
+            query = "SELECT id, api_id, api_hash, phone, proxy, session_file, status, phone_code_hash FROM telegram_accounts"
+            rows = await conn.fetch(query)
+            
+            result = []
+            for account_record in rows:
+                account_dict = dict(account_record)
+                result.append({
+                    "id": account_dict["id"],
+                    "api_id": account_dict["api_id"],
+                    "api_hash": account_dict["api_hash"],
+                    "phone": account_dict["phone"],
+                    "proxy": account_dict["proxy"],
+                    "session_file": account_dict["session_file"],
+                    "status": account_dict["status"],
+                    "phone_code_hash": account_dict["phone_code_hash"]
+                })
+            
+            return result
+            
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL при получении списка аккаунтов: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка аккаунтов: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3030))

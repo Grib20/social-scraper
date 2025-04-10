@@ -2767,6 +2767,63 @@ function submit2FAPassword() {
     });
 }
 
+async function deleteUser(userId) { 
+    // userId здесь будет содержать api_key пользователя, который передается из displayUsers
+    if (!userId) {
+        console.error("Попытка удалить пользователя без ID (API ключа).");
+        showNotification('Ошибка: Не удалось определить ID пользователя для удаления.', 'error');
+        return;
+    }
 
+    // Используем userId (api_key) в сообщении
+    if (!confirm(`Вы уверены, что хотите удалить пользователя с API ключом: ${userId}? \nВНИМАНИЕ: Все связанные с ним аккаунты VK и Telegram также будут удалены!`)) {
+        return; // Пользователь отменил удаление
+    }
+
+    console.log(`Попытка удаления пользователя с API ключом: ${userId}`);
+
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        showNotification('Админ-ключ не найден. Авторизуйтесь снова.', 'error');
+        window.location.href = '/login';
+        return;
+    }
+
+    try {
+        // Отправляем DELETE запрос на эндпоинт, который у вас есть
+        // Передаем userId (api_key) в URL
+        const response = await fetch(`/admin/users/${userId}`, { 
+            method: 'DELETE',
+            headers: {
+                // Используем 'Authorization': 'Bearer ...' если ваш эндпоинт его ожидает,
+                // или 'X-Admin-Key', если он ожидает его (судя по коду эндпоинта, он проверяет оба)
+                'Authorization': `Bearer ${adminKey}` 
+                // 'X-Admin-Key': adminKey // Если используете этот заголовок
+            }
+        });
+
+        if (!response.ok) {
+            let errorDetail = `Ошибка HTTP: ${response.status}`;
+            try {
+                const errorData = await response.json();
+                errorDetail = errorData.detail || errorDetail;
+            } catch (jsonError) { /* игнорируем */ }
+            throw new Error(errorDetail);
+        }
+
+        let resultMessage = 'Пользователь успешно удален.';
+        try {
+            const result = await response.json();
+            resultMessage = result.message || resultMessage;
+        } catch (jsonError) { /* игнорируем пустое тело ответа */ }
+
+        showNotification(resultMessage, 'success');
+        displayUsers(); // Обновляем список пользователей
+
+    } catch (error) {
+        console.error('Ошибка при удалении пользователя:', error);
+        showNotification(`Ошибка удаления: ${error.message}`, 'error');
+    }
+}
 
 // ... existing code ...

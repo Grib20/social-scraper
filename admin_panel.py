@@ -182,33 +182,33 @@ async def get_all_users() -> List[Dict]:
     try:
         pool = await user_manager.get_db_connection()
         if not pool:
-             raise HTTPException(status_code=503, detail="Не удалось получить пул БД")
+            raise HTTPException(status_code=503, detail="Не удалось получить пул БД")
 
         async with pool.acquire() as conn:
             users_records = await conn.fetch('SELECT * FROM users ORDER BY created_at DESC')
-        users = []
+            users = []
             for user_record in users_records:
                 user_dict = dict(user_record)
-            api_key = user_dict['api_key']
-            
-            # Получаем Telegram аккаунты
+                api_key = user_dict['api_key']
+                
+                # Получаем Telegram аккаунты
                 tg_records = await conn.fetch('SELECT * FROM telegram_accounts WHERE user_api_key = $1', api_key)
                 user_dict['telegram_accounts'] = [dict(acc) for acc in tg_records]
-            
-            # Получаем VK аккаунты
+                
+                # Получаем VK аккаунты
                 vk_records = await conn.fetch('SELECT * FROM vk_accounts WHERE user_api_key = $1', api_key)
                 vk_accounts_processed = []
                 for vk_record in vk_records:
-                     acc_dict = dict(vk_record)
-                     # Расшифровываем токен VK аккаунта
-                     encrypted_token_str_vk = acc_dict.get('token')
-                     if encrypted_token_str_vk:
-                          try:
-                              acc_dict['token'] = user_manager.cipher.decrypt(encrypted_token_str_vk.encode()).decode()
-                          except Exception as e:
-                              logger.error(f"Ошибка расшифровки токена VK аккаунта {acc_dict.get('id')} в get_all_users: {e}")
-                              acc_dict['token'] = None # Устанавливаем None при ошибке
-                     vk_accounts_processed.append(acc_dict)
+                    acc_dict = dict(vk_record)
+                    # Расшифровываем токен VK аккаунта
+                    encrypted_token_str_vk = acc_dict.get('token')
+                    if encrypted_token_str_vk:
+                        try:
+                            acc_dict['token'] = user_manager.cipher.decrypt(encrypted_token_str_vk.encode()).decode()
+                        except Exception as e:
+                            logger.error(f"Ошибка расшифровки токена VK аккаунта {acc_dict.get('id')} в get_all_users: {e}")
+                            acc_dict['token'] = None  # Устанавливаем None при ошибке
+                    vk_accounts_processed.append(acc_dict)
                 user_dict['vk_accounts'] = vk_accounts_processed
                 
                 # Расшифровываем VK токен пользователя (если он есть)
@@ -218,11 +218,11 @@ async def get_all_users() -> List[Dict]:
                         user_dict['vk_token'] = user_manager.cipher.decrypt(user_vk_token_encrypted.encode()).decode()
                     except Exception as e:
                         logger.error(f"Ошибка расшифровки vk_token пользователя {api_key} в get_all_users: {e}")
-                        user_dict['vk_token'] = None # Устанавливаем None при ошибке
-            
-            users.append(user_dict)
-    return users
-    except PostgresError as e: # Используем PostgresError
+                        user_dict['vk_token'] = None  # Устанавливаем None при ошибке
+                
+                users.append(user_dict)
+        return users
+    except PostgresError as e:  # Используем PostgresError
         logger.error(f"Ошибка PostgreSQL в get_all_users: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка БД при получении пользователей: {e}")
     except Exception as e:
@@ -323,11 +323,11 @@ async def get_account_status(api_key: str, platform: str) -> Dict:
     try:
         accounts_key = f"{platform}_accounts"
         accounts = user.get(accounts_key, [])
-            return {
-                "total": len(accounts),
+        return {
+            "total": len(accounts),
             "active": sum(1 for acc in accounts if acc.get('is_active', False)),
-                "accounts": accounts
-            }
+            "accounts": accounts
+        }
     except Exception as e:
         logger.error(f"Ошибка при получении статуса аккаунтов ({platform}): {e}")
         raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")

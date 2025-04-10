@@ -17,6 +17,7 @@ import io
 from aiojobs import create_scheduler
 from dotenv import load_dotenv
 from typing import Union, Callable, Any, Optional, List, Dict
+import asyncpg
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -88,17 +89,17 @@ if not os.path.exists(MEDIA_DOWNLOAD_DIR):
 
 # --- Функции обновления статистики и инициализации --- 
 
-def update_account_usage(api_key, account_id, platform):
+async def update_account_usage(api_key, account_id, platform):
     """Обновляет статистику использования аккаунта через Redis"""
     try:
         from redis_utils import update_account_usage_redis
         # Вызываем функцию обновления статистики через Redis
-        update_account_usage_redis(api_key, account_id, platform)
+        await update_account_usage_redis(api_key, account_id, platform)
     except ImportError:
         # Если Redis не доступен, пытаемся использовать обычное обновление
         try:
             from user_manager import update_account_usage as real_update
-            real_update(api_key, account_id, platform)
+            await real_update(api_key, account_id, platform)
         except ImportError:
             logger.debug(f"Функции update_account_usage и update_account_usage_redis недоступны для {account_id}")
             pass
@@ -411,38 +412,67 @@ async def get_media_info(client, msg, album_messages=None, non_blocking=True) ->
             mime_type = 'application/octet-stream'
 
             # Определяем тип медиа и получаем объект для скачивания
-            if isinstance(media, types.MessageMediaPhoto):
+            if isinstance(media, types.MessageMediaPhoto) and media.photo:
                 media_type = 'photo'
                 media_object = media.photo
-                file_id = str(media_object.id)
-                file_ext = '.jpg'
-                mime_type = 'image/jpeg'
-            elif isinstance(media, types.MessageMediaDocument):
-                media_object = media.document
-                file_id = str(media_object.id)
-                mime_type = getattr(media_object, 'mime_type', mime_type).lower()
-                if mime_type.startswith('video/'):
-                    media_type = 'video'
-                    file_ext = '.mp4' # Предполагаем mp4
-                elif mime_type.startswith('image/'):
-                    media_type = 'photo'
-                    file_ext = '.jpg' # Предполагаем jpg
-                elif mime_type.startswith('audio/'):
-                    media_type = 'audio'
-                    file_ext = '.mp3' # Предполагаем mp3
+                if hasattr(media_object, 'id'):
+                    file_id = str(media_object.id)
+                    file_ext = '.jpg'
+                    mime_type = 'image/jpeg'
                 else:
-                    media_type = 'document'
-                    # Пытаемся угадать расширение по имени файла, если есть
-                    fname_attr = next((attr.file_name for attr in media_object.attributes if isinstance(attr, types.DocumentAttributeFilename)), None)
-                    if fname_attr:
-                         _root, _ext = os.path.splitext(fname_attr)
-                         if _ext: file_ext = _ext.lower()
+                    logger.warning("Фото без id, пропускаем")
+                    continue
+            elif isinstance(media, types.MessageMediaDocument) and media.document:
+                media_object = media.document
+                if hasattr(media_object, 'id'):
+                    file_id = str(media_object.id)
+                    mime_type = getattr(media_object, 'mime_type', 'application/octet-stream').lower()  
 
-                # Уточняем тип для GIF/стикеров
-                for attr in media_object.attributes:
-                    if isinstance(attr, types.DocumentAttributeAnimated): media_type = 'gif'; file_ext='.gif'
-                    elif isinstance(attr, types.DocumentAttributeSticker): media_type = 'sticker'; file_ext='.webp' # Стикеры часто webp
+                    if mime_type.startswith('video/'):
+                        media_type = 'video'
+                        file_ext = '.mp4'
+                    elif mime_type.startswith('image/'):
+                        media_type = 'photo'
+                        file_ext = '.jpg'
+                    elif mime_type.startswith('audio/'):
+                        media_type = 'audio'
+                        file_ext = '.mp3'
+                    else:
+                        media_type = 'document'
+                        file_ext = '.bin'  # По умолчанию   
 
+                        # Безопасно получаем расширение из атрибутов
+                        if hasattr(media_object, 'attributes'):
+                            try:
+                                attributes = getattr(media_object, 'attributes', [])
+                                fname_attr = next((attr.file_name for attr in attributes
+                                                 if isinstance(attr, types.DocumentAttributeFilename)), None)
+                                if fname_attr:
+                                    _, _ext = os.path.splitext(fname_attr)
+                                    if _ext: 
+                                        file_ext = _ext.lower()
+                            except Exception as e:
+                                logger.debug(f"Ошибка при получении имени файла: {e}")  
+
+                        # Уточняем тип для GIF/стикеров
+                        if hasattr(media_object, 'attributes'):
+                            try:
+                                attributes = getattr(media_object, 'attributes', [])
+                                for attr in attributes:
+                                    if isinstance(attr, types.DocumentAttributeAnimated): 
+                                        media_type = 'gif'
+                                        file_ext = '.gif'
+                                    elif isinstance(attr, types.DocumentAttributeSticker): 
+                                        media_type = 'sticker'
+                                        file_ext = '.webp'
+                            except Exception as e:
+                                logger.debug(f"Ошибка при обработке атрибутов: {e}")
+                else:
+                    logger.warning("Документ без id, пропускаем")
+                    continue
+            else:
+                logger.debug(f"Неизвестный тип медиа: {type(media)}")
+                continue
             # Если успешно определили медиа и file_id
             if file_id and media_object and file_id not in processed_file_ids:
                 processed_file_ids.add(file_id)
@@ -703,6 +733,7 @@ async def download_media_parallel(media_info_list, api_key, max_workers=5):
     async def download_single_media(media_info):
         """Скачивает одиночный медиафайл с использованием доступного аккаунта"""
         nonlocal account_index
+        account_id = None
         
         async with download_semaphore:
             try:
@@ -729,7 +760,7 @@ async def download_media_parallel(media_info_list, api_key, max_workers=5):
                             client = telegram_pool.clients.get(account_id)
                             if not client:
                                 logger.info(f"Пытаемся создать клиент для аккаунта {account_id}")
-                                await telegram_pool.connect_client(account_id)
+                                await telegram_pool.connect_client(account_id) # type: ignore
                                 client = telegram_pool.clients.get(account_id)
                         except Exception as e:
                             logger.error(f"Ошибка при создании клиента для аккаунта {account_id}: {e}")
@@ -752,7 +783,7 @@ async def download_media_parallel(media_info_list, api_key, max_workers=5):
                 logger.info(f"Скачивание медиа через аккаунт {account_id}")
                 
                 # Подключаем клиента, если он не подключен
-                await telegram_pool.connect_client(account_id)
+                await telegram_pool.connect_client(account_id) # type: ignore
                 
                 # Получаем информацию о медиа для скачивания
                 msg = media_info.get('_msg')
@@ -768,37 +799,23 @@ async def download_media_parallel(media_info_list, api_key, max_workers=5):
                 # Обновляем статистику использования аккаунта через Redis
                 try:
                     from redis_utils import update_account_usage_redis
-                    update_account_usage_redis(actual_api_key, account_id, "telegram")
+                    await update_account_usage_redis(actual_api_key, account_id, "telegram")
                 except ImportError:
                     # Если Redis не доступен, используем прямое обновление
-                    update_account_usage(actual_api_key, account_id, "telegram")
+                    await update_account_usage(actual_api_key, account_id, "telegram")
                 
                 return result
                 
-            except sqlite3.OperationalError as db_err:
-                # Обрабатываем ошибку блокировки базы данных
-                if "database is locked" in str(db_err):
-                    logger.warning(f"База данных заблокирована при скачивании медиа через аккаунт {account_id}, повторная попытка через 1 секунду")
-                    # Добавляем задержку перед повторной попыткой
-                    await asyncio.sleep(1.0)
-                    # Рекурсивно повторяем операцию
-                    return await download_single_media(media_info)
-                else:
-                    # Другие ошибки SQLite
-                    logger.error(f"SQLite ошибка при скачивании медиа через аккаунт {account_id}: {db_err}", exc_info=True)
-                    return None
+            except asyncpg.PostgresError as db_err:
+                # Общая обработка ошибок PostgreSQL
+                logger.error(f"PostgreSQL ошибка при скачивании медиа через аккаунт {account_id if 'account_id' in locals() else 'неизвестно'}: {db_err}", exc_info=True)
+                return None
             except Exception as e:
-                # Проверяем на ошибку блокировки базы данных в строковом виде
-                if "database is locked" in str(e):
-                    logger.warning(f"База данных заблокирована при скачивании медиа через аккаунт {account_id}, повторная попытка через 1 секунду")
-                    # Добавляем задержку перед повторной попыткой
-                    await asyncio.sleep(1.0)
-                    # Рекурсивно повторяем операцию
-                    return await download_single_media(media_info)
-                else:
-                    # Другие ошибки
-                    logger.error(f"Ошибка при скачивании медиа: {e}")
-                    return None
+                # Общая обработка ошибок
+                logger.error(f"Непредвиденная ошибка при скачивании медиа: {e}", exc_info=True)
+                if 'account_id' in locals():
+                    logger.error(f"Ошибка произошла при обработке аккаунта {account_id}")
+                return None
     
     # Создаем задачи для каждого медиафайла
     for media_info in media_info_list:
@@ -845,7 +862,11 @@ def generate_media_links(msg):
         if isinstance(msg.media, types.MessageMediaPhoto):
             media_type = 'photo'
             media_object = msg.media.photo
-            file_id = str(media_object.id)
+            if media_object is not None and hasattr(media_object, 'id'):
+                file_id = str(media_object.id)
+            else:
+                logger.warning("Объект медиа без id, пропускаем")
+                return []
             file_ext = '.jpg'
             
             # Формируем имя S3 файла и ссылку
@@ -856,7 +877,11 @@ def generate_media_links(msg):
         # Обрабатываем документы (видео, аудио, документы, анимации)
         elif isinstance(msg.media, types.MessageMediaDocument):
             media_object = msg.media.document
-            file_id = str(media_object.id)
+            if media_object is not None and hasattr(media_object, 'id'):
+                file_id = str(media_object.id)
+            else:
+                logger.warning("Объект медиа без id, пропускаем")
+                return []
             mime_type = getattr(media_object, 'mime_type', 'application/octet-stream').lower()
             
             # Определяем тип медиа и расширение
@@ -873,15 +898,18 @@ def generate_media_links(msg):
             else:
                 media_type = 'document'
                 # Пытаемся угадать расширение по имени файла
-                fname_attr = next((attr.file_name for attr in media_object.attributes 
-                                  if isinstance(attr, types.DocumentAttributeFilename)), None)
-                if fname_attr:
-                    _, _ext = os.path.splitext(fname_attr)
-                    if _ext: 
-                        file_ext = _ext.lower()
+                if hasattr(media_object, 'attributes'):
+                    attributes = getattr(media_object, 'attributes', [])
+                    fname_attr = next((attr.file_name for attr in attributes
+                       if isinstance(attr, types.DocumentAttributeFilename)), None)
+                    if fname_attr:
+                        _, _ext = os.path.splitext(fname_attr)
+                        if _ext: 
+                            file_ext = _ext.lower()
             
             # Уточняем тип для GIF/стикеров
-            for attr in media_object.attributes:
+            attributes = getattr(media_object, 'attributes', [])
+            for attr in attributes:
                 if isinstance(attr, types.DocumentAttributeAnimated): 
                     media_type = 'gif'
                     file_ext = '.gif'
@@ -998,11 +1026,19 @@ async def process_media_later(client, msg, api_key=None):
             if isinstance(media, types.MessageMediaPhoto):
                 media_type = 'photo'
                 media_object = media.photo
-                file_id = str(media_object.id)
+                if media_object is not None and hasattr(media_object, 'id'):
+                   file_id = str(media_object.id)
+                else:
+                   logger.warning("Объект медиа без id, пропускаем")
+                   return []
                 file_ext = '.jpg'
             elif isinstance(media, types.MessageMediaDocument):
                 media_object = media.document
-                file_id = str(media_object.id)
+                if media_object is not None and hasattr(media_object, 'id'):
+                    file_id = str(media_object.id)
+                else:
+                    logger.warning("Объект медиа без id, пропускаем")
+                    return []
                 mime_type = getattr(media_object, 'mime_type', 'application/octet-stream').lower()
                 
                 # Определяем тип и расширение файла
@@ -1017,15 +1053,18 @@ async def process_media_later(client, msg, api_key=None):
                     file_ext = '.mp3'
                 else:
                     media_type = 'document'
-                    fname_attr = next((attr.file_name for attr in media_object.attributes 
-                                      if isinstance(attr, types.DocumentAttributeFilename)), None)
-                    if fname_attr:
-                        _, _ext = os.path.splitext(fname_attr)
-                        if _ext: 
-                            file_ext = _ext.lower()
+                    if hasattr(media_object, 'attributes'):
+                        attributes = getattr(media_object, 'attributes', [])
+                        fname_attr = next((attr.file_name for attr in attributes
+                                           if isinstance(attr, types.DocumentAttributeFilename)), None)
+                        if fname_attr:
+                            _, _ext = os.path.splitext(fname_attr)
+                            if _ext: 
+                                file_ext = _ext.lower()
                             
                 # Уточняем тип для GIF/стикеров
-                for attr in media_object.attributes:
+                attributes = getattr(media_object, 'attributes', [])
+                for attr in attributes:
                     if isinstance(attr, types.DocumentAttributeAnimated): 
                         media_type = 'gif'
                         file_ext = '.gif'
