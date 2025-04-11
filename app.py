@@ -1,5 +1,6 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Request, Security, Body, Header, responses, Depends, File, UploadFile, Form
+import client_pools
+from fastapi import FastAPI, HTTPException, Request, Security, Body, Header, responses, Depends, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -40,6 +41,8 @@ import media_utils
 import asyncpg
 from pydantic import BaseModel, Field 
 from user_manager import get_db_pool
+from client_pools import TelegramClientPool, VKClientPool # Импортируем классы
+from starlette.datastructures import UploadFile
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -66,10 +69,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('scraper.log')
+        logging.FileHandler('scraper.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
+# Создаем экземпляры пулов ПОСЛЕ импорта классов
+logger.info("Создание пулов клиентов...")
+telegram_pool = TelegramClientPool()
+vk_pool = VKClientPool()
+logger.info("Пулы клиентов созданы.")
+
 
 # Инициализация секретов из Docker secrets или переменных окружения
 AWS_ACCESS_KEY_ID = read_docker_secret('aws_access_key') or os.getenv('AWS_ACCESS_KEY_ID')
@@ -116,7 +125,7 @@ from vk_utils import VKClient, find_vk_groups, get_vk_posts, get_vk_posts_in_gro
 from user_manager import (
     get_db_pool, register_user, set_vk_token, get_db_connection, get_vk_token, get_user, 
     get_next_available_account, update_account_usage, update_user_last_used,
-    get_users_dict, verify_api_key, get_active_accounts
+    get_users_dict, verify_api_key, get_active_accounts    
 )
 from media_utils import init_scheduler, close_scheduler
 from admin_panel import (
@@ -178,11 +187,18 @@ async def auth_middleware(request: Request, platform: str):
 
         logger.info(f"Используется VK аккаунт {account_id}")
         
-        # Используем Redis для обновления статистики
+        # Используем Redis для обновления статистики и проверяем лимит
         try:
-            await update_account_usage_redis(api_key, account_id, "vk") # <-- Добавляем await ЗДЕСЬ
+            new_count = await update_account_usage_redis(api_key, account_id, "vk")
+            # if new_count is not None and new_count > REQUEST_LIMIT:
+            #     if hasattr(client, 'set_degraded_mode'):
+            #         client.set_degraded_mode(True)
+            #         logger.warning(f"VK аккаунт {account_id} переведен в режим пониженной производительности (счетчик: {new_count})")
+            #     else:
+            #         logger.error(f"Клиент VK для аккаунта {account_id} не имеет метода set_degraded_mode")
+                    
         except Exception as e:
-            logger.error(f"Ошибка при вызове update_account_usage_redis в auth_middleware (VK): {e}")
+            logger.error(f"Ошибка при вызове update_account_usage_redis или установке degraded_mode (VK): {e}")
             # Не прерываем работу, если статистика не обновилась
         return client
         
@@ -194,17 +210,39 @@ async def auth_middleware(request: Request, platform: str):
             raise HTTPException(429, "Не удалось инициализировать клиент Telegram. Добавьте аккаунт Telegram в личном кабинете.")
         
         logger.info(f"Используется Telegram аккаунт {account_id}")
-        # Используем Redis для обновления статистики
+        # Используем Redis для обновления статистики и проверяем лимит
         try:
-            await update_account_usage_redis(api_key, account_id, "telegram") # <-- Добавляем await ЗДЕСЬ
+            new_count = await update_account_usage_redis(api_key, account_id, "telegram")
+            # if new_count is not None and new_count > REQUEST_LIMIT:
+            #     # TODO: Реализовать set_degraded_mode для Telegram клиента/пула
+            #     # Пока просто логируем
+            #     logger.warning(f"Telegram аккаунт {account_id} превысил лимит запросов (счетчик: {new_count}). Логика деградации пока не реализована.")
+            #     # if hasattr(client, 'set_degraded_mode'): 
+            #     #    client.set_degraded_mode(True)
+            #     #    logger.warning(f"Telegram аккаунт {account_id} переведен в режим пониженной производительности.")
+
         except Exception as e:
-             logger.error(f"Ошибка при вызове update_account_usage_redis в auth_middleware (Telegram): {e}")
+             logger.error(f"Ошибка при вызове update_account_usage_redis или проверке лимита (Telegram): {e}")
              # Не прерываем работу, если статистика не обновилась
         return client
     
     else:
         logger.error(f"Запрос к неизвестной платформе: {platform}")
         raise HTTPException(400, f"Неизвестная платформа: {platform}")
+
+# --- Background task for cleaning inactive clients ---
+async def _cleanup_inactive_clients_task(interval_seconds: int = 300):
+    logger.info(f"Запуск фоновой задачи очистки неактивных клиентов (интервал: {interval_seconds} сек).")
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            if telegram_pool:
+                 await telegram_pool.disconnect_inactive_clients()
+            # Можно добавить аналогичный вызов для vk_pool, если он будет управлять подключениями
+            # if vk_pool and hasattr(vk_pool, 'disconnect_inactive_clients'):
+            #     await vk_pool.disconnect_inactive_clients()
+        except Exception as e:
+            logger.error(f"Ошибка в фоновой задаче очистки неактивных клиентов: {e}", exc_info=True)
 
 # Настраиваем приложение FastAPI и его жизненный цикл
 # --- Lifespan для инициализации и очистки ---
@@ -233,6 +271,11 @@ async def lifespan(app: FastAPI):
     else:
          logger.warning("Асинхронный клиент Redis НЕ доступен.")
 
+    # --- Запуск фоновой задачи очистки --- 
+    # Изменяем интервал на 3600 секунд (1 час)
+    cleanup_task = asyncio.create_task(_cleanup_inactive_clients_task(interval_seconds=3600)) 
+    logger.info("Фоновая задача очистки неактивных клиентов запущена.")
+    
     logger.info("Приложение готово к работе.")
     
     # --- Работа приложения ---
@@ -241,20 +284,30 @@ async def lifespan(app: FastAPI):
     # --- Завершение работы ---
     logger.info("Начало завершения работы приложения...")
 
-    # 1. Остановка планировщика
+    # 1. Остановка фоновой задачи очистки
+    logger.info("Остановка фоновой задачи очистки неактивных клиентов...")
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        logger.info("Фоновая задача очистки успешно отменена.")
+    except Exception as e:
+        logger.error(f"Ошибка при ожидании отмены задачи очистки: {e}", exc_info=True)
+
+    # 2. Остановка планировщика
     try:
         await media_utils.close_scheduler()
         logger.info("Планировщик медиа остановлен.")
     except Exception as e:
         logger.error(f"Ошибка при остановке планировщика: {e}", exc_info=True)
 
-    # 2. Закрытие соединения с Redis
+    # 3. Закрытие соединения с Redis
     if redis_client:
         try:
             logger.info("Закрытие асинхронного соединения с Redis...")
             # --- ИСПРАВЛЕНО ЗДЕСЬ ---
-            # Просто вызываем await close() для асинхронного клиента
-            await redis_client.close()
+            # Просто вызываем await aclose() для асинхронного клиента
+            await redis_client.aclose() # <-- ЗАМЕНА ЗДЕСЬ
             # Опционально: ожидание закрытия (для некоторых библиотек/версий)
             # if hasattr(redis_client, 'wait_closed'):
             #     await redis_client.wait_closed()
@@ -264,18 +317,23 @@ async def lifespan(app: FastAPI):
     else:
          logger.info("Клиент Redis не был инициализирован, закрытие не требуется.")
 
+    # 4. Закрытие пулов клиентов (если они будут реализованы с методом close)
+    logger.info("Закрытие клиентов в пулах...")
+    try:
+        if telegram_pool and hasattr(telegram_pool, 'disconnect_client'): # Используем disconnect_client
+            # Отключаем всех оставшихся клиентов при завершении
+            all_client_ids = list(telegram_pool.clients.keys())
+            logger.info(f"Отключение {len(all_client_ids)} клиентов Telegram при завершении работы...")
+            disconnect_tasks = [telegram_pool.disconnect_client(acc_id) for acc_id in all_client_ids]
+            await asyncio.gather(*disconnect_tasks, return_exceptions=True) 
+            logger.info("Все клиенты Telegram в пуле отключены.")
 
-    # 3. Закрытие пулов клиентов (если они будут реализованы с методом close)
-    # logger.info("Закрытие пулов клиентов (если реализовано)...")
-    # try:
-    #     if telegram_pool and hasattr(telegram_pool, 'close_all_clients'):
-    #         await telegram_pool.close_all_clients()
-    #     if vk_pool and hasattr(vk_pool, 'close_all_clients'):
-    #         await vk_pool.close_all_clients()
-    #     logger.info("Пулы клиентов закрыты (если были методы).")
-    # except Exception as e:
-    #     logger.error(f"Ошибка при закрытии пулов клиентов: {e}", exc_info=True)
+        # Аналогично для VK, если нужно
+        # if vk_pool and hasattr(vk_pool, 'disconnect_client'):
+        #     ...
 
+    except Exception as e:
+        logger.error(f"Ошибка при отключении клиентов в пулах: {e}", exc_info=True)
 
     logger.info("Приложение успешно остановлено.")
 
@@ -863,8 +921,8 @@ async def find_groups(request: Request):
                 logger.info(f"Является ли объект awaitable: {inspect.isawaitable(coro_to_await)}")
                 # --- Конец детального логирования ---
                 
-                # Ищем группы
-                groups = await find_groups_by_keywords(vk_client, keywords, min_members, max_count, api_key)
+                # Ищем группы, ожидая уже созданную корутину
+                groups = await coro_to_await 
                 return {"groups": groups, "count": len(groups)}
             except Exception as e:
                 logger.error(f"Error in find_groups for VK: {e}")
@@ -874,9 +932,10 @@ async def find_groups(request: Request):
                 )
         else:  # telegram
             # Получаем клиент Telegram через auth_middleware
+            client = None # Инициализируем client как None
             try:
-                from telegram_utils import find_channels
-                
+                from telegram_utils import find_channels # Убираем start_client и disconnect_client из импорта
+
                 # Получаем Telegram клиент используя запрос с правильным заголовком
                 client = await auth_middleware(request_for_auth, 'telegram')
                 if not client:
@@ -885,15 +944,31 @@ async def find_groups(request: Request):
                         content={"error": "No Telegram account available"}
                     )
                 
+                logger.info(f"Получен клиент Telegram для поиска каналов. Подключение...")
+                # Подключаем клиент перед использованием напрямую
+                await client.connect() 
+                logger.info(f"Клиент Telegram подключен.")
+
                 # Ищем каналы
                 channels = await find_channels(client, keywords, min_members, max_count, api_key)
+                logger.info(f"Поиск каналов завершен, найдено: {len(channels)}")
+                
                 return {"groups": channels, "count": len(channels)}
+            
             except Exception as e:
-                logger.error(f"Error in find_groups for Telegram: {e}")
+                # Логируем ошибку перед возвратом ответа
+                logger.error(f"Ошибка в find_groups для Telegram: {e}", exc_info=True) # Добавляем exc_info=True
                 return JSONResponse(
                     status_code=500,
                     content={"error": f"Failed to find Telegram channels: {str(e)}"}
                 )
+            finally:
+                # Гарантированно отключаем клиент, если он был создан
+                if client and client.is_connected(): # Проверяем, что клиент существует и подключен
+                    logger.info("Отключение клиента Telegram после поиска каналов...")
+                    # Отключаем клиент напрямую
+                    await client.disconnect() 
+                    logger.info("Клиент Telegram отключен.")
     except Exception as e:
         logger.error(f"Error in find_groups: {e}")
         return JSONResponse(
@@ -908,13 +983,24 @@ async def trending_posts(request: Request, data: dict):
     await init_scheduler()
     
     platform = data.get('platform', 'telegram')
-    group_ids = data.get('group_ids', [])
-    if not group_ids:
+    group_ids_input = data.get('group_ids', [])
+    if not group_ids_input:
         raise HTTPException(400, "ID групп обязательны")
-    
+
+    # --- Гарантируем, что group_ids - это список --- 
+    if isinstance(group_ids_input, (int, str)):
+        logger.warning(f"Получен не список group_ids: {group_ids_input}. Преобразуем в список.")
+        group_ids = [str(group_ids_input)] # Преобразуем в список строк
+    elif isinstance(group_ids_input, list):
+        group_ids = [str(gid) for gid in group_ids_input if gid is not None] # Преобразуем все элементы в строки
+    else:
+        logger.error(f"Некорректный тип для group_ids: {type(group_ids_input)}")
+        raise HTTPException(400, "Некорректный формат group_ids")
+    # ---------------------------------------------
+        
     days_back = data.get('days_back', 7)
     posts_per_group = data.get('posts_per_group', 10)
-    min_views = data.get('min_views', 0)  # Устанавливаем значение по умолчанию 0
+    min_views = data.get('min_views', 0)
 
     # Получаем API ключ из заголовка для передачи в функцию get_trending_posts
     api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
@@ -924,9 +1010,41 @@ async def trending_posts(request: Request, data: dict):
             api_key = auth_header.split(' ')[1]
 
     if platform == 'telegram':
-        client = await auth_middleware(request, 'telegram')
-        # Устанавливаем non_blocking=True для более быстрого ответа
-        return await get_trending_posts(client, group_ids, days_back, posts_per_group, min_views, api_key=api_key, non_blocking=True)
+        client = None 
+        account_id = None
+        if api_key is None:
+            logger.error("API ключ не предоставлен")
+            raise HTTPException(status_code=401, detail="API ключ не предоставлен")
+        try:
+            # Получаем КЛИЕНТА и ID АККАУНТА из auth_middleware
+            client, account_id = await telegram_pool.select_next_client(api_key)
+            if not client or not account_id:
+                 logger.error(f"Не удалось получить Telegram клиент или account_id для API ключа {api_key}")
+                 raise HTTPException(400, "Не удалось получить Telegram клиент")
+
+            logger.info(f"Получен клиент Telegram {account_id} для trending-posts. Подключение...")
+            await client.connect()
+            logger.info(f"Клиент Telegram {account_id} подключен.")
+
+            # Передаем client, account_id и список group_ids
+            result = await get_trending_posts(
+                client, 
+                account_id, # <--- Передаем account_id
+                group_ids, # <--- Передаем гарантированно список
+                days_back, 
+                posts_per_group, 
+                min_views, 
+                api_key=api_key
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка в trending_posts для Telegram: {e}", exc_info=True)
+            # В случае ошибки возвращаем 500
+            raise HTTPException(status_code=500, detail=f"Ошибка при получении трендовых постов: {str(e)}")
+        finally:
+            # ... (блок finally остается без disconnect) ...
+            pass 
     elif platform == 'vk':
         vk = await auth_middleware(request, 'vk')
         return await get_vk_posts_in_groups(vk, group_ids, count=posts_per_group * len(group_ids), min_views=min_views, days_back=days_back)
@@ -1041,13 +1159,14 @@ async def posts_by_keywords(request: Request, data: dict):
 async def get_posts_by_period(request: Request, data: dict):
     # Инициализируем планировщик медиа
     from media_utils import init_scheduler
+    from telegram_utils import get_posts_by_period
     await init_scheduler()
     
     platform = data.get('platform', 'telegram')
     group_ids = data.get('group_ids', [])
     if not group_ids:
         raise HTTPException(400, "ID групп обязательны")
-    
+
     max_posts = data.get('max_posts', 100)
     days_back = data.get('days_back', 7)
     min_views = data.get('min_views', 0)
@@ -1061,18 +1180,125 @@ async def get_posts_by_period(request: Request, data: dict):
         else:
             raise HTTPException(401, "API ключ обязателен")
 
+    # Проверка API ключа (общая для обеих платформ)
+    if not await verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Неверный API ключ")
+
     if platform == 'telegram':
-        client = await auth_middleware(request, 'telegram')
-        from telegram_utils import get_posts_by_period as get_telegram_posts_by_period
-        # Устанавливаем non_blocking=True для более быстрого ответа
-        return await get_telegram_posts_by_period(client, group_ids, max_posts, days_back, min_views, api_key=api_key, non_blocking=True)
+        # --- Начало существующего кода для Telegram (не трогаем) ---
+        client = None
+        account_id = None
+        is_degraded = False # Флаг для передачи в функцию
+
+        try:
+            # Получаем клиента и его статус
+            client, account_id = await telegram_pool.select_next_client(api_key)
+            if not client or not account_id:
+                # Проверяем, есть ли вообще активные аккаунты у пользователя
+                active_accounts = await get_active_accounts(api_key, "telegram")
+                if not active_accounts:
+                    raise HTTPException(400, "Нет активных Telegram аккаунтов для выполнения запроса")
+                else:
+                    raise HTTPException(400, "Не удалось выбрать активный Telegram клиент. Возможно, все аккаунты временно недоступны.")
+
+            # Проверяем, находится ли клиент в режиме деградации
+            is_degraded = telegram_pool.degraded_mode_status.get(account_id, False)
+
+            # Подключаемся (если еще не подключен)
+            if not client.is_connected():
+                logger.info(f"Подключаем Telegram клиент {account_id} для posts-by-period...")
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                         logger.warning(f"Клиент Telegram {account_id} подключен, но не авторизован.")
+                         raise HTTPException(status_code=403, detail=f"Аккаунт {account_id} требует авторизации.")
+                    logger.info(f"Клиент Telegram {account_id} подключен и авторизован.")
+                except Exception as connect_error:
+                    logger.error(f"Ошибка подключения клиента Telegram {account_id}: {connect_error}")
+                    raise HTTPException(status_code=503, detail=f"Ошибка подключения к Telegram для аккаунта {account_id}")
+
+            # Вызываем get_posts_by_period
+            result = await get_posts_by_period(
+                client,
+                group_ids,
+                limit_per_channel=max_posts, # Используем limit_per_channel=max_posts
+                days_back=days_back,
+                min_views=min_views,
+                is_degraded=is_degraded # Передаем статус деградации
+            )
+            return result
+        except HTTPException as http_exc:
+             # Перебрасываем HTTP исключения дальше
+             raise http_exc
+        except Exception as e:
+            logger.error(f"Ошибка в posts-by-period для Telegram: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера при обработке запроса Telegram.")
+        # --- Конец существующего кода для Telegram ---
+
     elif platform == 'vk':
-        vk = await auth_middleware(request, 'vk')
-        # Устанавливаем API ключ для клиента VK
-        vk.api_key = api_key
-        # Вызываем метод get_posts_by_period у объекта VKClient
-        return await vk.get_posts_by_period(group_ids, max_posts, days_back, min_views)
-    raise HTTPException(400, "Платформа не поддерживается")
+        # +++ Начало добавленного кода для VK +++
+        try:
+            # Используем get_next_available_account для VK
+            account = await get_next_available_account(api_key, "vk")
+            if not account:
+                 # Проверяем, есть ли вообще активные аккаунты VK у пользователя
+                active_vk_accounts = await get_active_accounts(api_key, "vk")
+                if not active_vk_accounts:
+                    raise HTTPException(status_code=400, detail="Нет активных VK аккаунтов для выполнения запроса.")
+                else:
+                    # Используем 429 Too Many Requests, как было в оригинальном эндпоинте
+                    raise HTTPException(status_code=429, detail="Нет доступных VK аккаунтов в данный момент, попробуйте позже.")
+
+            # Создаем VKClient с данными аккаунта
+            # Передаем account_id и api_key для учета использования
+            async with VKClient(
+                access_token=account["token"], # Используем ключ "token"
+                proxy=account.get("proxy"),
+                account_id=account["id"],
+                api_key=api_key # Передаем api_key
+            ) as vk:
+                # Вызываем метод клиента VK для получения постов
+                # Убедимся, что group_ids - это список чисел или строк, как ожидает vk_utils
+                processed_group_ids = []
+                for gid in group_ids:
+                    try:
+                        # Пытаемся преобразовать в int, если это строка с числом
+                        if isinstance(gid, str) and gid.lstrip('-').isdigit(): # Проверяем, что строка (возможно с минусом) содержит только цифры
+                            processed_group_ids.append(int(gid))
+                        elif isinstance(gid, int):
+                             processed_group_ids.append(gid)
+                        else:
+                            logger.warning(f"Не удалось обработать group_id: {gid} (тип: {type(gid)}), пропускаем.")
+                    except ValueError:
+                        logger.warning(f"Неверный формат group_id: {gid}, пропускаем.")
+
+                if not processed_group_ids:
+                     raise HTTPException(status_code=400, detail="Не найдено валидных ID групп VK.")
+
+                # Проверяем работоспособность клиента перед вызовом основного метода
+                if not await vk.test_connection():
+                     logger.error(f"Не удалось установить соединение с VK API для аккаунта {account['id']}")
+                     # Возможно, стоит пометить аккаунт как неактивный или вернуть другую ошибку
+                     raise HTTPException(status_code=503, detail="Не удалось подключиться к VK API.")
+
+                posts = await vk.get_posts_by_period(
+                    group_ids=processed_group_ids, # Используем обработанные ID
+                    max_posts=max_posts,
+                    days_back=days_back,
+                    min_views=min_views
+                )
+                # Формат ответа как в оригинальном эндпоинте /api/vk/posts-by-period
+                return {"posts": posts}
+        except HTTPException as http_exc:
+            # Перебрасываем HTTP исключения дальше
+            raise http_exc
+        except Exception as e:
+            logger.error(f"Ошибка в posts-by-period для VK: {e}", exc_info=True)
+            # Возвращаем более общую ошибку
+            raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера при обработке запроса VK.")
+        # +++ Конец добавленного кода для VK +++
+    else:
+        raise HTTPException(status_code=400, detail="Платформа не поддерживается")
 
 @app.get("/api/accounts/status")
 async def get_accounts_status(api_key: str = Header(...)):
@@ -1164,6 +1390,26 @@ async def add_telegram_account_endpoint(request: Request):
     proxy = form_data.get('proxy')
     session_file = form_data.get('session_file')
     
+    # --- Определяем тип ОДИН РАЗ --- 
+    is_actually_upload_file = isinstance(session_file, UploadFile)
+    logger.info(f"Получен session_file: тип={type(session_file)}, значение={session_file}")
+    logger.info(f"Зафиксировано: is_actually_upload_file = {is_actually_upload_file}")
+    # -------------------------------
+    
+    # Вычисляем is_file_empty, используя зафиксированный тип
+    if is_actually_upload_file:
+        try:
+            # Check if file seems non-empty without consuming it entirely yet
+            first_byte = await session_file.read(1)
+            await session_file.seek(0) # Reset pointer back to the start
+            is_file_empty = not first_byte
+            logger.info(f"session_file это UploadFile. Файл пустой: {is_file_empty}")
+        except Exception as e:
+            logger.error(f"Ошибка при чтении первого байта session_file: {e}")
+            is_file_empty = True # Assume empty on error
+    else:
+        is_file_empty = True # Not an UploadFile, treat as if no valid file provided
+    
     # Проверка и преобразование api_id
     api_id_int = None
     if isinstance(api_id_str, str):
@@ -1207,171 +1453,198 @@ async def add_telegram_account_endpoint(request: Request):
     # Проверяем прокси, если он указан
     if proxy:
         logger.info(f"Проверка прокси для Telegram: {proxy}")
-        from telegram_utils import validate_proxy
+        from client_pools import validate_proxy
         is_valid, proxy_type = validate_proxy(proxy)
         
         if not is_valid:
             logger.error(f"Неверный формат прокси: {proxy}")
             raise HTTPException(400, "Неверный формат прокси")
     
-    # Обрабатываем загрузку файла сессии, если он предоставлен
-    if isinstance(session_file, UploadFile) and await session_file.read(1):  # Проверяем, что файл не пустой
-        await session_file.seek(0)  # Возвращаем указатель в начало файла
+    # --- Повторное добавление Debug Logging (используем зафиксированный тип) --- 
+    logger.info(f"!!!! DEBUG CHECK !!!! Перед IF: Используем зафиксированный is_actually_upload_file = {is_actually_upload_file}")
+    logger.info(f"!!!! DEBUG CHECK !!!! Перед IF: is_file_empty = {is_file_empty}")
+    # Используем зафиксированный тип для условия
+    should_process_session_file = is_actually_upload_file and not is_file_empty 
+    logger.info(f"!!!! DEBUG CHECK !!!! Перед IF: Условие (is_actually_upload_file and not is_file_empty) = {should_process_session_file}")
+    # --- Конец Debug Logging ---
+
+    # Обрабатываем загрузку файла сессии, если он предоставлен и является UploadFile
+    if isinstance(session_file, UploadFile):
+        # Проверяем, не пустой ли файл
+        await session_file.seek(0)
+        is_file_empty = not await session_file.read(1) # Читаем 1 байт для проверки
+        await session_file.seek(0) # Возвращаем указатель в начало
+
+        if not is_file_empty:
+            # <<< SESSION FILE BRANCH >>>
+            logger.info("!!!! DEBUG CHECK !!!! Вход в ветку IF (обработка файла сессии)")
+            # Указатель уже в начале, seek не нужен
+            # await session_file.seek(0) 
+            
+            # Путь к файлу сессии
+            session_path = f"{user_sessions_dir}/{phone}"
+            full_session_path = f"{session_path}.session"
+            
+            # Сохраняем файл сессии (читаем с текущей позиции - начала)
+            session_content = await session_file.read()
+            with open(full_session_path, "wb") as f:
+                f.write(session_content)
+            
+            logger.info(f"Файл сессии сохранен: {full_session_path}")
+            
+            # Создаем новый аккаунт
+            account_data = {
+                "id": account_id,
+                "api_id": api_id_int, # Используем проверенный int
+                "api_hash": api_hash,
+                "phone": phone,
+                "proxy": proxy,
+                "session_file": session_path,
+                "status": "pending"  # Изначально устанавливаем статус pending
+            }
+            
+            try:
+                # Создаем клиент Telegram и проверяем авторизацию
+                from client_pools import create_telegram_client
+                client = await create_telegram_client(session_path, api_id_int, api_hash, proxy)
+                
+                logger.info("Устанавливаем соединение с Telegram для проверки сессии")
+                await client.connect()
+                
+                # Проверяем, авторизован ли клиент
+                is_authorized = await client.is_user_authorized()
+                logger.info(f"Сессия {'авторизована' if is_authorized else 'не авторизована'}")
+                
+                if is_authorized:
+                    account_data["status"] = "active"
+                    
+                    # Получаем информацию о пользователе, чтобы убедиться, что сессия действительно работает
+                    me = await client.get_me()
+                    logger.info(f"Успешно получена информация о пользователе: {getattr(me, 'id', getattr(me, 'user_id', str(me)))}")
+                
+                # Исправляем ошибку: client.disconnect() может не быть корутиной
+                if asyncio.iscoroutinefunction(client.disconnect):
+                    await client.disconnect()
+                else:
+                    client.disconnect()
+                
+                # Добавляем аккаунт в базу данных
+                await admin_add_telegram_account(user_id, account_data)
+                
+                return {
+                    "account_id": account_id,
+                    "is_authorized": is_authorized,
+                    "status": account_data["status"],
+                    "message": "Файл сессии загружен и аккаунт добавлен"
+                }
+            except Exception as e:
+                logger.error(f"Ошибка при проверке файла сессии: {str(e)}")
+                
+                # Удаляем файл сессии, если произошла ошибка
+                if os.path.exists(full_session_path):
+                    os.remove(full_session_path)
+                    logger.info(f"Удален файл сессии после ошибки: {full_session_path}")
+                
+                raise HTTPException(400, f"Ошибка при проверке файла сессии: {str(e)}")
+        else:
+            # Если файл пустой, логируем и переходим к созданию новой сессии (поток выполнения выйдет из этого if и попадет в else ниже)
+            logger.info("Файл сессии предоставлен, но он пустой. Будет создана новая сессия.")
+
+    # <<< NEW SESSION BRANCH >>>
+    # Этот блок выполнится, если session_file не UploadFile ИЛИ если он UploadFile, но пустой
+    if not isinstance(session_file, UploadFile) or is_file_empty:
+        logger.info("!!!! DEBUG CHECK !!!! Вход в ветку ELSE/НОВАЯ СЕССИЯ (файл не UploadFile или пустой)")
+        # Если файл сессии не предоставлен или пуст, создаем стандартное имя сессии (Telethon добавит .session)
+        session_name = f"{user_sessions_dir}/{phone}"
+        logger.info(f"Назначено имя сессии: {session_name}")
         
-        # Путь к файлу сессии
-        session_path = f"{user_sessions_dir}/{phone}"
-        full_session_path = f"{session_path}.session"
-        
-        # Сохраняем файл сессии
-        session_content = await session_file.read()
-        with open(full_session_path, "wb") as f:
-            f.write(session_content)
-        
-        logger.info(f"Файл сессии сохранен: {full_session_path}")
-        
-        # Создаем новый аккаунт
+        # Создаем аккаунт
         account_data = {
             "id": account_id,
             "api_id": api_id_int, # Используем проверенный int
             "api_hash": api_hash,
             "phone": phone,
             "proxy": proxy,
-            "session_file": session_path,
-            "status": "pending"  # Изначально устанавливаем статус pending
-        }
-        
-        try:
-            # Создаем клиент Telegram и проверяем авторизацию
-            from telegram_utils import create_telegram_client
-            client = await create_telegram_client(session_path, api_id_int, api_hash, proxy)
-            
-            logger.info("Устанавливаем соединение с Telegram для проверки сессии")
-            await client.connect()
-            
-            # Проверяем, авторизован ли клиент
-            is_authorized = await client.is_user_authorized()
-            logger.info(f"Сессия {'авторизована' if is_authorized else 'не авторизована'}")
-            
-            if is_authorized:
-                account_data["status"] = "active"
-                
-                # Получаем информацию о пользователе, чтобы убедиться, что сессия действительно работает
-                me = await client.get_me()
-                logger.info(f"Успешно получена информация о пользователе: {getattr(me, 'id', getattr(me, 'user_id', str(me)))}")
-            
-            # Исправляем ошибку: client.disconnect() может не быть корутиной
-            if asyncio.iscoroutinefunction(client.disconnect):
-                await client.disconnect()
-            else:
-                client.disconnect()
-            
-            # Добавляем аккаунт в базу данных
-            await admin_add_telegram_account(user_id, account_data)
-            
-            return {
-                "account_id": account_id,
-                "is_authorized": is_authorized,
-                "status": account_data["status"],
-                "message": "Файл сессии загружен и аккаунт добавлен"
-            }
-        except Exception as e:
-            logger.error(f"Ошибка при проверке файла сессии: {str(e)}")
-            
-            # Удаляем файл сессии, если произошла ошибка
-            if os.path.exists(full_session_path):
-                os.remove(full_session_path)
-                logger.info(f"Удален файл сессии после ошибки: {full_session_path}")
-            
-            raise HTTPException(400, f"Ошибка при проверке файла сессии: {str(e)}")
-    
-    # Если файл сессии не предоставлен, создаем стандартное имя сессии (Telethon добавит .session)
-    session_name = f"{user_sessions_dir}/{phone}"
-    logger.info(f"Назначено имя сессии: {session_name}")
-    
-    # Создаем аккаунт
-    account_data = {
-        "id": account_id,
-        "api_id": api_id_int, # Используем проверенный int
-        "api_hash": api_hash,
-        "phone": phone,
-        "proxy": proxy,
-        "session_file": session_name,
-        "status": "pending"
-    }
-    
-    # Создаем Telegram клиент и отправляем код
-    logger.info(f"Создаем Telegram клиент с сессией {session_name}")
-    from telegram_utils import create_telegram_client, start_client
-    
-    try:
-        # Явное преобразование api_hash в строку (на случай, если неявно придет другой тип)
-        api_hash_str = str(api_hash) if api_hash is not None else ""
-        # Используем проверенный api_id_int
-        client = await create_telegram_client(session_name, api_id_int, api_hash_str, proxy if isinstance(proxy, str) or proxy is None else None)
-        
-        # Подключаемся к Telegram
-        await start_client(client)
-        
-        # Проверяем, авторизован ли аккаунт
-        is_authorized = await client.is_user_authorized()
-        if is_authorized:
-            logger.info(f"Клиент уже авторизован")
-            account_data["status"] = "active"
-            
-            # Добавляем аккаунт в базу данных
-            await admin_add_telegram_account(user_id, account_data)
-            
-            # Проверяем, является ли метод disconnect корутиной
-            if asyncio.iscoroutinefunction(client.disconnect):
-                await client.disconnect()
-            else:
-                client.disconnect()
-                
-            return {
-                "account_id": account_id,
-                "is_authorized": True,
-                "status": "active"
-            }
-        
-        # Если не авторизован, отправляем код
-        from telethon.errors import SessionPasswordNeededError, FloodWaitError
-        
-        # Отправляем код на номер телефона
-        logger.info(f"Отправляем код на номер {phone}")
-        try:
-            # Явно преобразуем phone в строку, чтобы избежать проблем с типами
-            phone_str = str(phone) if phone is not None else ""
-            result = await client.send_code_request(phone_str)
-            phone_code_hash = result.phone_code_hash
-            
-            # Добавляем hash в данные аккаунта
-            account_data["phone_code_hash"] = phone_code_hash
-        except FloodWaitError as e:
-            logger.error(f"FloodWaitError при отправке кода: {e}")
-            # Проверяем, является ли метод disconnect корутиной
-            if asyncio.iscoroutinefunction(client.disconnect):
-                await client.disconnect()
-            else:
-                client.disconnect()
-            raise HTTPException(400, f"Telegram требует подождать {e.seconds} секунд перед повторной попыткой")
-        
-        # Добавляем аккаунт в базу данных
-        await admin_add_telegram_account(user_id, account_data)
-        
-        # Проверяем, является ли метод disconnect корутиной
-        if asyncio.iscoroutinefunction(client.disconnect):
-            await client.disconnect()
-        else:
-            client.disconnect()
-            
-        return {
-            "account_id": account_id,
-            "requires_auth": True,
+            "session_file": session_name,
             "status": "pending"
         }
-    except Exception as e:
-        logger.error(f"Ошибка при создании клиента Telegram: {str(e)}")
-        raise HTTPException(400, f"Ошибка при создании клиента Telegram: {str(e)}")
+    
+        # Создаем Telegram клиент и отправляем код
+        logger.info(f"Создаем Telegram клиент с сессией {session_name}")
+        from client_pools import create_telegram_client
+        
+        try:
+            # Явное преобразование api_hash в строку (на случай, если неявно придет другой тип)
+            api_hash_str = str(api_hash) if api_hash is not None else ""
+            # Используем проверенный api_id_int
+            client = await create_telegram_client(session_name, api_id_int, api_hash_str, proxy if isinstance(proxy, str) or proxy is None else None)
+            
+            # Подключаемся к Telegram
+            await client.connect()
+            logger.info(f"[New Session] Клиент для сессии {session_name} подключен.")
+            
+            # Проверяем, авторизован ли аккаунт
+            is_authorized = await client.is_user_authorized()
+            # Log for new session scenario
+            logger.info(f"[New Session] Проверка авторизации после connect(): {is_authorized}") 
+            if is_authorized:
+                logger.info(f"[New Session] Клиент уже авторизован (возможно, сессия уже существовала)")
+                account_data["status"] = "active"
+                
+                # Добавляем аккаунт в базу данных
+                await admin_add_telegram_account(user_id, account_data)
+                
+                # Проверяем, является ли метод disconnect корутиной
+                if asyncio.iscoroutinefunction(client.disconnect):
+                    await client.disconnect()
+                else:
+                    client.disconnect()
+                
+                return {
+                    "account_id": account_id,
+                    "is_authorized": True,
+                    "status": "active"
+                }
+            
+            # Если не авторизован, отправляем код
+            from telethon.errors import SessionPasswordNeededError, FloodWaitError
+            
+            # Отправляем код на номер телефона
+            logger.info(f"[New Session] Отправляем код на номер {phone}, так как is_user_authorized() = False")
+            try:
+                # Явно преобразуем phone в строку, чтобы избежать проблем с типами
+                phone_str = str(phone) if phone is not None else ""
+                result = await client.send_code_request(phone_str)
+                phone_code_hash = result.phone_code_hash
+                
+                # Добавляем hash в данные аккаунта
+                account_data["phone_code_hash"] = phone_code_hash
+            except FloodWaitError as e:
+                logger.error(f"FloodWaitError при отправке кода: {e}")
+                # Проверяем, является ли метод disconnect корутиной
+                if asyncio.iscoroutinefunction(client.disconnect):
+                    await client.disconnect()
+                else:
+                    client.disconnect()
+                raise HTTPException(400, f"Telegram требует подождать {e.seconds} секунд перед повторной попыткой")
+            
+            # Добавляем аккаунт в базу данных
+            await admin_add_telegram_account(user_id, account_data)
+            
+            # Проверяем, является ли метод disconnect корутиной
+            if asyncio.iscoroutinefunction(client.disconnect):
+                await client.disconnect()
+            else:
+                client.disconnect()
+                
+            return {
+                "account_id": account_id,
+                "requires_auth": True,
+                "status": "pending"
+            }
+        except Exception as e:
+            logger.error(f"Ошибка при создании клиента Telegram: {str(e)}")
+            raise HTTPException(400, f"Ошибка при создании клиента Telegram: {str(e)}")
 
 @app.post("/api/telegram/verify-code")
 async def verify_telegram_code(request: Request):
@@ -1431,7 +1704,7 @@ async def verify_telegram_code(request: Request):
     client = None
     try:
         logger.info(f"Создание клиента для верификации кода, сессия: {session_file}")
-        client = await telegram_utils.create_telegram_client(str(session_file), api_id, str(api_hash), proxy)
+        client = await client_pools.create_telegram_client(str(session_file), api_id, str(api_hash), proxy)
 
         logger.info(f"Подключение клиента для верификации кода аккаунта {account_id}")
         await client.connect()
@@ -1611,7 +1884,7 @@ async def verify_telegram_2fa(request: Request):
                 session_file = account_record['session_file']
                 
                 # Создаем клиент Telethon (прокси уже передается сюда)
-                client = await telegram_utils.create_telegram_client(session_file, api_id, api_hash, proxy)
+                client = await client_pools.create_telegram_client(session_file, api_id, api_hash, proxy)
                 
                 # Избыточный вызов set_proxy убран
                 # if proxy:
@@ -1752,7 +2025,7 @@ async def update_telegram_account(account_id: str, request: Request):
         new_proxy = data.get('proxy')  # Может быть None или пустой строкой
         # Валидация прокси, если нужно
         if new_proxy:
-            from telegram_utils import validate_proxy
+            from client_pools import validate_proxy
             is_valid, _ = validate_proxy(new_proxy)
             if not is_valid:
                 raise HTTPException(status_code=400, detail="Неверный формат прокси")
@@ -2087,7 +2360,7 @@ async def check_telegram_account_status(request: Request, account_id: str):
 
                 # 4. Проверяем статус через Telethon
                 logger.info(f"Создание клиента Telethon для проверки статуса аккаунта {account_id}")
-                from telegram_utils import create_telegram_client  # Импорт внутри для ясности
+                from client_pools import create_telegram_client  # Импорт внутри для ясности
                 client = await create_telegram_client(session_file, api_id_int, api_hash, proxy)
 
         await client.connect()
@@ -2216,7 +2489,7 @@ async def resend_telegram_code(request: Request, account_id: str):
                     raise HTTPException(400, "Неверный формат api_id")
                 
                 # Создаем клиент Telegram
-                from telegram_utils import create_telegram_client
+                from client_pools import create_telegram_client
                 logger.info(f"Создание клиента Telegram, сессия: {account_id}")
                 # Используем временную сессию для операции отправки кода
                 client = await create_telegram_client(f"resend_{account_id}", api_id, api_hash, proxy)
@@ -2777,16 +3050,29 @@ async def toggle_account_status(request: Request, data: dict):
                 logger.warning(f"Не удалось обновить статус клиента VK в пуле: {e}")
         elif platform.lower() == 'telegram':
             # Для Telegram также обновим статус в пуле
-            for user_key, clients in telegram_pool.clients.items():
-                for i, client in enumerate(clients):
-                    if str(client.id) == str(account_id):
-                        client.is_active = active
-                        # Если деактивировали, возможно нужно отключить клиент
-                        if not active and account_id in telegram_pool.connected_clients:
-                            if hasattr(telegram_pool, 'disconnect_client'):
-                                asyncio.create_task(telegram_pool.disconnect_client(account_id))
-                        break
-        
+            try:
+                # Получаем клиент напрямую по ID
+                client = telegram_pool.get_client(account_id) 
+                
+                if client:
+                    # logger.info(f"Найден клиент {account_id} в пуле. Статус в БД обновлен.")
+                    # TODO: Добавить вызов метода пула для обновления его внутреннего статуса активности, если нужно
+                    # if hasattr(telegram_pool, 'update_client_status'):
+                    #    await telegram_pool.update_client_status(account_id, is_active=active)
+                    
+                    # Отключение клиента при деактивации
+                    if not active and hasattr(telegram_pool, 'disconnect_client'):
+                        # Проверяем, подключен ли клиент перед отключением
+                        if client.is_connected():
+                            logger.info(f"Клиент {account_id} деактивирован, запускаем отключение.")
+                            # Запускаем отключение в фоне, чтобы не блокировать ответ
+                            asyncio.create_task(telegram_pool.disconnect_client(account_id)) 
+                else:
+                     logger.warning(f"Клиент Telegram с ID {account_id} не найден в пуле во время toggle_status.")
+
+            except Exception as e:
+                 logger.error(f"Ошибка при обработке клиента Telegram в пуле (ID: {account_id}): {e}", exc_info=True)
+         
         return {"success": True, "message": f"Статус аккаунта {account_id} изменен на {'активен' if active else 'неактивен'}"}
     
     except HTTPException as http_exc:
@@ -3035,10 +3321,21 @@ async def api_trending_posts_extended(request: Request, data: dict):
             
             # Получаем клиент
             client = await auth_middleware(request, 'telegram')
-            
+
+            # Получаем ID аккаунта из словаря account
+            account_id_str = account.get("id")
+
+            # Проверяем, что клиент и ID получены
+            if not client or not account_id_str:
+                logger.warning(f"Пропуск аккаунта {account_id_str or '(ID not found)'} из-за отсутствия клиента или ID")
+                raise HTTPException(status_code=400, detail="Нет доступного клиента или ID аккаунта")
+
+            # Лог перед вызовом
+            logger.info(f"Вызов get_trending_posts для аккаунта {account_id_str}")
             # Получаем трендовые посты с расширенными параметрами
             posts = await get_trending_posts(
                 client, 
+                account_id_str, # Добавляем account_id как второй аргумент
                 channel_ids, 
                 days_back=days_back, 
                 posts_per_channel=posts_per_channel,
@@ -3047,7 +3344,6 @@ async def api_trending_posts_extended(request: Request, data: dict):
                 min_comments=min_comments,
                 min_forwards=min_forwards,
                 api_key=api_key,
-                non_blocking=True  # Устанавливаем non_blocking=True для более быстрого ответа
             )
             
             # Обновляем статистику использования аккаунта
@@ -3379,7 +3675,7 @@ async def check_proxy(request: Request):
                     return {"valid": False, "message": "Прокси не указан для этого аккаунта"}
                 
                 # Валидируем прокси
-                from telegram_utils import validate_proxy
+                from client_pools import validate_proxy
                 is_valid, proxy_type = validate_proxy(proxy)
                 
                 if not is_valid:
@@ -3387,7 +3683,7 @@ async def check_proxy(request: Request):
                 
                 # Попытка подключения с прокси
                 try:
-                    from telegram_utils import create_telegram_client
+                    from client_pools import create_telegram_client
                     client = await create_telegram_client(
                         session_path=f"check_proxy_{account_dict['id']}",
                         api_id=int(account_dict['api_id']),
@@ -3489,7 +3785,7 @@ async def update_proxy(request: Request):
                         
                         return {"success": True, "message": "Прокси успешно удален"}
                     
-                    from telegram_utils import validate_proxy
+                    from client_pools import validate_proxy
                     is_valid, _ = validate_proxy(proxy)
                     
                     if not is_valid:
@@ -3955,7 +4251,7 @@ async def check_proxy_endpoint(request: Request):
         raise HTTPException(400, "Указана неверная платформа")
     
     if platform == "telegram":
-        from telegram_utils import validate_proxy
+        from client_pools import validate_proxy
         is_valid, proxy_type = validate_proxy(proxy)
         
         if not is_valid:
@@ -4031,7 +4327,7 @@ async def check_proxy_endpoint_v2(request: Request):
     
     if platform == "telegram":
         # Проверяем прокси для Telegram
-        from telegram_utils import validate_proxy, validate_proxy_connection
+        from client_pools import validate_proxy, validate_proxy_connection
         
         # Сначала проверяем формат прокси
         is_valid, proxy_type = validate_proxy(proxy)
@@ -4193,7 +4489,7 @@ async def auth_telegram_code(request: Request, account_id: str):
                 
                 # Создаем клиент Telegram
                 logger.info(f"Создание клиента Telegram с сессией {session_file}")
-                client = await telegram_utils.create_telegram_client(session_file, api_id, api_hash, proxy)
+                client = await client_pools.create_telegram_client(session_file, api_id, api_hash, proxy)
                 
                 # Подключаемся к серверам Telegram
                 logger.info(f"Подключение клиента к серверам Telegram")
@@ -4346,7 +4642,7 @@ async def auth_telegram_code(request: Request, account_id: str):
 async def request_telegram_auth_code(request: Request, account_id: str):
     """Запрашивает новый код авторизации для существующего аккаунта Telegram."""
     from user_manager import get_db_pool
-    from telegram_utils import create_telegram_client
+    from client_pools import create_telegram_client
     from telethon import errors
     
     logger.info(f"Запрос кода авторизации для аккаунта {account_id}")

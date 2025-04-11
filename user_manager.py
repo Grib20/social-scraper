@@ -9,17 +9,17 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 # Сторонние библиотеки (требуют установки)
-from cryptography.fernet import Fernet  # pip install cryptography
-from dotenv import load_dotenv          # pip install python-dotenv
-import asyncpg # Добавляем asyncpg
+from cryptography.fernet import Fernet 
+from dotenv import load_dotenv 
+import asyncpg 
 
 load_dotenv()
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+# )
 logger = logging.getLogger(__name__)
 
 # Константы
@@ -27,6 +27,7 @@ MAX_REQUESTS_PER_ACCOUNT = 1000
 MAX_ACTIVE_ACCOUNTS = 5
 # Возвращаем чтение DATABASE_URL
 DATABASE_URL = os.getenv('DATABASE_URL')
+print(f"Loaded DATABASE_URL: '{DATABASE_URL}'")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL не установлен в переменных окружения.")
 
@@ -117,7 +118,7 @@ async def init_db(conn: asyncpg.Connection):
     CREATE TABLE IF NOT EXISTS telegram_accounts (
         id VARCHAR(36) PRIMARY KEY, 
         user_api_key VARCHAR(36) REFERENCES users(api_key) ON DELETE CASCADE, 
-        api_id TEXT, 
+        api_id INTEGER, 
         api_hash TEXT,
         phone TEXT, 
         proxy TEXT, 

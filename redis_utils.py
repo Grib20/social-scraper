@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import redis.asyncio as aredis
 import asyncio
 import asyncpg # Добавляем для обработки ошибок
+from typing import Optional, Union, Dict, Any, List # Add Optional here if not present, or modify existing import
 
 # Импортируем нужные async функции из user_manager
 # get_db_connection теперь возвращает пул
@@ -17,7 +18,7 @@ from user_manager import get_db_connection # get_active_accounts # get_active_ac
 load_dotenv()
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # <-- УДАЛЕНО
 logger = logging.getLogger(__name__)
 
 # Получаем параметры подключения из .env
@@ -115,42 +116,45 @@ async def get_redis():
         # TODO: Рассмотреть возможность возврата aredis_client и обработки ошибки выше
         return None
 
-async def update_account_usage_redis(api_key, account_id, platform):
-    """Обновляет статистику использования аккаунта в Redis."""
+async def update_account_usage_redis(api_key, account_id, platform) -> Optional[int]:
+    """Обновляет статистику использования аккаунта в Redis и ВОЗВРАЩАЕТ новый счетчик."""
     redis_client = await get_redis()
     if not redis_client:
         logger.warning(f"Redis недоступен, пропускаем обновление статистики для {platform}:{account_id}")
-        return False
+        return None # Возвращаем None при ошибке Redis
 
     try:
         count_key = f"account:{platform}:{account_id}:requests_count"
         last_used_key = f"account:{platform}:{account_id}:last_used"
         current_time = datetime.now().isoformat()
         
-        # Используем async pipeline
-        async with redis_client.pipeline(transaction=True) as pipe:
-            # Команды пайплайна не требуют await
-            pipe.incr(count_key)
+        # Увеличиваем счетчик и получаем новое значение за одну операцию INCR
+        new_count = await redis_client.incr(count_key)
+        
+        # Обновляем время последнего использования и устанавливаем TTL
+        async with redis_client.pipeline(transaction=False) as pipe: # Можно без транзакции
             pipe.set(last_used_key, current_time)
-            pipe.expire(count_key, 60*60*24*30)
-            pipe.expire(last_used_key, 60*60*24*30)
-            # Выполняем транзакцию с помощью await
-            results = await pipe.execute() 
-            logger.debug(f"Результат выполнения Redis pipeline для {platform}:{account_id}: {results}")
+            # Обновляем TTL для обоих ключей при каждом запросе
+            pipe.expire(count_key, 60*60*24*30) # 30 дней TTL для счетчика
+            pipe.expire(last_used_key, 60*60*24*30) # 30 дней TTL для времени
+            await pipe.execute()
 
+        logger.debug(f"Статистика Redis обновлена для {platform}:{account_id}. Новый счетчик: {new_count}")
+
+        # Синхронизация с БД остается без изменений (происходит с некоторой вероятностью)
         if random.random() < 0.1:
             await sync_account_stats_to_db(account_id, platform)
         
-        return True
+        return new_count # Возвращаем новое значение счетчика
+        
     except aredis.RedisError as e:
         logger.error(f"Ошибка Redis при обновлении статистики ({platform}:{account_id}): {e}")
-        return False
+        return None # Возвращаем None при ошибке Redis
     except Exception as e:
         logger.error(f"Неожиданная ошибка обновления статистики в Redis ({platform}:{account_id}): {e}")
-        # Логируем traceback для полной диагностики
         import traceback
         logger.error(traceback.format_exc())
-        return False
+        return None # Возвращаем None при других ошибках
 
 async def sync_account_stats_to_db(account_id, platform, force=False):
     """Асинхронно синхронизирует статистику из Redis в БД (PostgreSQL)."""

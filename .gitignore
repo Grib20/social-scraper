@@ -76,4 +76,7 @@ sql.py
 # Чувствительные данные
 credentials.json
 token.pickle
-config.local.json 
+config.local.json
+
+# S3 File Cache
+s3_file_cache.pkl 

@@ -8,7 +8,6 @@ import os
 import aiohttp
 from typing import List, Dict, Optional, Union, Any, Tuple
 from datetime import datetime, timedelta
-from media_utils import get_media_info as telegram_get_media_info
 from user_manager import get_active_accounts, update_account_usage
 import math
 import redis
@@ -1165,8 +1164,8 @@ async def find_vk_groups_parallel(vk, keywords, min_members=10000, max_count=20,
                         # Создаем отдельный клиент для каждого аккаунта
                         acc_client = VKClient(acc_token, None, acc_id)
                         
-                        # Создаем задачу для поиска групп
-                        task = find_vk_groups(acc_client, kw_list, min_members, max_count)
+                        # Создаем задачу для поиска групп с помощью asyncio.create_task
+                        task = asyncio.create_task(find_vk_groups(acc_client, kw_list, min_members, max_count))
                         tasks.append(task)
                         logger.info(f"Создана задача для VK аккаунта {acc_id} с ключевыми словами: {kw_list}")
                 

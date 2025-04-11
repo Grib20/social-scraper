@@ -477,7 +477,8 @@ function createAccountItem(platform, accountId, userId, displayName, status, isA
     toggleButton.title = isActive ? 'Выключить' : 'Включить';
     toggleButton.onclick = (event) => {
         event.stopPropagation(); // Предотвращаем всплытие события
-        toggleAccountStatus(platform, accountId, !isActive);
+        // Вызываем toggleAccountStatus БЕЗ третьего аргумента
+        toggleAccountStatus(platform, accountId);
     };
     accountActions.appendChild(toggleButton);
 
@@ -2484,16 +2485,11 @@ function handleAddTelegramSubmit(event) {
         fetch('/api/telegram/accounts', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${adminKey}`
+                // НЕ указываем Content-Type, браузер сделает это сам для FormData
+                'Authorization': `Bearer ${adminKey}`,
+                'X-User-Id': userId // Заголовок с ID пользователя
             },
-            body: JSON.stringify({
-                user_id: userId,
-                phone: phone,
-                api_id: apiId,
-                api_hash: apiHash,
-                proxy: proxy
-            })
+            body: formData // Отправляем объект FormData напрямую
         })
         .then(response => {
             // Восстанавливаем кнопку независимо от результата
@@ -2824,6 +2820,93 @@ async function deleteUser(userId) {
         console.error('Ошибка при удалении пользователя:', error);
         showNotification(`Ошибка удаления: ${error.message}`, 'error');
     }
+}
+
+// ... existing code ...
+
+// --- НОВАЯ ФУНКЦИЯ: Переключение статуса аккаунта --- 
+async function toggleAccountStatus(platform, accountId) {
+    console.log(`Переключение статуса для ${platform}:${accountId}...`);
+
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        showNotification('Админ-ключ не найден. Авторизуйтесь снова.', 'error');
+        window.location.href = '/login';
+        return;
+    }
+
+    // Находим кнопку
+    const accountItem = document.querySelector(`.account-item[data-id="${accountId}"][data-platform="${platform}"]`);
+    const toggleButton = accountItem ? accountItem.querySelector('.toggle-btn') : null;
+    
+    if (!toggleButton) {
+        console.error(`Кнопка для ${platform}:${accountId} не найдена.`);
+        showNotification('Ошибка: кнопка переключения не найдена', 'error');
+        return;
+    }
+
+    // Определяем ТЕКУЩЕЕ состояние по классу кнопки
+    const currentIsActive = toggleButton.classList.contains('active');
+    // Вычисляем НОВОЕ желаемое состояние
+    const newActiveState = !currentIsActive;
+    console.log(`   Текущее состояние: ${currentIsActive}, Желаемое новое: ${newActiveState}`);
+
+    let originalButtonHtml = toggleButton.innerHTML;
+    toggleButton.disabled = true;
+    toggleButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+
+    try {
+        const response = await fetch('/api/admin/accounts/toggle_status', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${adminKey}`
+            },
+            body: JSON.stringify({
+                platform: platform,
+                account_id: accountId,
+                active: newActiveState // Отправляем новое состояние на бэкенд
+            })
+        });
+
+        // Восстанавливаем кнопку сразу после ответа, но перед проверкой ok
+        toggleButton.disabled = false;
+
+        if (!response.ok) {
+            let errorDetail = `Ошибка HTTP: ${response.status}`;
+            try {
+                const errorData = await response.json();
+                errorDetail = errorData.detail || errorDetail;
+            } catch (e) { /* ignore json parsing error */ }
+            throw new Error(errorDetail);
+        }
+
+        const result = await response.json();
+        showNotification(result.message || 'Статус аккаунта успешно изменен', 'success');
+
+        // Обновляем кнопку на основе newActiveState
+        toggleButton.innerHTML = newActiveState ? '<i class="fas fa-toggle-on"></i>' : '<i class="fas fa-toggle-off"></i>';
+        toggleButton.title = newActiveState ? 'Выключить' : 'Включить';
+        // Обновляем классы
+        toggleButton.classList.remove(currentIsActive ? 'active' : 'inactive');
+        toggleButton.classList.add(newActiveState ? 'active' : 'inactive');
+
+        // Обновляем UI для статус индикатора (рядом с именем)
+        if (accountItem) {
+            const statusIndicator = accountItem.querySelector('.status-indicator');
+            if (statusIndicator) {
+                statusIndicator.classList.remove(currentIsActive ? 'active' : 'inactive');
+                statusIndicator.classList.add(newActiveState ? 'active' : 'inactive');
+            }
+        }
+
+    } catch (error) {
+        console.error('Ошибка при переключении статуса аккаунта:', error);
+        showNotification(`Ошибка переключения статуса: ${error.message}`, 'error');
+        // Восстанавливаем кнопку в исходное состояние (currentIsActive) В СЛУЧАЕ ОШИБКИ
+        toggleButton.innerHTML = originalButtonHtml; // Используем сохраненный HTML
+        // Классы не менялись, так что восстанавливать их не нужно
+    } 
 }
 
 // ... existing code ...

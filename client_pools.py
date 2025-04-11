@@ -6,7 +6,18 @@ import inspect
 from typing import Dict, List, Optional, Set, Tuple, Any, Union
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
+import re
+import traceback
+from redis_utils import get_account_stats_redis
+from user_manager import get_active_accounts, update_account_usage
+
+# --- Добавляем константу задержки (если ее нет) ---
+# Нужно убедиться, что она не конфликтует с vk_utils
+# Можно вынести в общий файл настроек?
+TELEGRAM_DEGRADED_MODE_DELAY = 0.5 # Секунды
+# -----------------------------------------------
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +26,6 @@ class ClientPool:
     
     def __init__(self):
         self.clients = {}  # account_id -> client
-        self.usage_counts = {}  # account_id -> count
-        self.last_used = {}  # account_id -> timestamp
         self.client_auth_status = {}  # account_id -> bool
         self.platform = None  # Должен быть установлен в подклассах ('vk' или 'telegram')
         
@@ -43,8 +52,6 @@ class ClientPool:
             return
             
         self.clients[account_id] = client
-        self.usage_counts[account_id] = 0
-        self.last_used[account_id] = datetime.now()
         self.client_auth_status[account_id] = False
         logger.info(f"Добавлен {self.platform} клиент для аккаунта {account_id}")
 
@@ -67,34 +74,27 @@ class ClientPool:
 
         # Выбираем аккаунт в зависимости от стратегии
         if strategy == "round_robin":
-            # Простая ротация по кругу
-            sorted_accounts = sorted(
-                active_accounts, 
-                key=lambda acc: self.last_used.get(acc['id'], datetime.min)
-            )
+            # Временно оставляем сортировку по ID для round_robin, пока не будем получать last_used из Redis
+            sorted_accounts = sorted(active_accounts, key=lambda acc: acc['id'])
         elif strategy == "least_used":
-            # Выбираем наименее использованный аккаунт
-            sorted_accounts = sorted(
-                active_accounts, 
-                key=lambda acc: self.usage_counts.get(acc['id'], 0)
-            )
+            # Временно возвращаем ошибку, так как usage_counts удален
+            logger.error("Стратегия 'least_used' временно не поддерживается из-за удаления usage_counts из пула.")
+            # Можно временно переключиться на round_robin
+            sorted_accounts = sorted(active_accounts, key=lambda acc: acc['id'])
+            # raise NotImplementedError("Стратегия 'least_used' требует доработки для работы с Redis")
         elif strategy == "random":
-            # Случайный выбор аккаунта
+            # Случайный выбор
             import random
             random.shuffle(active_accounts)
             sorted_accounts = active_accounts
         else:
-            # По умолчанию используем round_robin
-            sorted_accounts = sorted(
-                active_accounts, 
-                key=lambda acc: self.last_used.get(acc['id'], datetime.min)
-            )
+            # По умолчанию round_robin
+            sorted_accounts = sorted(active_accounts, key=lambda acc: acc['id'])
 
         # Пробуем каждый аккаунт по очереди, пока не найдем работающий
         for account in sorted_accounts:
             account_id = account['id']
             
-            # Получаем существующий клиент или создаем новый
             client = self.get_client(account_id)
             if not client:
                 client = await self.create_client(account)
@@ -103,9 +103,7 @@ class ClientPool:
                     continue
                 self.add_client(account_id, client)
 
-            # Обновляем статистику использования
-            self.usage_counts[account_id] = self.usage_counts.get(account_id, 0) + 1
-            self.last_used[account_id] = datetime.now()
+            # TODO: Позже добавить проверку degraded_mode здесь
             
             logger.info(f"Выбран {self.platform} клиент для аккаунта {account_id}")
             return client, account_id
@@ -137,6 +135,8 @@ class VKClientPool(ClientPool):
         self.max_retries = 3
         self.retry_delay = 5  # секунды
         self.current_index = 0
+        self.usage_counts: Dict[str, int] = {}
+        self.last_used: Dict[str, datetime] = {}
     
     async def create_client(self, account):
         """Создает нового клиента VK."""
@@ -203,102 +203,130 @@ class VKClientPool(ClientPool):
     
     async def select_next_client(self, api_key: str, strategy: str = "round_robin") -> Tuple[Any, str]:
         """
-        Выбирает следующего клиента VK для использования.
-        
-        Args:
-            api_key: API ключ пользователя
-            strategy: Стратегия выбора клиента ("round_robin", "least_used", "random")
-            
-        Returns:
-            Tuple[Any, str]: (клиент VK, ID аккаунта) или (None, "")
+        Выбирает следующего клиента VK для использования, учитывая degraded_mode и статистику из Redis.
         """
-        # Получаем активные аккаунты
         active_accounts = await self.get_active_clients(api_key)
         if not active_accounts:
             logger.error(f"Нет активных аккаунтов VK для API ключа {api_key}")
-            return None, ""  # Возвращаем пустую строку вместо None для второго элемента кортежа
+            return None, ""
+        
+        # --- Получаем статистику из Redis для активных аккаунтов --- 
+        account_stats = {}
+        if active_accounts:
+            tasks = [get_account_stats_redis(acc['id'], self.platform) for acc in active_accounts]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                acc_id = active_accounts[i]['id']
+                if isinstance(result, Exception):
+                    logger.error(f"Ошибка получения статистики из Redis для аккаунта VK {acc_id}: {result}")
+                    account_stats[acc_id] = {'requests_count': 0, 'last_used': datetime.min.replace(tzinfo=timezone.utc)}
+                elif result:
+                    last_used_dt = datetime.min.replace(tzinfo=timezone.utc)
+                    requests_count = 0
+                    if isinstance(result, dict): 
+                        if result_last_used := result.get('last_used'): 
+                            try:
+                                # Используем сохраненное значение result_last_used
+                                dt_from_redis = datetime.fromisoformat(result_last_used) 
+                                if dt_from_redis.tzinfo is None:
+                                    last_used_dt = dt_from_redis.replace(tzinfo=timezone.utc)
+                                else:
+                                    last_used_dt = dt_from_redis.astimezone(timezone.utc)
+                            except (ValueError, TypeError):
+                                 # Используем сохраненное значение result_last_used и в логе
+                                 logger.warning(f"Не удалось преобразовать last_used '{result_last_used}' из Redis для VK {acc_id}")
+                        
+                        # Get requests_count safely within the type check
+                        requests_count = result.get('requests_count', 0)
+                    
+                    # Assign account_stats only if result was a dict
+                        account_stats[acc_id] = {
+                            'requests_count': requests_count, 
+                            'last_used': last_used_dt
+                        }
+                    else: 
+                        # Handle case where result is truthy but not a dict (shouldn't happen often with current checks)
+                         logger.warning(f"Получен не-словарный результат из Redis для VK {acc_id}, тип: {type(result)}. Используются значения по умолчанию.")
+                         account_stats[acc_id] = {'requests_count': 0, 'last_used': datetime.min.replace(tzinfo=timezone.utc)}
 
-        # Объявляем переменную selected_account перед условиями
-        selected_account = None
+                else: # Handle case where result is not True (e.g. None) or not a dict
+                     account_stats[acc_id] = {'requests_count': 0, 'last_used': datetime.min.replace(tzinfo=timezone.utc)}
+        # ---------------------------------------------------------
 
-        # Выбираем аккаунт в зависимости от стратегии
-        if strategy == "round_robin":
-            # Циклическая ротация
-            if self.current_index >= len(active_accounts):
-                self.current_index = 0
-            selected_account = active_accounts[self.current_index]
-            self.current_index += 1
-            
-        elif strategy == "least_used":
-            # Выбираем наименее использованный аккаунт
-            sorted_accounts = sorted(
-                active_accounts,
-                key=lambda acc: (
-                    self.usage_counts.get(acc['id'], 0),  # Сначала по количеству использований
-                    self.last_used.get(acc['id'], datetime.min)  # Потом по времени последнего использования
-                )
-            )
-            if sorted_accounts:
-                selected_account = sorted_accounts[0]
-            
-        elif strategy == "random":
-            # Случайный выбор
-            import random
-            selected_account = random.choice(active_accounts)
-            
+        # --- Переделываем логику выбора стратегии (с учетом Redis) --- 
+        # 1. Фильтруем аккаунты: сначала недеградированные, потом деградированные
+        non_degraded_accounts = []
+        degraded_accounts = []
+        for acc in active_accounts:
+            client = self.get_client(acc['id'])
+            # Проверяем degraded_mode у самого клиента VK
+            # Добавим проверку, что клиент вообще существует
+            if client and client.degraded_mode:
+                degraded_accounts.append(acc)
+            elif client:
+                # Добавляем только если клиент существует и не деградирован
+                non_degraded_accounts.append(acc)
+            # Если клиента нет (маловероятно, но возможно), игнорируем аккаунт
+        
+        # 2. Применяем стратегию к недеградированным аккаунтам
+        if non_degraded_accounts:
+            target_list = non_degraded_accounts
+            logger.debug(f"Выбор из {len(target_list)} недеградированных аккаунтов VK")
+        elif degraded_accounts:
+            target_list = degraded_accounts
+            logger.warning(f"Нет доступных недеградированных аккаунтов VK, выбираем из {len(target_list)} деградированных.")
         else:
-            logger.warning(f"Неизвестная стратегия: {strategy}, используем round_robin")
-            if self.current_index >= len(active_accounts):
+            logger.error("Непредвиденная ситуация: нет доступных клиентов VK (ни деградированных, ни недеградированных). Возможно, клиенты не создались.")
+            return None, ""
+        
+        # --- Применяем сортировку/выбор по стратегии к выбранному списку (с учетом Redis) --- 
+        selected_account = None
+        default_stats = {'requests_count': 0, 'last_used': datetime.min.replace(tzinfo=timezone.utc)}
+        if strategy == "round_robin":
+            # Сортируем по времени последнего использования (старые сначала)
+            target_list.sort(key=lambda acc: account_stats.get(acc['id'], default_stats)['last_used'])
+            if not target_list: return None, "" 
+            if self.current_index >= len(target_list):
                 self.current_index = 0
-            selected_account = active_accounts[self.current_index]
+            selected_account = target_list[self.current_index]
             self.current_index += 1
-
-        # Проверяем, был ли выбран аккаунт
-        if not selected_account:
-            logger.error(f"Не удалось выбрать аккаунт VK для API ключа {api_key} со стратегией {strategy}")
-            return None, ""
-
-        account_id = selected_account.get('id')
-        if not account_id:
-            logger.error(f"Выбранный аккаунт VK не имеет ID: {selected_account}")
-            return None, ""
-        
-        # Получаем или создаем клиента
-        client = self.get_client(account_id)
-        if not client:
-            client = await self.create_client(selected_account)
-            if not client:
-                logger.error(f"Не удалось создать клиент VK для аккаунта {account_id}")
-                # Возможно, стоит попробовать следующий аккаунт? Пока возвращаем None.
-                return None, ""  # Исправлено: возвращаем (None, "") вместо (None, None)
-            self.add_client(account_id, client)
-
-        # Обновляем статистику использования
-        self.usage_counts[account_id] = self.usage_counts.get(account_id, 0) + 1
-        self.last_used[account_id] = datetime.now()
-        
-        # Обновляем статистику в Redis
-        try:
-            from redis_utils import update_account_usage_redis
+        elif strategy == "least_used":
+            # Сортируем по количеству запросов (меньше сначала), затем по времени (старые сначала)
+            target_list.sort(key=lambda acc: (
+                 account_stats.get(acc['id'], default_stats)['requests_count'], 
+                 account_stats.get(acc['id'], default_stats)['last_used']
+                 ))
+            if target_list:
+                selected_account = target_list[0] # Выбираем первый после сортировки
+        elif strategy == "random":
+            import random
+            if target_list:
+                 selected_account = random.choice(target_list)
+        else: # По умолчанию round_robin
+            target_list.sort(key=lambda acc: account_stats.get(acc['id'], default_stats)['last_used'])
+            if not target_list: return None, "" 
+            if self.current_index >= len(target_list):
+                self.current_index = 0
+            selected_account = target_list[self.current_index]
+            self.current_index += 1
             
-            # --- Непосредственно вызываем и ожидаем асинхронную функцию ---
-            logger.info(f"Попытка выполнить await update_account_usage_redis (acc: {account_id})...")
-            # Напрямую ожидаем результат вызова асинхронной функции
-            update_success = await update_account_usage_redis(api_key, account_id, "vk")
-            if update_success:
-                logger.info(f"Успешно обновлена статистика Redis для аккаунта {account_id}.")
-            else:
-                logger.warning(f"Не удалось обновить статистику Redis для аккаунта {account_id} (функция вернула False).")
+        if not selected_account:
+            logger.error(f"Не удалось выбрать аккаунт VK по стратегии '{strategy}'")
+            return None, ""
+        # ---------------------------------------------------------------------
 
-        except ImportError:
-             logger.error("Не удалось импортировать update_account_usage_redis из redis_utils.")
-        except Exception as e:
-             # Ловим любые исключения во время вызова await
-             logger.error(f"Ошибка при вызове await update_account_usage_redis (acc: {account_id}): {e}")
-             import traceback
-             logger.error(traceback.format_exc())
+        # Получаем ID и клиента для выбранного аккаунта
+        account_id = selected_account['id']
+        client = self.get_client(account_id)
 
-        logger.info(f"Выбран VK клиент для аккаунта {account_id} (использований: {self.usage_counts[account_id]})")
+        # Клиент должен существовать, так как мы фильтровали по нему
+        if not client:
+             logger.error(f"КРИТИЧЕСКАЯ ОШИБКА: Не найден клиент для выбранного активного аккаунта VK {account_id} ПОСЛЕ ФИЛЬТРАЦИИ!")
+             # Это не должно происходить. Если произошло, что-то не так с логикой.
+             return None, "" 
+
+        # Задержка для degraded_mode уже встроена в _make_request клиента VK
+        logger.info(f"Выбран {self.platform} клиент для аккаунта {account_id} (Деградация: {client.degraded_mode})")
         return client, account_id
         
     
@@ -388,20 +416,148 @@ class VKClientPool(ClientPool):
             return {}
 
 
+# --- Перемещенные хелперы для прокси ---
+def validate_proxy(proxy: Optional[str]) -> Tuple[bool, str]:
+    """
+    Валидирует строку прокси и возвращает статус валидации и тип прокси.
+    """
+    if not proxy:
+        return False, "none"
+    
+    # Определяем тип прокси по схеме
+    if proxy.startswith('socks5://'):
+        proxy_type = 'socks5'
+    elif proxy.startswith('socks4://'):
+        proxy_type = 'socks4'
+    elif proxy.startswith('http://'):
+        proxy_type = 'http'
+    elif proxy.startswith('https://'):
+        proxy_type = 'https'
+    else:
+        # Если схема не указана, по умолчанию считаем http
+        proxy_type = 'http'
+        proxy = f'http://{proxy}'
+    
+    # Проверяем формат proxy:port или proxy:port@login:password
+    proxy_pattern = r'^(https?://|socks[45]://)(([^:@]+)(:[^@]+)?@)?([^:@]+)(:(\d+))$'
+    return bool(re.match(proxy_pattern, proxy)), proxy_type
+
+def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
+    """
+    Подготавливает строку прокси для логирования (скрывая чувствительные данные).
+    """
+    if not proxy:
+        return "None"
+    
+    try:
+        # Нормализуем прокси URL
+        proxy_url = proxy
+        if '://' not in proxy_url:
+            proxy_url = 'http://' + proxy_url
+        
+        # Если в прокси есть логин/пароль, то скрываем их
+        if '@' in proxy_url:
+            scheme_auth, host_part = proxy_url.split('@', 1)
+            
+            if '://' in scheme_auth:
+                scheme, auth = scheme_auth.split('://', 1)
+                scheme = scheme + '://'
+            else:
+                scheme = 'http://'
+                auth = scheme_auth
+                
+            # Возвращаем только схему и хост:порт, скрывая данные авторизации
+            return f"{scheme}***@{host_part}"
+            
+        return proxy_url
+    except Exception:
+        # В случае ошибки возвращаем исходную строку
+        return proxy
+# --- Конец перемещенных хелперов ---
+
+# --- Функция create_telegram_client ---
+async def create_telegram_client(session_path: str, api_id: int, api_hash: str, proxy: Optional[str] = None) -> TelegramClient:
+    """Создает клиент Telegram с указанными параметрами."""
+    try:
+        # Настройка прокси
+        proxy_config = None
+        if proxy:
+            logger.info(f"Настройка прокси для клиента {session_path}: {sanitize_proxy_for_logs(proxy)}")
+            # Нормализуем формат прокси
+            if '://' not in proxy:
+                proxy = 'socks5://' + proxy
+                
+            # Проверка формата прокси
+            is_valid, proxy_type = validate_proxy(proxy)
+            if not is_valid:
+                logger.error(f"Неверный формат прокси: {sanitize_proxy_for_logs(proxy)}")
+                raise ValueError(f"Неверный формат прокси: {sanitize_proxy_for_logs(proxy)}")
+            
+            # Простое определение типа прокси для Telethon
+            proxy_parsed = urlparse(proxy)
+            
+            # Определим тип прокси на основе URL
+            proxy_type_str = 'socks5'
+            if proxy.startswith('http://') or proxy.startswith('https://'):
+                proxy_type_str = 'http'
+            elif proxy.startswith('socks4://'):
+                proxy_type_str = 'socks4'
+            
+            # Создаем конфиг прокси
+            proxy_config = {
+                'proxy_type': proxy_type_str,
+                'addr': proxy_parsed.hostname or '',
+                'port': proxy_parsed.port or 1080
+            }
+            
+            # Добавляем учетные данные, если они есть
+            if proxy_parsed.username and proxy_parsed.password:
+                proxy_config['username'] = proxy_parsed.username
+                proxy_config['password'] = proxy_parsed.password
+        
+        # Создаем клиент с запретом интерактивного ввода
+        logger.info(f"Создание клиента Telegram с сессией {session_path}")
+        client = TelegramClient(
+            session_path,
+            api_id,
+            api_hash,
+            proxy=proxy_config if proxy_config else {},
+            device_model="Social Scraper",
+            system_version="1.0",
+            app_version="1.0",
+            lang_code="ru",
+            system_lang_code="ru",
+            connection_retries=3,  # Запрещаем бесконечные попытки
+            retry_delay=1,  # Минимальная задержка между попытками
+            auto_reconnect=False,  # Запрещаем автоматическое переподключение
+            loop=asyncio.get_event_loop()
+        )
+        
+        return client
+    except Exception as e:
+        logger.error(f"Ошибка при создании клиента Telegram: {e}")
+        logger.error(traceback.format_exc())
+        raise
+# --- Конец функции create_telegram_client ---
+
 class TelegramClientPool(ClientPool):
     """Пул клиентов Telegram."""
     
     def __init__(self):
         super().__init__()
         self.platform = 'telegram'
-        self.connected_clients = set()  # Множество подключенных клиентов
-        self.locked_clients = set()     # Множество заблокированных клиентов (используемых в данный момент)
-        self.client_auth_status = {}    # Статус авторизации клиентов {'account_id': True/False/'2fa_required'}
-        self.client_semaphores = {}     # Семафоры для контроля параллельного доступа к клиентам
+        self.connected_clients = set()  # Множество подключенных клиентов (IDs as strings)
+        self.locked_clients = set()     # Множество заблокированных клиентов (используемых в данный момент) (IDs as strings)
+        self.client_auth_status: Dict[str, Union[bool, str]] = {} # Статус авторизации клиентов {'account_id': True/False/'2fa_required'} (IDs as strings)
+        self.client_semaphores: Dict[str, asyncio.Semaphore] = {}     # Семафоры для контроля параллельного доступа к клиентам (IDs as strings)
         self.max_retries = 3
         self.retry_delay = 5  # секунды
         self.current_index = 0
-        
+        self.degraded_mode_status: Dict[str, bool] = {} # (IDs as strings)
+        self.usage_counts: Dict[str, int] = {} # (IDs as strings)
+        self.last_used: Dict[str, datetime] = {} # (IDs as strings)
+        self.active_accounts: Dict[str, Dict] = {} # Инициализируем active_accounts (IDs as strings)
+
     async def get_active_clients(self, api_key):
         """Получает активные клиенты Telegram на основе активных аккаунтов."""
         from user_manager import get_active_accounts
@@ -419,7 +575,8 @@ class TelegramClientPool(ClientPool):
     
     async def create_client(self, account):
         """Создает нового клиента Telegram."""
-        from telegram_utils import create_telegram_client
+        # Убираем импорт, так как функция теперь здесь
+        # from telegram_utils import create_telegram_client 
         
         api_id = account.get('api_id')
         api_hash = account.get('api_hash')
@@ -451,7 +608,7 @@ class TelegramClientPool(ClientPool):
             
         for attempt in range(self.max_retries):
             try:
-                client = await create_telegram_client(
+                client = await create_telegram_client( # Вызов локальной функции
                     session_path=session_file,
                     api_id=api_id,
                     api_hash=api_hash,
@@ -475,67 +632,38 @@ class TelegramClientPool(ClientPool):
         logger.error(f"Не удалось создать клиент Telegram для аккаунта {account_id} после {self.max_retries} попыток")
         return None
 
-    async def disconnect_client(self, account_id: Union[int, str]) -> bool:
-        """
-        Отключает клиент Telegram и удаляет его из множества подключенных клиентов.
-        
-        Args:
-            account_id (Union[int, str]): ID аккаунта
-            
-        Returns:
-            bool: True если клиент успешно отключен, False в противном случае
-        """
+    async def disconnect_client(self, account_id: str):
+        """Отключает и удаляет клиента Telegram по его ID."""
+        # --- ИЗМЕНЕНИЕ: Работаем с account_id как со строкой (UUID) --- 
         logger.info(f"Отключение клиента Telegram для аккаунта {account_id}")
-        
-        try:
-            # Преобразуем ID в целое число, если это строка
-            try:
-                account_id = int(account_id) if isinstance(account_id, str) else account_id
-            except (ValueError, TypeError):
-                logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
-                return False
-            
-            # Проверяем, существует ли клиент в пуле
-            client = self.get_client(account_id)
-            if not client:
-                logger.warning(f"Клиент для аккаунта {account_id} не найден в пуле")
-                return False
-            
-            # Проверяем, подключен ли клиент
-            try:
-                if not client.is_connected():
-                    logger.info(f"Клиент для аккаунта {account_id} уже отключен")
-                    # Удаляем из множества подключенных клиентов, если он там есть
-                    if account_id in self.connected_clients:
-                        self.connected_clients.remove(account_id)
-                    return True
-            except Exception as e:
-                logger.error(f"Ошибка при проверке соединения клиента: {e}")
-            
-            # Отключаем клиент
-            try:
-                # Используем метод disconnect() телеграм-клиента
-                await client.disconnect()
-                logger.info(f"Клиент для аккаунта {account_id} успешно отключен")
-                
-                # Удаляем из множества подключенных клиентов
-                if account_id in self.connected_clients:
-                    self.connected_clients.remove(account_id)
-                
-                return True
-            except Exception as e:
-                logger.error(f"Ошибка при отключении клиента: {e}")
-                import traceback
-                logger.error(f"Трассировка: {traceback.format_exc()}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"Непредвиденная ошибка при отключении клиента Telegram: {e}")
-            import traceback
-            logger.error(f"Трассировка: {traceback.format_exc()}")
-            return False
+        client = self.clients.pop(account_id, None)
+        self.active_accounts.pop(account_id, None) # Удаляем из активных
+        self.degraded_mode_status.pop(account_id, None) # Сбрасываем статус деградации
 
-    def get_client_auth_status(self, account_id: Union[int, str]) -> Optional[bool]:
+        # --- Убираем ненужное преобразование в int --- 
+        # try:
+        #     numeric_account_id = int(account_id)
+        # except ValueError:
+        #     logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
+        #     numeric_account_id = None # Или другое значение по умолчанию
+        # ------------------------------------------
+        
+        if client:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+                    logger.info(f"Клиент Telegram для аккаунта {account_id} успешно отключен.")
+                else:
+                    logger.info(f"Клиент Telegram для аккаунта {account_id} уже был отключен.")
+            except Exception as e:
+                logger.error(f"Ошибка при отключении клиента Telegram для аккаунта {account_id}: {e}")
+        else:
+            logger.warning(f"Попытка отключить несуществующего клиента Telegram для аккаунта {account_id}")
+        
+        # Опционально: Обновить статус в основной базе данных?
+        # await update_account_status(account_id, 'disconnected') # Пример
+
+    def get_client_auth_status(self, account_id: Union[int, str]) -> Optional[Union[bool, str]]:
         """
         Получает статус авторизации клиента Telegram по ID аккаунта.
         
@@ -543,71 +671,42 @@ class TelegramClientPool(ClientPool):
             account_id (Union[int, str]): ID аккаунта
             
         Returns:
-            Optional[bool]: Статус авторизации клиента или None, если клиент не найден
+            Optional[Union[bool, str]]: Статус авторизации клиента (True, False, '2fa_required') или None
         """
-        logger.info(f"Получение статуса авторизации клиента Telegram для аккаунта {account_id}")
-        
+        account_id_str = str(account_id) # Ensure string ID
+        logger.debug(f"Получение статуса авторизации клиента Telegram для аккаунта {account_id_str}")
+
         try:
-            # Преобразуем ID в целое число, если это строка
-            try:
-                account_id = int(account_id) if isinstance(account_id, str) else account_id
-            except (ValueError, TypeError):
-                logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
-                return None
-            
-            # Проверяем, существует ли клиент в пуле
-            if account_id not in self.clients:
-                logger.warning(f"Клиент для аккаунта {account_id} не найден в пуле")
-                return None
-            
             # Получаем статус авторизации
-            auth_status = self.client_auth_status.get(account_id)
-            
-            # Проверяем, что статус не None
-            if auth_status is None:
-                logger.warning(f"Статус авторизации для аккаунта {account_id} не найден")
-                return None
-            
-            logger.info(f"Статус авторизации клиента Telegram успешно получен для аккаунта {account_id}: {auth_status}")
-            return auth_status
-            
+            auth_status = self.client_auth_status.get(account_id_str) # Use string ID
+
+            logger.debug(f"Статус авторизации клиента Telegram для аккаунта {account_id_str}: {auth_status}")
+            return auth_status # Может быть None, если статус неизвестен
+
         except Exception as e:
             logger.error(f"Ошибка при получении статуса авторизации клиента Telegram: {str(e)}")
-            import traceback
             logger.error(f"Трассировка: {traceback.format_exc()}")
             return None
 
-    def set_client_auth_status(self, account_id: Union[int, str], status: bool) -> None:
+    def set_client_auth_status(self, account_id: Union[int, str], status: Union[bool, str]) -> None:
         """
         Устанавливает статус авторизации клиента Telegram по ID аккаунта.
         
         Args:
             account_id (Union[int, str]): ID аккаунта
-            status (bool): Статус авторизации
+            status (Union[bool, str]): Статус авторизации (True, False, '2fa_required')
         """
-        logger.info(f"Установка статуса авторизации клиента Telegram для аккаунта {account_id}: {status}")
-        
+        account_id_str = str(account_id) # Ensure string ID
+        logger.info(f"Установка статуса авторизации клиента Telegram для аккаунта {account_id_str}: {status}")
+
         try:
-            # Преобразуем ID в целое число, если это строка
-            try:
-                account_id = int(account_id) if isinstance(account_id, str) else account_id
-            except (ValueError, TypeError):
-                logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
-                return
-            
-            # Проверяем, существует ли клиент в пуле
-            if account_id not in self.clients:
-                logger.warning(f"Клиент для аккаунта {account_id} не найден в пуле")
-                return
-            
-            # Устанавливаем статус авторизации
-            self.client_auth_status[account_id] = status
-            
-            logger.info(f"Статус авторизации клиента Telegram успешно установлен для аккаунта {account_id}: {status}")
-            
+            # Устанавливаем статус авторизации (даже если клиента еще нет в self.clients)
+            self.client_auth_status[account_id_str] = status # Use string ID
+
+            logger.info(f"Статус авторизации клиента Telegram успешно установлен для аккаунта {account_id_str}: {status}")
+
         except Exception as e:
             logger.error(f"Ошибка при установке статуса авторизации клиента Telegram: {str(e)}")
-            import traceback
             logger.error(f"Трассировка: {traceback.format_exc()}")
 
     def get_client_usage_count(self, account_id: Union[int, str]) -> Optional[int]:
@@ -618,39 +717,22 @@ class TelegramClientPool(ClientPool):
             account_id (Union[int, str]): ID аккаунта
             
         Returns:
-            Optional[int]: Количество использований клиента или None, если клиент не найден
+            Optional[int]: Количество использований клиента или 0, если клиент не найден
         """
-        logger.info(f"Получение количества использований клиента Telegram для аккаунта {account_id}")
-        
+        account_id_str = str(account_id) # Ensure string ID
+        logger.debug(f"Получение количества использований клиента Telegram для аккаунта {account_id_str}")
+
         try:
-            # Преобразуем ID в целое число, если это строка
-            try:
-                account_id = int(account_id) if isinstance(account_id, str) else account_id
-            except (ValueError, TypeError):
-                logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
-                return None
-            
-            # Проверяем, существует ли клиент в пуле
-            if account_id not in self.clients:
-                logger.warning(f"Клиент для аккаунта {account_id} не найден в пуле")
-                return None
-            
-            # Получаем количество использований
-            usage_count = self.usage_counts.get(account_id)
-            
-            # Проверяем, что количество использований не None
-            if usage_count is None:
-                logger.warning(f"Количество использований для аккаунта {account_id} не найдено")
-                return None
-            
-            logger.info(f"Количество использований клиента Telegram успешно получено для аккаунта {account_id}: {usage_count}")
+            # Получаем количество использований, возвращаем 0 если нет
+            usage_count = self.usage_counts.get(account_id_str, 0) # Use string ID
+
+            logger.debug(f"Количество использований клиента Telegram для аккаунта {account_id_str}: {usage_count}")
             return usage_count
-            
+
         except Exception as e:
             logger.error(f"Ошибка при получении количества использований клиента Telegram: {str(e)}")
-            import traceback
             logger.error(f"Трассировка: {traceback.format_exc()}")
-            return None
+            return 0 # Return 0 on error
 
     def get_client_last_used(self, account_id: Union[int, str]) -> Optional[datetime]:
         """
@@ -660,37 +742,20 @@ class TelegramClientPool(ClientPool):
             account_id (Union[int, str]): ID аккаунта
             
         Returns:
-            Optional[datetime]: Время последнего использования клиента или None, если клиент не найден
+            Optional[datetime]: Время последнего использования клиента или None, если не использовался
         """
-        logger.info(f"Получение времени последнего использования клиента Telegram для аккаунта {account_id}")
-        
+        account_id_str = str(account_id) # Ensure string ID
+        logger.debug(f"Получение времени последнего использования клиента Telegram для аккаунта {account_id_str}")
+
         try:
-            # Преобразуем ID в целое число, если это строка
-            try:
-                account_id = int(account_id) if isinstance(account_id, str) else account_id
-            except (ValueError, TypeError):
-                logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
-                return None
-            
-            # Проверяем, существует ли клиент в пуле
-            if account_id not in self.clients:
-                logger.warning(f"Клиент для аккаунта {account_id} не найден в пуле")
-                return None
-            
             # Получаем время последнего использования
-            last_used = self.last_used.get(account_id)
-            
-            # Проверяем, что время последнего использования не None
-            if last_used is None:
-                logger.warning(f"Время последнего использования для аккаунта {account_id} не найдено")
-                return None
-            
-            logger.info(f"Время последнего использования клиента Telegram успешно получено для аккаунта {account_id}: {last_used}")
-            return last_used
-            
+            last_used = self.last_used.get(account_id_str) # Use string ID
+
+            logger.debug(f"Время последнего использования клиента Telegram для аккаунта {account_id_str}: {last_used}")
+            return last_used # Может быть None
+
         except Exception as e:
             logger.error(f"Ошибка при получении времени последнего использования клиента Telegram: {str(e)}")
-            import traceback
             logger.error(f"Трассировка: {traceback.format_exc()}")
             return None
 
@@ -702,46 +767,35 @@ class TelegramClientPool(ClientPool):
             account_id (Union[int, str]): ID аккаунта
             
         Returns:
-            Optional[Dict[str, Any]]: Статистика использования клиента или None, если клиент не найден
+            Optional[Dict[str, Any]]: Статистика использования клиента или None, если данных нет
         """
-        logger.info(f"Получение статистики использования клиента Telegram для аккаунта {account_id}")
-        
+        account_id_str = str(account_id) # Ensure string ID
+        logger.debug(f"Получение статистики использования клиента Telegram для аккаунта {account_id_str}")
+
         try:
-            # Преобразуем ID в целое число, если это строка
-            try:
-                account_id = int(account_id) if isinstance(account_id, str) else account_id
-            except (ValueError, TypeError):
-                logger.error(f"Не удалось преобразовать ID аккаунта в число: {account_id}")
-                return None
-            
-            # Проверяем, существует ли клиент в пуле
-            if account_id not in self.clients:
-                logger.warning(f"Клиент для аккаунта {account_id} не найден в пуле")
-                return None
-            
             # Получаем статистику использования
-            usage_count = self.usage_counts.get(account_id)
-            last_used = self.last_used.get(account_id)
-            auth_status = self.client_auth_status.get(account_id)
-            
-            # Проверяем, что все данные не None
-            if usage_count is None or last_used is None or auth_status is None:
-                logger.warning(f"Неполная статистика использования для аккаунта {account_id}")
-                return None
-            
-            # Формируем статистику
-            stats = {
-                "usage_count": usage_count,
-                "last_used": last_used,
-                "auth_status": auth_status
-            }
-            
-            logger.info(f"Статистика использования клиента Telegram успешно получена для аккаунта {account_id}: {stats}")
+            usage_count = self.usage_counts.get(account_id_str) # Use string ID, Might be None
+            last_used = self.last_used.get(account_id_str) # Use string ID, Might be None
+            auth_status = self.client_auth_status.get(account_id_str) # Use string ID, Might be None
+
+            # Формируем статистику, только если есть данные
+            stats = {}
+            if usage_count is not None:
+                stats["usage_count"] = usage_count
+            if last_used is not None:
+                stats["last_used"] = last_used
+            if auth_status is not None:
+                 stats["auth_status"] = auth_status
+
+            if not stats: # Если словарь пуст
+                 logger.warning(f"Нет статистики использования для аккаунта {account_id_str}")
+                 return None
+
+            logger.debug(f"Статистика использования клиента Telegram для аккаунта {account_id_str}: {stats}")
             return stats
-            
+
         except Exception as e:
             logger.error(f"Ошибка при получении статистики использования клиента Telegram: {str(e)}")
-            import traceback
             logger.error(f"Трассировка: {traceback.format_exc()}")
             return None
 
@@ -993,4 +1047,273 @@ class TelegramClientPool(ClientPool):
             logger.error(f"Трассировка: {traceback.format_exc()}")
             return {}
 
+    async def disconnect_inactive_clients(self, inactive_timeout_seconds: int = 300):
+        """Отключает клиентов, которые не использовались дольше указанного времени."""
+        logger.info(f"Запуск проверки неактивных клиентов Telegram (таймаут: {inactive_timeout_seconds} сек)...")
+        disconnected_count = 0
+        current_time = time.time()
+        # Копируем ключи, чтобы избежать изменения словаря во время итерации
+        account_ids = list(self.clients.keys())
+
+        for account_id in account_ids:
+            client = self.get_client(account_id)
+            if not client:
+                continue
+
+            # Получаем время последнего использования (может быть datetime или 0)
+            last_used_obj = self.last_used.get(account_id)
+            last_used_timestamp = 0.0 # Инициализируем как float
+            if isinstance(last_used_obj, datetime):
+                 # Преобразуем datetime в float timestamp
+                 last_used_timestamp = last_used_obj.timestamp()
+            elif last_used_obj is not None:
+                 # Если там что-то другое (например, старый timestamp float), пробуем использовать
+                 try: last_used_timestamp = float(last_used_obj)
+                 except (ValueError, TypeError): pass # Оставляем 0.0 если не float
+            
+            # Вычисляем разницу в секундах (float - float)
+            time_since_last_use = current_time - last_used_timestamp
+
+            # Проверяем, что клиент не используется и неактивен достаточно долго
+            if time_since_last_use > inactive_timeout_seconds:
+                try:
+                    # --- Добавляем сброс статистики и деградации ПЕРЕД отключением ---
+                    # 1. Сбрасываем статистику в Redis
+                    from redis_utils import reset_account_stats_redis
+                    reset_success = await reset_account_stats_redis(account_id, self.platform)
+                    if reset_success:
+                        logger.info(f"Сброшена статистика в Redis для неактивного аккаунта {account_id}")
+                    else:
+                        logger.warning(f"Не удалось сбросить статистику в Redis для неактивного аккаунта {account_id}")
+                    
+                    # 2. Отключаем режим деградации (если он был)
+                    if hasattr(client, 'set_degraded_mode'):
+                        client.set_degraded_mode(False)
+                        logger.info(f"Отключен режим деградации для неактивного аккаунта {account_id}")
+                    # --- Конец добавлений ---
+
+                    # 3. Отключаем сам клиент
+                    if client.is_connected():
+                        logger.info(f"Клиент {account_id} неактивен ({time_since_last_use:.1f} сек), отключаем...")
+                        await client.disconnect()
+                        disconnected_count += 1
+                        # Удаляем из множества подключенных клиентов (если используется)
+                        # if account_id in self.connected_clients: 
+                        #     self.connected_clients.remove(account_id)
+                    
+                    # 4. Удаляем клиент из основного словаря пула
+                    if account_id in self.clients:
+                        del self.clients[account_id]
+                        logger.info(f"Удален клиент {account_id} из пула после отключения.")
+                        
+                except Exception as e:
+                    logger.error(f"Ошибка при отключении неактивного клиента {account_id}: {e}")
+
+        if disconnected_count > 0:
+            logger.info(f"Проверка неактивных клиентов завершена. Отключено: {disconnected_count}")
+        # else:
+            # logger.info("Проверка неактивных клиентов завершена. Активных для отключения не найдено.")
+
+    # Добавляем метод для установки/снятия режима деградации
+    def set_degraded_mode(self, account_id: Union[int, str], degraded: bool):
+        """Устанавливает режим пониженной производительности для Telegram аккаунта."""
+        account_id_str = str(account_id) # Приводим к строке на всякий случай
+        if degraded:
+            logger.warning(f"Включение режима деградации для Telegram аккаунта {account_id_str}")
+            self.degraded_mode_status[account_id_str] = True
+        else:
+            # Снимаем режим деградации, если он был установлен
+            if self.degraded_mode_status.pop(account_id_str, None):
+                logger.info(f"Отключение режима деградации для Telegram аккаунта {account_id_str}")
+            # Если ключа не было, ничего не делаем
+
+    async def select_next_client(self, api_key: str, strategy: str = "round_robin") -> Tuple[Any, str]:
+        """
+        Выбирает следующего клиента Telegram для использования, учитывая degraded_mode и статистику из Redis.
+        """
+        active_accounts = await self.get_active_clients(api_key)
+        if not active_accounts:
+            logger.error(f"Нет активных аккаунтов {self.platform} для API ключа {api_key}")
+            return None, ""
+
+        # --- Получаем статистику из Redis для активных аккаунтов --- 
+        account_stats = {}
+        if active_accounts:
+            account_ids = [str(acc['id']) for acc in active_accounts] # Ensure string IDs
+            tasks = [get_account_stats_redis(acc_id, self.platform) for acc_id in account_ids]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, result in enumerate(results):
+                acc_id = account_ids[i]
+                # Initialize defaults for this account_id
+                requests_count = 0
+                last_used_dt = datetime.min.replace(tzinfo=timezone.utc)
+
+                if isinstance(result, Exception):
+                    logger.error(f"Ошибка получения статистики из Redis для аккаунта {acc_id}: {result}")
+                    # Defaults are already set
+                elif isinstance(result, dict): # Ensure result is a dictionary
+                    if last_used_str := result.get('last_used'):
+                        try:
+                            dt_from_redis = datetime.fromisoformat(last_used_str)
+                            if dt_from_redis.tzinfo is None:
+                                last_used_dt = dt_from_redis.replace(tzinfo=timezone.utc)
+                            else:
+                                last_used_dt = dt_from_redis.astimezone(timezone.utc)
+                        except (ValueError, TypeError):
+                             logger.warning(f"Не удалось преобразовать last_used '{last_used_str}' из Redis для {acc_id}")
+                    # Get requests_count safely
+                    requests_count = result.get('requests_count', 0)
+                else: # Handle case where result is not None/False but not a dict
+                     logger.warning(f"Получен неожиданный результат из Redis для Telegram {acc_id}, тип: {type(result)}. Используются значения по умолчанию.")
+                     # Defaults are already set
+
+                # Assign stats regardless of result type (using defaults if error/unexpected)
+                account_stats[acc_id] = {
+                    'requests_count': requests_count,
+                    'last_used': last_used_dt
+                }
+        # ---------------------------------------------------------
+
+        # --- Переделываем логику выбора стратегии (с учетом Redis) --- 
+        # 1. Фильтруем аккаунты: сначала недеградированные, потом деградированные
+        non_degraded_accounts = []
+        degraded_accounts = []
+        for acc in active_accounts:
+            acc_id = acc['id']
+            # Используем self.degraded_mode_status.get(acc_id, False) для проверки
+            if self.degraded_mode_status.get(str(acc_id), False):
+                degraded_accounts.append(acc)
+            else:
+                non_degraded_accounts.append(acc)
+        
+        # 2. Применяем стратегию к недеградированным аккаунтам
+        if non_degraded_accounts:
+            target_list = non_degraded_accounts
+            logger.debug(f"Выбор из {len(target_list)} недеградированных аккаунтов Telegram")
+        elif degraded_accounts:
+             # Если нет недеградированных, используем деградированные
+             target_list = degraded_accounts
+             logger.warning(f"Нет доступных недеградированных аккаунтов Telegram, выбираем из {len(target_list)} деградированных.")
+        else:
+             # Это не должно произойти, если active_accounts не пуст
+             logger.error("Непредвиденная ситуация: нет ни деградированных, ни недеградированных аккаунтов.")
+             return None, ""
+
+        # --- Применяем сортировку/выбор по стратегии к выбранному списку (с учетом Redis) --- 
+        selected_account = None
+        default_stats = {'requests_count': 0, 'last_used': datetime.min.replace(tzinfo=timezone.utc)}
+        if strategy == "round_robin":
+            # Сортируем по времени последнего использования (старые сначала)
+            target_list.sort(key=lambda acc: account_stats.get(acc['id'], default_stats)['last_used'])
+            if not target_list: return None, "" 
+            if self.current_index >= len(target_list):
+                self.current_index = 0
+            selected_account = target_list[self.current_index]
+            self.current_index += 1
+        elif strategy == "least_used":
+            # Сортируем по количеству запросов (меньше сначала), затем по времени (старые сначала)
+            target_list.sort(key=lambda acc: (
+                 account_stats.get(acc['id'], default_stats)['requests_count'], 
+                 account_stats.get(acc['id'], default_stats)['last_used']
+                 ))
+            if target_list:
+                selected_account = target_list[0] # Выбираем первый после сортировки
+        elif strategy == "random":
+            import random
+            if target_list:
+                 selected_account = random.choice(target_list)
+        else: # По умолчанию round_robin
+            target_list.sort(key=lambda acc: account_stats.get(acc['id'], default_stats)['last_used'])
+            if not target_list: return None, "" 
+            if self.current_index >= len(target_list):
+                self.current_index = 0
+            selected_account = target_list[self.current_index]
+            self.current_index += 1
+            
+        if not selected_account:
+            logger.error(f"Не удалось выбрать аккаунт VK по стратегии '{strategy}'")
+            return None, ""
+        # ---------------------------------------------------------------------
+
+        # Получаем ID и клиента для выбранного аккаунта
+        account_id = selected_account['id']
+        client = self.get_client(account_id)
+
+        # Клиент должен существовать, так как мы фильтровали по нему
+        if not client:
+             logger.error(f"КРИТИЧЕСКАЯ ОШИБКА: Не найден клиент для выбранного активного аккаунта Telegram {account_id} ПОСЛЕ ФИЛЬТРАЦИИ!")
+             # Это не должно происходить. Если произошло, что-то не так с логикой.
+             return None, "" 
+
+        # --- Исправляем логирование: берем статус деградации из пула ---
+        # Задержка для degraded_mode применяется в get_posts_by_period, не здесь.
+        is_degraded = self.degraded_mode_status.get(str(account_id), False) 
+        logger.info(f"Выбран {self.platform} клиент для аккаунта {account_id} (Деградация: {is_degraded})")
+        # --------------------------------------------------------------
+        return client, account_id
+
+async def validate_proxy_connection(proxy: Optional[str]) -> Tuple[bool, str]:
+    """
+    Валидирует строку прокси и проверяет соединение с сервером Telegram.
+    
+    Args:
+        proxy: Строка с прокси в формате scheme://host:port или scheme://user:password@host:port
+        
+    Returns:
+        Tuple[bool, str]: (валиден ли прокси, сообщение)
+    """
+    if not proxy:
+        return False, "Прокси не указан"
+    
+    # Проверяем формат прокси
+    is_valid, proxy_type = validate_proxy(proxy)
+    if not is_valid:
+        return False, "Неверный формат прокси"
+    
+    # Нормализуем прокси URL
+    if '://' not in proxy:
+        if proxy_type == 'socks5':
+            proxy = 'socks5://' + proxy
+        elif proxy_type == 'socks4':
+            proxy = 'socks4://' + proxy
+        else:
+            proxy = 'http://' + proxy
+    
+    # Проверяем, установлена ли библиотека aiohttp-socks
+    try:
+        import aiohttp
+        
+        # Для HTTP/HTTPS прокси можно использовать стандартный aiohttp
+        if proxy.startswith(('http://', 'https://')):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get('https://api.telegram.org', proxy=proxy, timeout=10) as response:
+                        if response.status == 200:
+                            return True, "Прокси работает"
+                        else:
+                            return False, f"Ошибка соединения: HTTP {response.status}"
+            except Exception as e:
+                return False, f"Ошибка соединения: {str(e)}"
+        
+        # Для SOCKS прокси нужна библиотека aiohttp-socks
+        # Проверяем, установлена ли она
+        try:
+            from aiohttp_socks import ProxyConnector
+            
+            # Если библиотека установлена, используем её
+            connector = ProxyConnector.from_url(proxy)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get('https://api.telegram.org', timeout=10) as response:
+                    if response.status == 200:
+                        return True, "Прокси работает"
+                    else:
+                        return False, f"Ошибка соединения: HTTP {response.status}"
+        except ImportError:
+            # Если библиотека не установлена, вернем соответствующее сообщение
+            return False, "Необходимо установить библиотеку aiohttp-socks для работы с SOCKS прокси"
+        except Exception as e:
+            return False, f"Ошибка соединения: {str(e)}"
+    except Exception as e:
+        return False, f"Ошибка при проверке прокси: {str(e)}"
 # Удаляем глобальные экземпляры пулов 
