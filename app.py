@@ -31,6 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from telethon.errors import SessionPasswordNeededError
 import telegram_utils # <-- Добавляем этот импорт
 import inspect
@@ -363,6 +364,7 @@ async def lifespan(app: FastAPI):
 
 # --- Инициализация FastAPI приложения ---
 app = FastAPI(lifespan=lifespan, title="Social Scraper API")
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # --- Настройка CORS ---
 app.add_middleware(
