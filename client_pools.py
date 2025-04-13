@@ -135,8 +135,9 @@ class VKClientPool(ClientPool):
         self.max_retries = 3
         self.retry_delay = 5  # секунды
         self.current_index = 0
-        self.usage_counts: Dict[str, int] = {}
-        self.last_used: Dict[str, datetime] = {}
+        # Убираем usage_counts и last_used из локального состояния, так как используем Redis
+        # self.usage_counts: Dict[str, int] = {}
+        # self.last_used: Dict[str, datetime] = {}
     
     async def create_client(self, account):
         """Создает нового клиента VK."""
@@ -328,39 +329,10 @@ class VKClientPool(ClientPool):
         # Задержка для degraded_mode уже встроена в _make_request клиента VK
         logger.info(f"Выбран {self.platform} клиент для аккаунта {account_id} (Деградация: {client.degraded_mode})")
         return client, account_id
-        
-    
-    async def balance_load(self, api_key):
-        """
-        Балансирует нагрузку между аккаунтами VK.
-        
-        Args:
-            api_key: API ключ пользователя
-        """
-        from user_manager import get_active_accounts
-        
-        # Получаем активные аккаунты
-        active_accounts = await get_active_accounts(api_key, "vk")
-        if not active_accounts or len(active_accounts) <= 1:
-            return
-        
-        # Вычисляем среднее количество запросов
-        total_requests = sum(self.usage_counts.get(acc['id'], 0) for acc in active_accounts)
-        avg_requests = total_requests / len(active_accounts) if active_accounts else 0
-        
-        # Если разница между максимальным и средним количеством запросов слишком большая,
-        # сбрасываем счетчики для аккаунтов с большим количеством запросов
-        max_requests = max(self.usage_counts.get(acc['id'], 0) for acc in active_accounts)
-        if max_requests > avg_requests * 1.5:  # Если максимальное количество запросов на 50% больше среднего
-            for account in active_accounts:
-                account_id = account['id']
-                if self.usage_counts.get(account_id, 0) > avg_requests * 1.2:  # Если количество запросов на 20% больше среднего
-                    self.usage_counts[account_id] = int(avg_requests)  # Сбрасываем счетчик до среднего значения
-                    logger.info(f"Сброшен счетчик запросов для аккаунта VK {account_id} до {int(avg_requests)}")
     
     async def get_pool_status(self, api_key):
         """
-        Получает статус пула клиентов VK.
+        Получает статус пула клиентов VK, используя данные из Redis.
         
         Args:
             api_key: API ключ пользователя
@@ -372,6 +344,39 @@ class VKClientPool(ClientPool):
         
         # Получаем активные аккаунты
         active_accounts = await get_active_accounts(api_key, "vk")
+        if not active_accounts:
+            return {
+                "total_accounts": 0,
+                "accounts": []
+            }
+
+        # Получаем статистику из Redis для активных аккаунтов
+        account_stats_redis = {}
+        account_ids = [acc['id'] for acc in active_accounts]
+        tasks = [get_account_stats_redis(acc_id, self.platform) for acc_id in account_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        default_stats = {'requests_count': 0, 'last_used': None}
+        for i, result in enumerate(results):
+            acc_id = account_ids[i]
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка получения статистики из Redis для VK {acc_id} в get_pool_status: {result}")
+                account_stats_redis[acc_id] = default_stats
+            elif isinstance(result, dict):
+                # Преобразуем last_used в строку ISO, если это datetime
+                last_used = result.get('last_used')
+                last_used_str = None
+                if isinstance(last_used, datetime):
+                    last_used_str = last_used.isoformat()
+                elif isinstance(last_used, str): # Если уже строка
+                    last_used_str = last_used
+
+                account_stats_redis[acc_id] = {
+                    'requests_count': result.get('requests_count', 0),
+                    'last_used': last_used_str # Используем строку
+                }
+            else:
+                account_stats_redis[acc_id] = default_stats
         
         # Собираем статистику
         stats = {
@@ -379,8 +384,8 @@ class VKClientPool(ClientPool):
             "accounts": [
                 {
                     "id": acc['id'],
-                    "requests": self.usage_counts.get(acc['id'], 0),
-                    "last_used": self.last_used.get(acc['id'], 0)
+                    "requests": account_stats_redis.get(acc['id'], default_stats)['requests_count'],
+                    "last_used": account_stats_redis.get(acc['id'], default_stats)['last_used']
                 }
                 for acc in active_accounts
             ]
@@ -390,31 +395,126 @@ class VKClientPool(ClientPool):
 
     def get_clients_usage_statistics(self) -> Dict[str, Dict[str, Any]]:
         """
-        Получает статистику использования всех клиентов VK.
+        Получает статистику использования всех клиентов VK из Redis (асинхронно).
+        ВНИМАНИЕ: Метод теперь асинхронный!
         
         Returns:
             Dict[str, Dict[str, Any]]: Словарь со статистикой использования всех клиентов
         """
-        logger.info("Получение статистики использования всех клиентов VK")
+        logger.info("Получение статистики использования всех клиентов VK из Redis")
         
-        try:
-            # Формируем статистику использования для всех клиентов
-            usage_stats = {}
-            for account_id in self.clients:
-                usage_stats[account_id] = {
-                    "usage_count": self.usage_counts.get(account_id, 0),
-                    "last_used": self.last_used.get(account_id, 0)
-                }
-                
-            logger.info(f"Статистика использования всех клиентов VK успешно получена: {len(usage_stats)} клиентов")
-            return usage_stats
-            
-        except Exception as e:
-            logger.error(f"Ошибка при получении статистики использования всех клиентов VK: {str(e)}")
-            import traceback
-            logger.error(f"Трассировка: {traceback.format_exc()}")
+        # Возвращаем пустой словарь, т.к. метод стал асинхронным
+        # и его вызов из синхронного контекста (если такой есть) потребует рефакторинга.
+        # Правильнее будет сделать этот метод асинхронным.
+        # Для совместимости пока возвращаем пустой словарь, 
+        # но нужно будет переделать вызовы этого метода на асинхронные.
+        logger.warning("Метод get_clients_usage_statistics для VK должен быть асинхронным. Возвращается пустой словарь для совместимости.")
+        return {} # Заглушка
+
+    async def get_clients_usage_statistics_async(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Асинхронно получает статистику использования всех клиентов VK из Redis.
+        
+        Returns:
+            Dict[str, Dict[str, Any]]: Словарь со статистикой использования всех клиентов
+        """
+        logger.info("Асинхронное получение статистики использования всех клиентов VK из Redis")
+        
+        usage_stats = {}
+        account_ids = list(self.clients.keys()) # Берем ID клиентов, которые есть в пуле
+        if not account_ids:
             return {}
 
+        tasks = [get_account_stats_redis(acc_id, self.platform) for acc_id in account_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        default_stats = {'usage_count': 0, 'last_used': None} # usage_count здесь синоним requests_count
+        for i, result in enumerate(results):
+            account_id = account_ids[i]
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка получения статистики из Redis для VK {account_id} в get_clients_usage_statistics_async: {result}")
+                usage_stats[account_id] = default_stats
+            elif isinstance(result, dict):
+                 # Преобразуем last_used в строку ISO, если это datetime
+                last_used = result.get('last_used')
+                last_used_str = None
+                if isinstance(last_used, datetime):
+                    last_used_str = last_used.isoformat()
+                elif isinstance(last_used, str): # Если уже строка
+                    last_used_str = last_used
+
+                usage_stats[account_id] = {
+                    "usage_count": result.get('requests_count', 0), # Используем requests_count из Redis
+                    "last_used": last_used_str # Используем строку ISO
+                }
+            else:
+                 usage_stats[account_id] = default_stats
+                
+        logger.info(f"Статистика использования всех клиентов VK успешно получена из Redis: {len(usage_stats)} клиентов")
+        return usage_stats
+            
+    async def disconnect_inactive_clients(self, inactive_timeout_seconds: int = 3600):
+        """Сбрасывает статистику в Redis для VK аккаунтов, которые не использовались дольше указанного времени."""
+        logger.info(f"Запуск проверки неактивных клиентов VK (таймаут: {inactive_timeout_seconds} сек)...")
+        reset_count = 0
+        # Получаем все ID аккаунтов, которые есть в пуле (независимо от api_key)
+        account_ids = list(self.clients.keys())
+        if not account_ids:
+            logger.info("Нет активных клиентов VK в пуле для проверки.")
+            return
+
+        current_time_utc = datetime.now(timezone.utc)
+
+        # Получаем статистику из Redis для всех клиентов в пуле
+        tasks = [get_account_stats_redis(acc_id, self.platform) for acc_id in account_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        from redis_utils import reset_account_stats_redis # Импортируем здесь, чтобы избежать циклической зависимости на уровне модуля
+
+        for i, result in enumerate(results):
+            account_id = account_ids[i]
+            last_used_dt = datetime.min.replace(tzinfo=timezone.utc) # Значение по умолчанию
+
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка получения статистики из Redis для VK {account_id} при проверке неактивности: {result}")
+                # Пропускаем этот аккаунт, так как не можем определить время использования
+                continue
+            elif isinstance(result, dict):
+                if last_used_str := result.get('last_used'):
+                    try:
+                        dt_from_redis = datetime.fromisoformat(last_used_str)
+                        if dt_from_redis.tzinfo is None:
+                            last_used_dt = dt_from_redis.replace(tzinfo=timezone.utc)
+                        else:
+                            last_used_dt = dt_from_redis.astimezone(timezone.utc)
+                    except (ValueError, TypeError):
+                         logger.warning(f"Не удалось преобразовать last_used '{last_used_str}' из Redis для VK {account_id} при проверке неактивности.")
+                         # last_used_dt остается datetime.min
+            # else: # result is None or other type - last_used_dt остается datetime.min
+
+            # Вычисляем время неактивности
+            time_since_last_use = (current_time_utc - last_used_dt).total_seconds()
+
+            # Проверяем, что аккаунт неактивен достаточно долго
+            # Используем > 0, чтобы не сбрасывать только что добавленные аккаунты (last_used_dt == min)
+            if last_used_dt > datetime.min.replace(tzinfo=timezone.utc) and time_since_last_use > inactive_timeout_seconds:
+                logger.info(f"VK аккаунт {account_id} неактивен ({time_since_last_use:.1f} сек), сбрасываем статистику в Redis...")
+                reset_success = await reset_account_stats_redis(account_id, self.platform)
+                if reset_success:
+                    reset_count += 1
+                    logger.info(f"Статистика для VK аккаунта {account_id} успешно сброшена в Redis.")
+                    # Сбросим degraded_mode для клиента, если он существует
+                    client = self.get_client(account_id)
+                    if client and hasattr(client, 'set_degraded_mode'):
+                         client.set_degraded_mode(False)
+                         logger.info(f"Отключен режим деградации для неактивного VK аккаунта {account_id}")
+                else:
+                    logger.warning(f"Не удалось сбросить статистику в Redis для неактивного VK аккаунта {account_id}")
+
+        if reset_count > 0:
+            logger.info(f"Проверка неактивных клиентов VK завершена. Сброшена статистика для: {reset_count} аккаунтов.")
+        else:
+            logger.info("Проверка неактивных клиентов VK завершена. Активных для сброса статистики не найдено.")
 
 # --- Перемещенные хелперы для прокси ---
 def validate_proxy(proxy: Optional[str]) -> Tuple[bool, str]:

@@ -35,7 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from telethon.errors import SessionPasswordNeededError
 import telegram_utils # <-- Добавляем этот импорт
 import inspect
-from redis_utils import update_account_usage_redis
+import redis_utils
+from redis_utils import update_account_usage_redis, reset_account_stats_redis
 import user_manager
 import media_utils
 import asyncpg
@@ -152,7 +153,8 @@ from redis_utils import (
     update_account_usage_redis,
     get_account_stats_redis,
     reset_all_account_stats,
-    sync_all_accounts_stats
+    sync_all_accounts_stats,
+    reset_account_stats_redis
 )
 
 # Обновляем функцию auth_middleware
@@ -232,17 +234,38 @@ async def auth_middleware(request: Request, platform: str):
 
 # --- Background task for cleaning inactive clients ---
 async def _cleanup_inactive_clients_task(interval_seconds: int = 300):
-    logger.info(f"Запуск фоновой задачи очистки неактивных клиентов (интервал: {interval_seconds} сек).")
+    """Фоновая задача для периодического отключения неактивных клиентов."""
     while True:
         await asyncio.sleep(interval_seconds)
+        logger.info(f"Запуск фоновой задачи очистки неактивных клиентов (интервал: {interval_seconds} сек)...")
         try:
             if telegram_pool:
-                 await telegram_pool.disconnect_inactive_clients()
-            # Можно добавить аналогичный вызов для vk_pool, если он будет управлять подключениями
-            # if vk_pool and hasattr(vk_pool, 'disconnect_inactive_clients'):
-            #     await vk_pool.disconnect_inactive_clients()
+                await telegram_pool.disconnect_inactive_clients(interval_seconds)
+            if vk_pool:
+                # Раскомментируем и используем новый метод для VK
+                await vk_pool.disconnect_inactive_clients(interval_seconds)
+                # logger.warning("Очистка неактивных клиентов VK еще не реализована.")
+            logger.info("Фоновая задача очистки неактивных клиентов завершена.")
         except Exception as e:
-            logger.error(f"Ошибка в фоновой задаче очистки неактивных клиентов: {e}", exc_info=True)
+            logger.error(f"Ошибка в фоновой задаче очистки неактивных клиентов: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+async def _sync_redis_to_db_task(interval_seconds: int = 600): # По умолчанию каждые 10 минут
+    """Фоновая задача для периодической синхронизации статистики из Redis в БД."""
+    while True:
+        await asyncio.sleep(interval_seconds) # Ждем интервал
+        logger.info(f"Запуск фоновой задачи синхронизации Redis -> DB (интервал: {interval_seconds} сек)...")
+        try:
+            # Вызываем функцию синхронизации из redis_utils
+            success = await redis_utils.sync_all_accounts_stats()
+            if success:
+                logger.info("Фоновая задача синхронизации Redis -> DB успешно завершена.")
+            else:
+                logger.warning("Фоновая задача синхронизации Redis -> DB завершена с ошибками.")
+        except Exception as e:
+            logger.error(f"Критическая ошибка в фоновой задаче синхронизации Redis -> DB: {e}", exc_info=True)
+
 
 # Настраиваем приложение FastAPI и его жизненный цикл
 # --- Lifespan для инициализации и очистки ---
@@ -274,6 +297,7 @@ async def lifespan(app: FastAPI):
     # --- Запуск фоновой задачи очистки --- 
     # Изменяем интервал на 3600 секунд (1 час)
     cleanup_task = asyncio.create_task(_cleanup_inactive_clients_task(interval_seconds=3600)) 
+    sync_task = asyncio.create_task(_sync_redis_to_db_task(600))
     logger.info("Фоновая задача очистки неактивных клиентов запущена.")
     
     logger.info("Приложение готово к работе.")
@@ -3089,195 +3113,198 @@ async def toggle_account_status(request: Request, data: dict):
 # Добавим эндпоинт для получения расширенной статистики аккаунтов
 @app.get("/api/admin/accounts/stats/detailed")
 async def get_accounts_statistics_detailed(request: Request):
-    """Получает расширенную статистику всех аккаунтов для админ-панели."""
+    """Получает расширенную статистику всех аккаунтов для админ-панели (из БД + статусы из пула)."""
     auth_header = request.headers.get('authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        raise HTTPException(401, "API ключ обязателен")
-    admin_key = auth_header.split(' ')[1]
-    
-    # Проверяем админ-ключ
-    if not await verify_admin_key(admin_key):
-        raise HTTPException(401, "Неверный админ-ключ")
-    
-    # Получаем пул соединений PostgreSQL вместо единичного соединения
+    # Используем X-Admin-Key, как в других эндпоинтах админки
+    admin_key_auth = request.headers.get("X-Admin-Key")
+    admin_key_bearer = None
+    if auth_header and auth_header.startswith('Bearer '):
+        admin_key_bearer = auth_header.split(' ')[1]
+
+    admin_key = admin_key_auth or admin_key_bearer # Берем любой из ключей
+
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Неверный или отсутствует админ-ключ")
+
     from user_manager import get_db_pool
     pool = await get_db_pool()
-    
+
+    detailed_users = []
+    telegram_stats_dict = {"status_breakdown": [], "total": 0, "active": 0}
+    vk_stats_dict = {"status_breakdown": [], "total": 0, "active": 0}
+    vk_usage_final = {} # Итоговая статистика использования VK из БД + статусы
+    telegram_usage_final = {} # Итоговая статистика использования Telegram из БД + статусы
+
     try:
         async with pool.acquire() as conn:
+            # --- Получаем общую статистику и список пользователей/аккаунтов из БД ---
+
             # Статистика по Telegram аккаунтам
             telegram_stats_by_status = await conn.fetch('''
-                SELECT 
-                    status, 
-                    COUNT(*) as count, 
-                    AVG(requests_count) as avg_requests,
-                    MAX(requests_count) as max_requests,
-                    MIN(requests_count) as min_requests
-                FROM telegram_accounts 
-                GROUP BY status
+                SELECT status, COUNT(*) as count, AVG(requests_count) as avg_requests,
+                       MAX(requests_count) as max_requests, MIN(requests_count) as min_requests
+                FROM telegram_accounts GROUP BY status
             ''')
-            
-            # Рассчитываем общее количество аккаунтов Telegram
-            total_tg_accounts = await conn.fetchval('''
-                SELECT COUNT(*) FROM telegram_accounts
-            ''')
-            
-            # Рассчитываем количество активных аккаунтов Telegram
-            active_tg_accounts = await conn.fetchval('''
-                SELECT COUNT(*) FROM telegram_accounts WHERE status = 'active'
-            ''')
-            
-            # Преобразуем результаты в список словарей и добавляем общую информацию
-            telegram_stats = [dict(row) for row in telegram_stats_by_status]
+            total_tg_accounts = await conn.fetchval('SELECT COUNT(*) FROM telegram_accounts')
+            # Используем is_active для подсчета активных
+            active_tg_accounts = await conn.fetchval("SELECT COUNT(*) FROM telegram_accounts WHERE is_active = TRUE")
             telegram_stats_dict = {
-                "status_breakdown": telegram_stats,
+                "status_breakdown": [dict(row) for row in telegram_stats_by_status],
                 "total": total_tg_accounts or 0,
                 "active": active_tg_accounts or 0
             }
-            
+
             # Статистика по VK аккаунтам
             vk_stats_by_status = await conn.fetch('''
-                SELECT 
-                    status, 
-                    COUNT(*) as count,
-                    AVG(requests_count) as avg_requests,
-                    MAX(requests_count) as max_requests,
-                    MIN(requests_count) as min_requests
-                FROM vk_accounts 
-                GROUP BY status
+                SELECT status, COUNT(*) as count, AVG(requests_count) as avg_requests,
+                       MAX(requests_count) as max_requests, MIN(requests_count) as min_requests
+                FROM vk_accounts GROUP BY status
             ''')
-            
-            # Рассчитываем общее количество аккаунтов VK
-            total_vk_accounts = await conn.fetchval('''
-                SELECT COUNT(*) FROM vk_accounts
-            ''')
-            
-            # Рассчитываем количество активных аккаунтов VK
-            active_vk_accounts = await conn.fetchval('''
-                SELECT COUNT(*) FROM vk_accounts WHERE status = 'active'
-            ''')
-            
-            # Преобразуем результаты в список словарей и добавляем общую информацию
-            vk_stats = [dict(row) for row in vk_stats_by_status]
+            total_vk_accounts = await conn.fetchval('SELECT COUNT(*) FROM vk_accounts')
+             # Используем is_active для подсчета активных
+            active_vk_accounts = await conn.fetchval("SELECT COUNT(*) FROM vk_accounts WHERE is_active = TRUE")
             vk_stats_dict = {
-                "status_breakdown": vk_stats,
+                "status_breakdown": [dict(row) for row in vk_stats_by_status],
                 "total": total_vk_accounts or 0,
                 "active": active_vk_accounts or 0
             }
-            
-            # Получаем статистику по пользователям с их аккаунтами
-            users_data = await conn.fetch('''
-                SELECT 
-                    u.username,
-                    u.api_key,
-                    COUNT(t.id) as telegram_count,
-                    COUNT(v.id) as vk_count,
-                    COALESCE(SUM(t.requests_count), 0) as telegram_requests,
-                    COALESCE(SUM(v.requests_count), 0) as vk_requests
-                FROM users u
-                LEFT JOIN telegram_accounts t ON u.api_key = t.user_api_key
-                LEFT JOIN vk_accounts v ON u.api_key = v.user_api_key
-                GROUP BY u.api_key, u.username
-            ''')
-            
-            # Преобразуем результаты в список словарей
-            users_basic = [dict(row) for row in users_data]
-            
-            # Для каждого пользователя получаем подробную информацию об его аккаунтах
-            detailed_users = []
-            for user in users_basic:
-                user_api_key = user["api_key"]
-                
-                # Получаем Telegram аккаунты пользователя
-                tg_accounts = await conn.fetch('''
-                    SELECT 
-                        id, 
-                        phone, 
-                        status, 
-                        requests_count, 
-                        last_request_time
-                    FROM telegram_accounts 
-                    WHERE user_api_key = $1
+
+            # Получаем всех пользователей
+            users_records = await conn.fetch('SELECT api_key, username FROM users')
+
+            # Для каждого пользователя получаем подробную информацию об его аккаунтах из БД
+            for user_record in users_records:
+                user_api_key = user_record["api_key"]
+                username = user_record["username"]
+
+                # --- Получаем и обрабатываем Telegram аккаунты пользователя из БД ---
+                tg_accounts_db = await conn.fetch('''
+                    SELECT id, phone, status, requests_count, last_used, is_active, added_at, proxy, api_id, api_hash
+                    FROM telegram_accounts WHERE user_api_key = $1 ORDER BY added_at DESC
                 ''', user_api_key)
 
-                # Получаем VK аккаунты пользователя
-                vk_accounts = await conn.fetch('''
-                    SELECT 
-                        id, 
-                        user_id, 
-                        user_name, 
-                        status, 
-                        requests_count, 
-                        last_request_time
-                    FROM vk_accounts 
-                    WHERE user_api_key = $1
+                user_tg_accounts_list = []
+                for acc_tg_db in tg_accounts_db:
+                    acc_tg_dict = dict(acc_tg_db)
+                    acc_id_tg = acc_tg_dict['id']
+
+                    # Получаем оперативные статусы из пула Telegram
+                    connected_tg = False
+                    auth_status_tg = 'unknown'
+                    degraded_mode_tg = False
+                    if telegram_pool:
+                        pool_stats_tg = telegram_pool.get_client_usage_stats(acc_id_tg)
+                        if pool_stats_tg:
+                            connected_tg = pool_stats_tg.get('connected', False)
+                            auth_status_tg = pool_stats_tg.get('auth_status', 'unknown')
+                            if auth_status_tg is True: auth_status_tg = 'authorized'
+                            elif auth_status_tg is False: auth_status_tg = 'not_authorized'
+                            elif auth_status_tg is None: auth_status_tg = 'unknown'
+                        degraded_mode_tg = telegram_pool.degraded_mode_status.get(str(acc_id_tg), False)
+
+                    # Форматируем last_used из БД
+                    last_used_dt_tg = acc_tg_dict.get('last_used')
+                    last_used_str_tg = last_used_dt_tg.isoformat() if isinstance(last_used_dt_tg, datetime) else None
+
+                    # Собираем информацию для usage и для списка пользователя
+                    usage_info_tg = {
+                        "id": acc_id_tg,
+                        "user_api_key": user_api_key, # Добавляем api_key для удобства
+                        "username": username,
+                        "phone": acc_tg_dict.get('phone'),
+                        "api_id": acc_tg_dict.get('api_id'),
+                        "api_hash": maskToken(acc_tg_dict.get('api_hash')),
+                        "proxy": acc_tg_dict.get('proxy'),
+                        "status": acc_tg_dict.get('status'), # Статус из БД
+                        "is_active": acc_tg_dict.get('is_active'),
+                        "added_at": acc_tg_dict.get('added_at'),
+                        "usage_count": acc_tg_dict.get('requests_count', 0), # Статистика из БД
+                        "last_used": last_used_str_tg, # Статистика из БД
+                        "connected": connected_tg, # Статус из пула
+                        "auth_status": auth_status_tg, # Статус из пула
+                        "degraded_mode": degraded_mode_tg # Статус из пула
+                    }
+                    user_tg_accounts_list.append(usage_info_tg)
+                    telegram_usage_final[acc_id_tg] = usage_info_tg # Добавляем в общий словарь usage
+
+                # --- Получаем и обрабатываем VK аккаунты пользователя из БД ---
+                vk_accounts_db = await conn.fetch('''
+                    SELECT id, user_id, user_name, status, requests_count, last_used, is_active, added_at, proxy, token
+                    FROM vk_accounts WHERE user_api_key = $1 ORDER BY added_at DESC
                 ''', user_api_key)
-                
-                # Формируем полную информацию о пользователе
-                user_info = {
-                    "username": user["username"],
+
+                user_vk_accounts_list = []
+                for acc_vk_db in vk_accounts_db:
+                    acc_vk_dict = dict(acc_vk_db)
+                    acc_id_vk = acc_vk_dict['id']
+
+                    # Расшифровываем токен VK перед маскировкой
+                    decrypted_token_vk = None
+                    encrypted_token_str_vk = acc_vk_dict.get('token')
+                    if encrypted_token_str_vk:
+                        try:
+                            # Используем cipher из user_manager
+                            decrypted_token_vk = user_manager.cipher.decrypt(encrypted_token_str_vk.encode()).decode()
+                        except Exception as decrypt_err:
+                            logger.warning(f"Не удалось расшифровать токен VK для {acc_id_vk}: {decrypt_err}")
+                            decrypted_token_vk = "[Ошибка расшифровки]"
+
+                    # Получаем статус деградации из пула VK
+                    degraded_mode_vk = False
+                    if vk_pool:
+                        client_vk = vk_pool.get_client(acc_id_vk)
+                        if client_vk and hasattr(client_vk, 'degraded_mode'):
+                            degraded_mode_vk = client_vk.degraded_mode
+
+                    # Форматируем last_used из БД
+                    last_used_dt_vk = acc_vk_dict.get('last_used')
+                    last_used_str_vk = last_used_dt_vk.isoformat() if isinstance(last_used_dt_vk, datetime) else None
+
+                    # Собираем информацию для usage и для списка пользователя
+                    usage_info_vk = {
+                        "id": acc_id_vk,
+                        "user_api_key": user_api_key, # Добавляем api_key для удобства
+                        "username": username,
+                        "user_name": acc_vk_dict.get('user_name'), # Имя аккаунта VK
+                        "token": maskToken(decrypted_token_vk), # Маскируем расшифрованный токен
+                        "proxy": acc_vk_dict.get('proxy'),
+                        "status": acc_vk_dict.get('status'),
+                        "is_active": acc_vk_dict.get('is_active'),
+                        "added_at": acc_vk_dict.get('added_at'),
+                        "usage_count": acc_vk_dict.get('requests_count', 0), # Статистика из БД
+                        "last_used": last_used_str_vk, # Статистика из БД
+                        "degraded_mode": degraded_mode_vk # Статус из пула
+                    }
+                    user_vk_accounts_list.append(usage_info_vk)
+                    vk_usage_final[acc_id_vk] = usage_info_vk # Добавляем в общий словарь usage
+
+                # Собираем информацию по пользователю для users
+                detailed_users.append({
+                    "username": username,
                     "api_key": user_api_key,
-                    "telegram_count": user["telegram_count"],
-                    "vk_count": user["vk_count"],
-                    "telegram_requests": user["telegram_requests"],
-                    "vk_requests": user["vk_requests"],
-                    "telegram_accounts": [dict(acc) for acc in tg_accounts],
-                    "vk_accounts": [dict(acc) for acc in vk_accounts]
-                }
-                
-                detailed_users.append(user_info)
-                
+                    "telegram_count": len(user_tg_accounts_list),
+                    "vk_count": len(user_vk_accounts_list),
+                    "telegram_requests": sum(a.get('usage_count', 0) for a in user_tg_accounts_list),
+                    "vk_requests": sum(a.get('usage_count', 0) for a in user_vk_accounts_list),
+                    "telegram_accounts": user_tg_accounts_list, # Полные данные аккаунта
+                    "vk_accounts": user_vk_accounts_list # Полные данные аккаунта
+                })
+
     except Exception as e:
-        logger.error(f"Ошибка при получении статистики аккаунтов: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Ошибка при получении статистики аккаунтов из БД: {e}", exc_info=True)
         raise HTTPException(500, "Ошибка при получении статистики аккаунтов")
-    
-    # Статистика по использованию клиентов из пула
-    try:
-        # Используем метод get_clients_usage_statistics для VK клиентов
-        vk_usage = vk_pool.get_clients_usage_statistics()
-    except Exception as e:
-        logger.error(f"Ошибка при получении статистики VK клиентов: {e}")
-        # Используем старый способ, если метод недоступен
-        vk_usage = {
-            account_id: {
-                "usage_count": count,
-                "last_used": vk_pool.last_used.get(account_id, 0)
-            } for account_id, count in vk_pool.usage_counts.items()
-        }
-    
-    # Для Telegram клиентов формируем статистику с информацией о подключении
-    try:
-        # Пробуем использовать новый метод get_clients_usage_statistics для Telegram пула
-        if hasattr(telegram_pool, 'get_clients_usage_statistics'):
-            telegram_usage = telegram_pool.get_clients_usage_statistics()
-        else:
-            # Используем старый способ
-            telegram_usage = {
-                account_id: {
-                    "usage_count": count,
-                    "last_used": telegram_pool.last_used.get(account_id, 0),
-                    "connected": account_id in telegram_pool.connected_clients
-                } for account_id, count in telegram_pool.usage_counts.items()
-            }
-    except Exception as e:
-        logger.error(f"Ошибка при получении статистики Telegram клиентов: {e}")
-        telegram_usage = {}
-    
-    # В PostgreSQL мы не закрываем соединение, так как оно возвращается в пул
-    
+
+    # Собираем итоговый ответ
     return {
         "telegram": {
             "stats_by_status": telegram_stats_dict,
-            "usage": telegram_usage,
-            "connected_count": len(telegram_pool.connected_clients)
+            "usage": telegram_usage_final # Используем данные, сформированные из БД + статусы пула
         },
         "vk": {
             "stats_by_status": vk_stats_dict,
-            "usage": vk_usage
+            "usage": vk_usage_final # Используем данные, сформированные из БД + статусы пула
         },
-        "users": detailed_users,
+        "users": detailed_users, # Здесь уже есть вся детальная информация, включая usage
         "timestamp": time.time()
     }
 
@@ -3846,56 +3873,90 @@ async def update_proxy(request: Request):
 # Добавляем эндпоинт для ручного сброса и проверки статистики аккаунтов (только для админов)
 @app.post("/admin/accounts/reset-stats")
 async def reset_accounts_stats(request: Request):
-    """Ручной сброс статистики и режима пониженной производительности для всех аккаунтов."""
+    """
+    Ручной сброс статистики в Redis и режима пониженной производительности
+    для ВСЕХ аккаунтов, находящихся в данный момент в пулах.
+    """
     # Проверяем админ-ключ
     admin_key = request.headers.get("X-Admin-Key")
     if not admin_key or not await verify_admin_key(admin_key):
         raise HTTPException(status_code=401, detail="Неверный admin ключ")
-    
-    try:
-        reset_counts = 0
-        reset_degraded = 0
-        
-        # Сбрасываем статистику для VK аккаунтов в памяти
-        if vk_pool:
-            for account_id in list(vk_pool.usage_counts.keys()):
-                if vk_pool.usage_counts.get(account_id, 0) > 0:
-                    vk_pool.usage_counts[account_id] = 0
-                    reset_counts += 1
-                
-                client = vk_pool.get_client(account_id)
+
+    reset_counts = {"telegram": 0, "vk": 0}
+    reset_degraded = {"telegram": 0, "vk": 0}
+    errors = []
+
+    # --- Сброс для VK ---
+    if vk_pool:
+        vk_account_ids = list(vk_pool.clients.keys())
+        logger.info(f"Сброс статистики и degraded_mode для {len(vk_account_ids)} VK клиентов в пуле...")
+        tasks_reset = [reset_account_stats_redis(acc_id, 'vk') for acc_id in vk_account_ids]
+        results_reset = await asyncio.gather(*tasks_reset, return_exceptions=True)
+
+        for i, result in enumerate(results_reset):
+            acc_id = vk_account_ids[i]
+            if isinstance(result, Exception):
+                error_msg = f"Ошибка сброса Redis стат. для VK {acc_id}: {result}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+            elif result is True:
+                reset_counts["vk"] += 1
+                # Сбрасываем degraded_mode для клиента в пуле
+                client = vk_pool.get_client(acc_id)
                 if client and hasattr(client, 'set_degraded_mode'):
+                    # Проверяем, был ли он вообще включен, чтобы точно посчитать сброшенные
+                    if client.degraded_mode:
+                        reset_degraded["vk"] += 1
                     client.set_degraded_mode(False)
-                    reset_degraded += 1
-        
-        # Сбрасываем статистику для Telegram аккаунтов в памяти
-        if telegram_pool:
-            for account_id in list(telegram_pool.usage_counts.keys()):
-                if telegram_pool.usage_counts.get(account_id, 0) > 0:
-                    telegram_pool.usage_counts[account_id] = 0
-                    reset_counts += 1
-                
-                client = telegram_pool.get_client(account_id)
-                if client and hasattr(client, 'set_degraded_mode'):
-                    client.set_degraded_mode(False)
-                    reset_degraded += 1
-        
-        # Сбрасываем статистику в Redis и синхронизируем с базой данных
-        await reset_all_account_stats()
-        
-        # Логируем результаты
-        logger.info(f"Сброшена статистика для всех аккаунтов")
-        logger.info(f"Отключен режим пониженной производительности для {reset_degraded} аккаунтов")
-        
-        return {
-            "status": "success",
-            "reset_count": reset_counts,
-            "reset_degraded": reset_degraded,
-            "message": f"Сброшена статистика для всех аккаунтов, отключен режим пониженной производительности для {reset_degraded} аккаунтов"
-        }
-    except Exception as e:
-        logger.error(f"Ошибка при сбросе статистики аккаунтов: {e}")
-        raise HTTPException(500, f"Ошибка при сбросе статистики: {str(e)}")
+            # else: result is False - ошибка логируется внутри reset_account_stats_redis
+
+    # --- Сброс для Telegram ---
+    if telegram_pool:
+        tg_account_ids = list(telegram_pool.clients.keys())
+        logger.info(f"Сброс статистики и degraded_mode для {len(tg_account_ids)} Telegram клиентов в пуле...")
+        tasks_reset_tg = [reset_account_stats_redis(acc_id, 'telegram') for acc_id in tg_account_ids]
+        results_reset_tg = await asyncio.gather(*tasks_reset_tg, return_exceptions=True)
+
+        for i, result in enumerate(results_reset_tg):
+            acc_id = tg_account_ids[i]
+            if isinstance(result, Exception):
+                error_msg = f"Ошибка сброса Redis стат. для Telegram {acc_id}: {result}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+            elif result is True:
+                reset_counts["telegram"] += 1
+                # Сбрасываем degraded_mode через метод пула
+                # Проверяем, был ли он включен
+                if telegram_pool.degraded_mode_status.get(str(acc_id), False):
+                    reset_degraded["telegram"] += 1
+                telegram_pool.set_degraded_mode(acc_id, False)
+            # else: result is False
+
+    # Формируем ответ
+    total_reset_count = reset_counts["vk"] + reset_counts["telegram"]
+    total_reset_degraded = reset_degraded["vk"] + reset_degraded["telegram"]
+    message = f"Статистика в Redis сброшена для {total_reset_count} аккаунтов ({reset_counts['vk']} VK, {reset_counts['telegram']} TG). Режим деградации отключен для {total_reset_degraded} аккаунтов ({reset_degraded['vk']} VK, {reset_degraded['telegram']} TG)."
+
+    if errors:
+        logger.warning(f"Запрос на сброс статистики завершен с ошибками: {errors}")
+        return JSONResponse(
+            status_code=207, # Multi-Status
+            content={
+                "status": "partial_success",
+                "message": message + " Возникли ошибки.",
+                "reset_counts": reset_counts,
+                "reset_degraded": reset_degraded,
+                "errors": errors
+            }
+        )
+
+    logger.info(message)
+    return {
+        "status": "success",
+        "reset_counts": reset_counts,
+        "reset_degraded": reset_degraded,
+        "message": message
+    }
 
 @app.get("/health")
 async def health_check():

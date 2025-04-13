@@ -1815,39 +1815,46 @@ async function checkAccountStatus(platform, accountId) {
 async function displayAccountsStats() {
     console.log("Загрузка статистики аккаунтов...");
     const statsContainer = document.getElementById('accountsStatsContainer');
-    
+
     if (!statsContainer) {
         console.error("Контейнер для статистики не найден");
         return;
     }
-    
+
     statsContainer.innerHTML = `
         <div class="loading">
             <i class="fas fa-spinner fa-spin"></i>
             <p>Загрузка статистики...</p>
         </div>
     `;
-    
+
     const adminKey = getAdminKey();
     if (!adminKey) {
         window.location.href = '/login';
         return;
     }
-    
+
     try {
         const response = await fetch('/api/admin/accounts/stats/detailed', {
             headers: {
-                'Authorization': `Bearer ${adminKey}`
+                'Authorization': `Bearer ${adminKey}` // Используем Bearer токен
             }
         });
-        
+
         if (!response.ok) {
-            throw new Error(`Ошибка HTTP: ${response.status}`);
+             let errorDetail = `Ошибка HTTP: ${response.status}`;
+             try {
+                 const errorData = await response.json();
+                 errorDetail = errorData.detail || errorDetail;
+             } catch (e) {}
+            throw new Error(errorDetail);
         }
-        
+
         const stats = await response.json();
         console.log("Получены данные статистики:", stats);
-        
+
+        // ------ НАЧАЛО ИСПРАВЛЕНИЙ ------
+
         // Форматируем данные и отображаем статистику
         let html = `
             <div class="stats-summary">
@@ -1861,17 +1868,17 @@ async function displayAccountsStats() {
                                 <span class="stats-value">${stats.telegram?.stats_by_status?.total || 0}</span>
                             </div>
                             <div class="stats-item">
-                                <span class="stats-label">Активные:</span>
+                                <span class="stats-label">Активные (в БД):</span>
                                 <span class="stats-value">${stats.telegram?.stats_by_status?.active || 0}</span>
                             </div>
                             <div class="stats-item">
-                                <span class="stats-label">Подключено:</span>
-                                <span class="stats-value">${stats.telegram?.connected_count || 0}</span>
+                                <span class="stats-label">Подключено (сейчас):</span>
+                                <span class="stats-value">${Object.values(stats.telegram?.usage || {}).filter(acc => acc.connected).length}</span>
                             </div>
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="stats-card">
                     <div class="stats-icon"><i class="fab fa-vk"></i></div>
                     <div class="stats-data">
@@ -1882,13 +1889,13 @@ async function displayAccountsStats() {
                                 <span class="stats-value">${stats.vk?.stats_by_status?.total || 0}</span>
                             </div>
                             <div class="stats-item">
-                                <span class="stats-label">Активные:</span>
+                                <span class="stats-label">Активные (в БД):</span>
                                 <span class="stats-value">${stats.vk?.stats_by_status?.active || 0}</span>
                             </div>
-                        </div>
+                            </div>
                     </div>
                 </div>
-                
+
                 <div class="stats-card">
                     <div class="stats-icon"><i class="fas fa-users"></i></div>
                     <div class="stats-data">
@@ -1902,150 +1909,107 @@ async function displayAccountsStats() {
                     </div>
                 </div>
             </div>
-            
+
             <div class="stats-tables">
                 <div class="stats-section">
-                    <h3><i class="fab fa-telegram"></i> Статистика аккаунтов Telegram</h3>
+                    <h3><i class="fab fa-telegram"></i> Статистика использования Telegram</h3>
                     <table class="stats-table">
                         <thead>
                             <tr>
                                 <th>Пользователь</th>
-                                <th>Аккаунт</th>
-                                <th>Статус</th>
+                                <th>Телефон</th>
+                                <th>Статус (БД)</th>
+                                <th>Статус (Пул)</th>
                                 <th>Запросы</th>
-                                <th>Последнее использование</th>
+                                <th>Последнее исп.</th>
                             </tr>
                         </thead>
                         <tbody>
         `;
-        
-        // Добавляем строки для Telegram аккаунтов
-        if (stats.users && stats.users.length > 0) {
-            let hasTelegramAccounts = false;
-            
-            for (const user of stats.users) {
-                const username = user.username || 'Без имени';
-                
-                if (user.telegram_accounts && user.telegram_accounts.length > 0) {
-                    hasTelegramAccounts = true;
-                    
-                    for (const account of user.telegram_accounts) {
-                        const accountName = account.phone || 'Неизвестный';
-                        const status = getStatusText(account.status);
-                        const statusClass = account.status === 'active' ? 'active' : 'inactive';
-                        const requests = account.requests_count || 0;
-                        
-                        // Форматирование времени последнего использования
-                        let lastUsed = "Не использовался";
-                        if (account.last_request_time) {
-                            const date = new Date(account.last_request_time * 1000);
-                            lastUsed = date.toLocaleString();
-                        }
-                        
-                        html += `
-                            <tr>
-                                <td>${username}</td>
-                                <td>${accountName}</td>
-                                <td><span class="status-badge ${statusClass}">${status}</span></td>
-                                <td>${requests}</td>
-                                <td>${lastUsed}</td>
-                            </tr>
-                        `;
-                    }
-                }
-            }
-            
-            if (!hasTelegramAccounts) {
+
+        // ИСПОЛЬЗУЕМ stats.telegram.usage для построения таблицы
+        if (stats.telegram?.usage && Object.keys(stats.telegram.usage).length > 0) {
+            // Сортируем аккаунты по ID или другому полю при необходимости
+            const sortedTgAccounts = Object.values(stats.telegram.usage).sort((a, b) => (a.added_at || '').localeCompare(b.added_at || ''));
+
+            for (const account of sortedTgAccounts) {
+                const username = account.username || 'N/A';
+                const accountName = account.phone || 'Неизвестный';
+                const dbStatus = getStatusText(account.status); // Статус из БД
+                const dbStatusClass = account.is_active ? 'active' : 'inactive';
+                const poolStatus = `Подкл: ${account.connected ? 'Да' : 'Нет'} / Авториз: ${account.auth_status} / Дегр: ${account.degraded_mode ? 'Да' : 'Нет'}`;
+                const requests = account.usage_count || 0;
+                const lastUsed = account.last_used ? new Date(account.last_used).toLocaleString() : 'Не исп.';
+
                 html += `
                     <tr>
-                        <td colspan="5" class="no-data">Нет аккаунтов Telegram</td>
+                        <td>${username}</td>
+                        <td>${accountName}</td>
+                        <td><span class="status-badge ${dbStatusClass}">${dbStatus}</span></td>
+                        <td>${poolStatus}</td>
+                        <td>${requests}</td>
+                        <td>${lastUsed}</td>
                     </tr>
                 `;
             }
         } else {
-            html += `
-                <tr>
-                    <td colspan="5" class="no-data">Нет данных</td>
-                </tr>
-            `;
+            html += `<tr><td colspan="6" class="no-data">Нет данных об использовании Telegram</td></tr>`;
         }
-        
+
         html += `
                     </tbody>
                 </table>
             </div>
-            
+
             <div class="stats-section">
-                <h3><i class="fab fa-vk"></i> Статистика аккаунтов VK</h3>
+                <h3><i class="fab fa-vk"></i> Статистика использования VK</h3>
                 <table class="stats-table">
                     <thead>
                         <tr>
                             <th>Пользователь</th>
-                            <th>Аккаунт</th>
-                            <th>Статус</th>
+                            <th>Имя (VK)</th>
+                            <th>Статус (БД)</th>
+                            <th>Статус (Пул)</th>
                             <th>Запросы</th>
-                            <th>Последнее использование</th>
+                            <th>Последнее исп.</th>
                         </tr>
                     </thead>
                     <tbody>
         `;
-        
-        // Добавляем строки для VK аккаунтов
-        if (stats.users && stats.users.length > 0) {
-            let hasVkAccounts = false;
-            
-            for (const user of stats.users) {
-                const username = user.username || 'Без имени';
-                
-                if (user.vk_accounts && user.vk_accounts.length > 0) {
-                    hasVkAccounts = true;
-                    
-                    for (const account of user.vk_accounts) {
-                        const accountName = account.user_name || 'ID: ' + (account.user_id || 'Неизвестный');
-                        const status = getStatusText(account.status);
-                        const statusClass = account.status === 'active' ? 'active' : 'inactive';
-                        const requests = account.requests_count || 0;
-                        
-                        // Форматирование времени последнего использования
-                        let lastUsed = "Не использовался";
-                        if (account.last_request_time) {
-                            const date = new Date(account.last_request_time * 1000);
-                            lastUsed = date.toLocaleString();
-                        }
-                        
-                        html += `
-                            <tr>
-                                <td>${username}</td>
-                                <td>${accountName}</td>
-                                <td><span class="status-badge ${statusClass}">${status}</span></td>
-                                <td>${requests}</td>
-                                <td>${lastUsed}</td>
-                            </tr>
-                        `;
-                    }
-                }
-            }
-            
-            if (!hasVkAccounts) {
+
+        // ИСПОЛЬЗУЕМ stats.vk.usage для построения таблицы
+        if (stats.vk?.usage && Object.keys(stats.vk.usage).length > 0) {
+            const sortedVkAccounts = Object.values(stats.vk.usage).sort((a, b) => (a.added_at || '').localeCompare(b.added_at || ''));
+
+            for (const account of sortedVkAccounts) {
+                const username = account.username || 'N/A';
+                const accountName = account.user_name || `ID: ${account.id.substring(0, 8)}`;
+                const dbStatus = getStatusText(account.status);
+                const dbStatusClass = account.is_active ? 'active' : 'inactive';
+                const poolStatus = `Дегр: ${account.degraded_mode ? 'Да' : 'Нет'}`;
+                const requests = account.usage_count || 0;
+                const lastUsed = account.last_used ? new Date(account.last_used).toLocaleString() : 'Не исп.';
+
                 html += `
                     <tr>
-                        <td colspan="5" class="no-data">Нет аккаунтов VK</td>
+                        <td>${username}</td>
+                        <td>${accountName}</td>
+                        <td><span class="status-badge ${dbStatusClass}">${dbStatus}</span></td>
+                        <td>${poolStatus}</td>
+                        <td>${requests}</td>
+                        <td>${lastUsed}</td>
                     </tr>
                 `;
             }
         } else {
-            html += `
-                <tr>
-                    <td colspan="5" class="no-data">Нет данных</td>
-                </tr>
-            `;
+            html += `<tr><td colspan="6" class="no-data">Нет данных об использовании VK</td></tr>`;
         }
-        
+
         html += `
                     </tbody>
                 </table>
             </div>
-            
+
             <div class="stats-section">
                 <h3><i class="fas fa-users"></i> Статистика по пользователям</h3>
                 <table class="stats-table">
@@ -2054,20 +2018,20 @@ async function displayAccountsStats() {
                             <th>Пользователь</th>
                             <th>Аккаунтов Telegram</th>
                             <th>Аккаунтов VK</th>
-                            <th>Всего запросов</th>
+                            <th>Всего запросов (БД)</th>
                         </tr>
                     </thead>
                     <tbody>
         `;
-        
-        // Добавляем строки для пользователей
+
+        // Используем stats.users для этой таблицы
         if (stats.users && stats.users.length > 0) {
             for (const user of stats.users) {
-                const username = user.username || 'Без имени';
+                const username = user.username || 'N/A';
                 const telegramCount = user.telegram_count || 0;
                 const vkCount = user.vk_count || 0;
                 const totalRequests = (user.telegram_requests || 0) + (user.vk_requests || 0);
-                
+
                 html += `
                     <tr>
                         <td>${username}</td>
@@ -2078,20 +2042,16 @@ async function displayAccountsStats() {
                 `;
             }
         } else {
-            html += `
-                <tr>
-                    <td colspan="4" class="no-data">Нет данных</td>
-                </tr>
-            `;
+            html += `<tr><td colspan="4" class="no-data">Нет данных</td></tr>`;
         }
-        
+
         html += `
                     </tbody>
                 </table>
             </div>
-            
+
             <div class="stats-section">
-                <h3><i class="fas fa-chart-area"></i> Статистика по статусам</h3>
+                <h3><i class="fas fa-chart-area"></i> Статистика по статусам (из БД)</h3>
                 <div class="stats-subsection">
                     <h4><i class="fab fa-telegram"></i> Telegram</h4>
                     <table class="stats-table">
@@ -2106,20 +2066,26 @@ async function displayAccountsStats() {
                         </thead>
                         <tbody>
         `;
-        
-        // Добавляем строки для статусов Telegram
+
+        // Используем stats.telegram.stats_by_status
         if (stats.telegram?.stats_by_status?.status_breakdown && stats.telegram.stats_by_status.status_breakdown.length > 0) {
             for (const status_stat of stats.telegram.stats_by_status.status_breakdown) {
-                const status = getStatusText(status_stat.status);
-                const statusClass = status_stat.status === 'active' ? 'active' : 'inactive';
+                const statusText = getStatusText(status_stat.status);
+                // Используем 'active'/'inactive' классы в зависимости от самого статуса, если возможно
+                let statusClass = 'inactive';
+                if (status_stat.status && status_stat.status.toLowerCase() === 'active') {
+                    statusClass = 'active';
+                } else if (status_stat.status && status_stat.status.toLowerCase().includes('error')) {
+                     statusClass = 'error'; // Можно добавить стиль для ошибок
+                }
                 const count = status_stat.count || 0;
                 const avgRequests = Math.round((status_stat.avg_requests || 0) * 100) / 100;
                 const maxRequests = status_stat.max_requests || 0;
                 const minRequests = status_stat.min_requests || 0;
-                
+
                 html += `
                     <tr>
-                        <td><span class="status-badge ${statusClass}">${status}</span></td>
+                        <td><span class="status-badge ${statusClass}">${statusText}</span></td>
                         <td>${count}</td>
                         <td>${avgRequests}</td>
                         <td>${maxRequests}</td>
@@ -2128,18 +2094,14 @@ async function displayAccountsStats() {
                 `;
             }
         } else {
-            html += `
-                <tr>
-                    <td colspan="5" class="no-data">Нет данных</td>
-                </tr>
-            `;
+            html += `<tr><td colspan="5" class="no-data">Нет данных</td></tr>`;
         }
-        
+
         html += `
                     </tbody>
                 </table>
             </div>
-            
+
             <div class="stats-subsection">
                 <h4><i class="fab fa-vk"></i> VK</h4>
                 <table class="stats-table">
@@ -2154,20 +2116,25 @@ async function displayAccountsStats() {
                     </thead>
                     <tbody>
         `;
-        
-        // Добавляем строки для статусов VK
+
+        // Используем stats.vk.stats_by_status
         if (stats.vk?.stats_by_status?.status_breakdown && stats.vk.stats_by_status.status_breakdown.length > 0) {
             for (const status_stat of stats.vk.stats_by_status.status_breakdown) {
-                const status = getStatusText(status_stat.status);
-                const statusClass = status_stat.status === 'active' ? 'active' : 'inactive';
+                const statusText = getStatusText(status_stat.status);
+                let statusClass = 'inactive';
+                 if (status_stat.status && status_stat.status.toLowerCase() === 'active') {
+                     statusClass = 'active';
+                 } else if (status_stat.status && status_stat.status.toLowerCase().includes('error')) {
+                      statusClass = 'error';
+                 }
                 const count = status_stat.count || 0;
                 const avgRequests = Math.round((status_stat.avg_requests || 0) * 100) / 100;
                 const maxRequests = status_stat.max_requests || 0;
                 const minRequests = status_stat.min_requests || 0;
-                
+
                 html += `
                     <tr>
-                        <td><span class="status-badge ${statusClass}">${status}</span></td>
+                        <td><span class="status-badge ${statusClass}">${statusText}</span></td>
                         <td>${count}</td>
                         <td>${avgRequests}</td>
                         <td>${maxRequests}</td>
@@ -2176,29 +2143,28 @@ async function displayAccountsStats() {
                 `;
             }
         } else {
-            html += `
-                <tr>
-                    <td colspan="5" class="no-data">Нет данных</td>
-                </tr>
-            `;
+            html += `<tr><td colspan="5" class="no-data">Нет данных</td></tr>`;
         }
-        
+
         html += `
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
-        </div>
+        </div> <!-- End of stats-tables -->
         `;
-        
+
+        // ------ КОНЕЦ ИСПРАВЛЕНИЙ ------
+
         statsContainer.innerHTML = html;
-        
+
         // Добавляем время последнего обновления
         const updateTime = new Date().toLocaleString();
         const updateTimeElem = document.createElement('div');
         updateTimeElem.className = 'update-time';
         updateTimeElem.innerHTML = `<i class="fas fa-sync"></i> Последнее обновление: ${updateTime}`;
         statsContainer.appendChild(updateTimeElem);
-        
+
     } catch (error) {
         console.error('Ошибка при загрузке статистики:', error);
         statsContainer.innerHTML = `

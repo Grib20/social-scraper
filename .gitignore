@@ -79,4 +79,9 @@ token.pickle
 config.local.json
 
 # S3 File Cache
-s3_file_cache.pkl 
+s3_file_cache.pkl
+
+# Redis
+redis-server.log
+redis-server.log.1
+redis-server.log.2
