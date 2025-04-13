@@ -4006,7 +4006,7 @@ async def health_check():
         
         # Проверка Redis, если доступен
         if redis_client:
-            if redis_client.ping():
+            if await redis_client.ping():
                 redis_status = "ok"
         
         # Если база данных недоступна, возвращаем ошибку
