@@ -1042,12 +1042,19 @@ function showTelegramModal(userId) {
         form.appendChild(hiddenField);
     }
     
-    // Сбрасываем состояние модального окна
-    resetTelegramModal();
+    // Сбрасываем состояние модального окна ВЕРСИЕЙ из admin.js
+    resetTelegramModalToAddState(userId); // <--- ИЗМЕНЕНИЕ ЗДЕСЬ
     
     // Показываем модальное окно
     document.getElementById('telegramModal').style.display = 'block';
-    document.getElementById('api_id').focus();
+    // Фокус на первое поле, которое должно быть видимым
+    const apiIdInput = document.getElementById('api_id');
+    if (apiIdInput && apiIdInput.closest('.form-group').style.display !== 'none') {
+        apiIdInput.focus();
+    } else {
+         // Если api_id скрыт (не должно быть при добавлении), фокус на номер
+         document.getElementById('phone').focus();
+    }
 }
 
 function showVkModal(userId) {
