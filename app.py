@@ -81,6 +81,18 @@ telegram_pool = TelegramClientPool()
 vk_pool = VKClientPool()
 logger.info("Пулы клиентов созданы.")
 
+# --- ДОБАВЛЕННЫЙ КОД ЛОГИРОВАНИЯ ---
+logger.info(f"--- Debug /admin route ---")
+logger.info(f"Request URL: {request.url}")
+logger.info(f"Request Scheme: {request.url.scheme}")
+logger.info(f"Request Base URL: {request.base_url}")
+logger.info(f"Request Headers:")
+# Используем request.headers.raw, чтобы увидеть оригинальный регистр заголовков
+for name, value in request.headers.raw:
+    logger.info(f"  {name.decode('latin-1')}: {value.decode('latin-1')}") # Декодируем байты заголовков
+logger.info(f"--- End Debug /admin route ---")
+# --- КОНЕЦ ЛОГИРОВАНИЯ ---
+
 
 # Инициализация секретов из Docker secrets или переменных окружения
 AWS_ACCESS_KEY_ID = read_docker_secret('aws_access_key') or os.getenv('AWS_ACCESS_KEY_ID')
@@ -425,10 +437,10 @@ async def admin_panel(request: Request):
     # Если ключа нет и в query параметрах, пытаемся получить из cookie
     if not admin_key:
         admin_key = request.cookies.get("admin_key")
-        
+
     if not admin_key or not await verify_admin_key(admin_key):
         return RedirectResponse(url="/login")
-    
+
     return templates.TemplateResponse(
         "admin_panel.html",
         get_base_context(request)
