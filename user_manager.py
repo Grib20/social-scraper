@@ -131,7 +131,12 @@ async def init_db(conn: asyncpg.Connection):
         phone_code_hash TEXT,
         is_active BOOLEAN DEFAULT TRUE, 
         request_limit INTEGER DEFAULT 1000,
-        last_used TIMESTAMPTZ
+        last_used TIMESTAMPTZ,
+        device_model TEXT,
+        system_version TEXT,
+        app_version TEXT,
+        lang_code TEXT,
+        system_lang_code TEXT
     )''')
     logger.info("Таблица 'telegram_accounts' проверена/создана.")
 
@@ -164,6 +169,11 @@ async def init_db(conn: asyncpg.Connection):
     await check_and_add_column(conn, "telegram_accounts", "is_active", "BOOLEAN DEFAULT TRUE")
     await check_and_add_column(conn, "telegram_accounts", "request_limit", "INTEGER DEFAULT 1000")
     await check_and_add_column(conn, "telegram_accounts", "last_used", "TIMESTAMPTZ")
+    await check_and_add_column(conn, "telegram_accounts", "device_model", "TEXT")
+    await check_and_add_column(conn, "telegram_accounts", "system_version", "TEXT")
+    await check_and_add_column(conn, "telegram_accounts", "app_version", "TEXT")
+    await check_and_add_column(conn, "telegram_accounts", "lang_code", "TEXT")
+    await check_and_add_column(conn, "telegram_accounts", "system_lang_code", "TEXT")
 
     await check_and_add_column(conn, "vk_accounts", "user_id", "BIGINT")
     await check_and_add_column(conn, "vk_accounts", "user_name", "TEXT")
@@ -387,8 +397,9 @@ async def add_telegram_account(api_key: str, account_data: Dict) -> Optional[str
     INSERT INTO telegram_accounts 
     (id, user_api_key, api_id, api_hash, phone, proxy, status, session_file,
                  requests_count, last_request_time, added_at, session_string, phone_code_hash, 
-                 is_active, request_limit, last_used)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                 is_active, request_limit, last_used,
+                 device_model, system_version, app_version, lang_code, system_lang_code)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
     ''', 
         account_id, 
         api_key, 
@@ -405,7 +416,12 @@ async def add_telegram_account(api_key: str, account_data: Dict) -> Optional[str
         account_data.get('phone_code_hash', ''),
         account_data.get('is_active', True), # is_active (Boolean)
         account_data.get('request_limit', 1000), # request_limit (INTEGER)
-        account_data.get('last_used') # last_used (TIMESTAMPTZ or None)
+        account_data.get('last_used'), # last_used (TIMESTAMPTZ or None)
+        account_data.get('device_model'),
+        account_data.get('system_version'),
+        account_data.get('app_version'),
+        account_data.get('lang_code'),
+        account_data.get('system_lang_code')
       )
             logger.info(f"Добавлен Telegram аккаунт {account_id} для пользователя {api_key}")
             return account_id 
@@ -450,8 +466,10 @@ async def update_telegram_account(api_key: str, account_id: str, account_data: D
                 UPDATE telegram_accounts 
                 SET api_id = $1, api_hash = $2, phone = $3, proxy = $4, status = $5, 
                     session_file = $6, session_string = $7, phone_code_hash = $8,
-                    is_active = $9, request_limit = $10, last_used = $11 
-                WHERE id = $12 AND user_api_key = $13
+                    is_active = $9, request_limit = $10, last_used = $11,
+                    device_model = $12, system_version = $13, app_version = $14, 
+                    lang_code = $15, system_lang_code = $16
+                WHERE id = $17 AND user_api_key = $18
             ''', 
                 account_data.get('api_id'), 
                 account_data.get('api_hash'),
@@ -464,6 +482,11 @@ async def update_telegram_account(api_key: str, account_id: str, account_data: D
                 account_data.get('is_active'), # Boolean or None
                 account_data.get('request_limit'), # Integer or None
                 account_data.get('last_used'), # TIMESTAMPTZ or None
+                account_data.get('device_model'),
+                account_data.get('system_version'),
+                account_data.get('app_version'),
+                account_data.get('lang_code'),
+                account_data.get('system_lang_code'),
                 account_id,
                 api_key
             )
@@ -1174,7 +1197,12 @@ async def save_users(users_dict: Dict) -> None:
                             account.get('phone_code_hash', ''),
                             account.get('is_active', True),
                             account.get('request_limit', 1000),
-                            account.get('last_used')
+                            account.get('last_used'),
+                            account.get('device_model'),
+                            account.get('system_version'),
+                            account.get('app_version'),
+                            account.get('lang_code'),
+                            account.get('system_lang_code')
                         ))
                     
                     if tg_accounts_to_insert:
@@ -1183,7 +1211,8 @@ async def save_users(users_dict: Dict) -> None:
                              records=tg_accounts_to_insert,
                              columns=['id', 'user_api_key', 'api_id', 'api_hash', 'phone', 'proxy', 'status', 'session_file',
                                       'requests_count', 'last_request_time', 'added_at', 'session_string', 'phone_code_hash',
-                                      'is_active', 'request_limit', 'last_used']
+                                      'is_active', 'request_limit', 'last_used',
+                                      'device_model', 'system_version', 'app_version', 'lang_code', 'system_lang_code']
                          ) 
             
                     # Вставляем аккаунты VK
@@ -1244,46 +1273,64 @@ async def save_users(users_dict: Dict) -> None:
         # Пул управляет соединением
 
 async def fix_vk_tokens():
-    """Асинхронно исправляет дважды зашифрованные токены VK в PostgreSQL."""
+    """Асинхронно проверяет токены VK в PostgreSQL:
+    - Шифрует незашифрованные токены (начинающиеся с 'vk1.a.', но вызывающие ошибку при расшифровке).
+    - Исправляет дважды зашифрованные токены.
+    """
     logger.info("Проверка и исправление токенов VK в PostgreSQL...")
-    count = 0
-    pool = None  
+    encrypted_count = 0
+    fixed_double_count = 0
+    pool = None
     try:
         pool = await get_db_connection()
         if not pool:
             logger.error("Не удалось получить пул соединений в fix_vk_tokens")
-            return 0  
+            return 0, 0 # Возвращаем два значения
 
         async with pool.acquire() as conn:
-            # Получаем все ID и токены
             rows = await conn.fetch("SELECT id, token FROM vk_accounts WHERE token IS NOT NULL")
 
             updates = []
             for record in rows:
-                acc_id, encrypted_token_str = record['id'], record['token']
-                if not encrypted_token_str: continue
-                
-                try:
-                    decrypted_once_bytes = cipher.decrypt(encrypted_token_str.encode())
-                    # Попытка второй расшифровки
-                    cipher.decrypt(decrypted_once_bytes)
-                    # Если вторая удалась, сохраняем результат первой
-                    updates.append((decrypted_once_bytes.decode(), acc_id))
-                    count += 1
-                except Exception:
-                    # Ошибка -> токен нормальный или поврежден, пропускаем
-                    continue
+                acc_id, token_str = record['id'], record['token']
+                if not token_str: continue
 
-            # Выполняем обновление в транзакции, если есть что обновлять
+                try:
+                    # 1. Пытаемся расшифровать токен
+                    decrypted_once_bytes = cipher.decrypt(token_str.encode())
+                    # Если успешно, проверяем на двойное шифрование
+                    try:
+                        cipher.decrypt(decrypted_once_bytes)
+                        # Если вторая расшифровка удалась -> токен был зашифрован дважды
+                        logger.warning(f"Найден дважды зашифрованный токен для аккаунта {acc_id}. Исправляем.")
+                        updates.append((decrypted_once_bytes.decode(), acc_id))
+                        fixed_double_count += 1
+                    except Exception:
+                        # Вторая расшифровка не удалась -> токен зашифрован нормально
+                        pass # Ничего не делаем
+                except Exception:
+                    # 2. Расшифровка не удалась -> токен НЕ зашифрован или поврежден
+                    # Проверяем, похож ли он на настоящий незашифрованный токен VK
+                    if isinstance(token_str, str) and token_str.startswith('vk1.a.'):
+                        logger.warning(f"Найден незашифрованный токен VK для аккаунта {acc_id}. Шифруем.")
+                        try:
+                            # Шифруем незашифрованный токен
+                            encrypted_token = cipher.encrypt(token_str.encode()).decode()
+                            updates.append((encrypted_token, acc_id))
+                            encrypted_count += 1
+                        except Exception as enc_err:
+                            logger.error(f"Ошибка шифрования ранее незашифрованного токена для {acc_id}: {enc_err}")
+                    else:
+                        # Токен не похож на 'vk1.a.' и не расшифровывается - пропускаем
+                        logger.warning(f"Найден некорректный/поврежденный токен для аккаунта {acc_id}. Пропускаем.")
+
             if updates:
                 async with conn.transaction():
-                     # Используем executemany для массового обновления
                     await conn.executemany("UPDATE vk_accounts SET token = $1 WHERE id = $2", updates)
-                logger.info(f"Успешно исправлено {len(updates)} дважды зашифрованных токенов VK.")
+                logger.info(f"Успешно зашифровано {encrypted_count} токенов и исправлено {fixed_double_count} дважды зашифрованных токенов VK.")
             else:
-                logger.info("Не найдено дважды зашифрованных токенов VK для исправления.")
+                logger.info("Не найдено незашифрованных или дважды зашифрованных токенов VK для исправления.")
 
-    # Обрабатываем специфичные ошибки PostgreSQL
     except asyncpg.exceptions.UndefinedTableError:
         logger.warning(f"Не удалось проверить токены VK: таблица 'vk_accounts' не найдена.")
     except asyncpg.PostgresError as e:
@@ -1296,10 +1343,8 @@ async def fix_vk_tokens():
         logger.error(f"Неожиданная ошибка при исправлении токенов VK: {e}")
         import traceback
         logger.error(traceback.format_exc())
-    # finally:
-        # Пул управляет соединением
 
-    return count
+    return encrypted_count, fixed_double_count # Возвращаем количество зашифрованных и исправленных
 
 if __name__ == "__main__":
     print("Инициализация структуры базы данных PostgreSQL...")
@@ -1308,19 +1353,20 @@ if __name__ == "__main__":
         pool = await get_db_pool() # Инициализация пула
         if not pool:
              logger.error("Не удалось создать пул соединений. Выход.")
-             return 
-             
+             return
+
         await initialize_database() # Инициализация схемы
-        
+
         # Вызываем fix_vk_tokens после инициализации
-        logger.info("Запуск исправления токенов VK...")
-        fixed_count = await fix_vk_tokens()
-        logger.info(f"Исправлено {fixed_count} токенов VK.")
-        
+        logger.info("Запуск проверки и исправления токенов VK...")
+        encrypted_count, fixed_double_count = await fix_vk_tokens() # Получаем оба значения
+        logger.info(f"Зашифровано {encrypted_count} токенов VK.")
+        logger.info(f"Исправлено {fixed_double_count} дважды зашифрованных токенов VK.")
+
         # Закрытие пула при завершении (если скрипт должен завершаться)
         if db_pool:
              await db_pool.close()
              logger.info("Пул соединений PostgreSQL закрыт.")
-             
+
     asyncio.run(main())
     print("Инициализация базы данных PostgreSQL завершена!") 

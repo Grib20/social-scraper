@@ -18,7 +18,6 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PasswordHashInvalidError, PhoneCodeExpiredError, FloodWaitError
 import time
 import redis
-import sqlite3
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,6 +43,8 @@ from pydantic import BaseModel, Field
 from user_manager import get_db_pool
 from client_pools import TelegramClientPool, VKClientPool # Импортируем классы
 from starlette.datastructures import UploadFile
+# Импортируем новый роутер
+from telegram_routes import router as telegram_v1_router 
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -126,7 +127,7 @@ from vk_utils import VKClient, find_vk_groups, get_vk_posts, get_vk_posts_in_gro
 from user_manager import (
     get_db_pool, register_user, set_vk_token, get_db_connection, get_vk_token, get_user, 
     get_next_available_account, update_account_usage, update_user_last_used,
-    get_users_dict, verify_api_key, get_active_accounts    
+    get_users_dict, verify_api_key, get_active_accounts, fix_vk_tokens, cipher
 )
 from media_utils import init_scheduler, close_scheduler
 from admin_panel import (
@@ -361,9 +362,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("Приложение успешно остановлено.")
 
-app = FastAPI(lifespan=lifespan)
+# --- Инициализация FastAPI приложения ---
+app = FastAPI(lifespan=lifespan, title="Social Scraper API")
 
-# Настройка CORS
+# --- Настройка CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Разрешаем доступ со всех источников
@@ -372,7 +374,7 @@ app.add_middleware(
     allow_headers=["*"],  # Разрешаем все заголовки
 )
 
-# Инициализируем шаблоны
+# --- Подключение статических файлов и шаблонов ---
 templates = Jinja2Templates(directory="templates")
 
 # Добавляем базовый контекст для всех шаблонов
@@ -387,6 +389,10 @@ def get_base_context(request: Request):
 
 # Монтируем статические файлы
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# === Подключение роутеров ===
+app.include_router(telegram_v1_router) # Подключаем роутер для Telegram V1
+# Добавьте сюда другие роутеры, если они будут
 
 # Маршрут для главной страницы
 @app.get("/")
@@ -2615,8 +2621,9 @@ async def check_vk_account_status(request: Request, account_id: str):
         logger.error("Неверный админ-ключ")
         raise HTTPException(401, "Неверный админ-ключ")
 
-    from user_manager import get_db_pool, cipher # Эти импорты можно вынести наверх файла
-    from vk_utils import VKClient # Этот импорт тоже
+    # Эти импорты можно вынести наверх файла, если они еще не там
+    # from user_manager import get_db_pool, cipher
+    # from vk_utils import VKClient
 
     token: Optional[str] = None
     proxy: Optional[str] = None
@@ -2624,19 +2631,19 @@ async def check_vk_account_status(request: Request, account_id: str):
     status: str = "unknown"
     error_message: Optional[str] = None
     error_code: int = 0
-    # Определяем текущее время как объект datetime один раз
-    last_checked_at_dt = datetime.now(timezone.utc) # <--- ИЗМЕНЕНО: теперь объект datetime
+    last_checked_at_dt = datetime.now(timezone.utc)
 
     pool = await get_db_pool()
     if not pool:
         logger.error(f"Не удалось получить пул соединений для проверки статуса VK {account_id}")
         raise HTTPException(500, "Ошибка сервера: База данных недоступна")
 
-    decrypted_token_for_update: Optional[str] = None # Переменная для хранения расшифрованного токена для обновления
+    # Переменная для хранения расшифрованного токена ТОЛЬКО для проверки API
+    token_for_api_check: Optional[str] = None
 
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
+            async with conn.transaction(): # Используем транзакцию для чтения и последующего обновления статуса
                 # --- Шаг 1: Чтение данных и расшифровка токена ---
                 query = 'SELECT token, proxy, status FROM vk_accounts WHERE id = $1'
                 account_record = await conn.fetchrow(query, account_id)
@@ -2654,9 +2661,8 @@ async def check_vk_account_status(request: Request, account_id: str):
                     status = "error"
                     error_message = "Токен отсутствует в БД"
                 elif token_value.startswith('vk1.a.'):
-                    logger.info(f"Токен для {account_id} не зашифрован (или уже обновлен).")
-                    token = token_value
-                    decrypted_token_for_update = token # Сохраняем для обновления
+                    logger.info(f"Токен для {account_id} не зашифрован.")
+                    token_for_api_check = token_value
                 else:
                     try:
                         logger.info(f"Пытаемся расшифровать токен для {account_id}")
@@ -2664,16 +2670,14 @@ async def check_vk_account_status(request: Request, account_id: str):
 
                         if decrypted_token.startswith('vk1.a.'):
                             logger.info(f"Токен для {account_id} успешно расшифрован.")
-                            token = decrypted_token
-                            decrypted_token_for_update = token # Сохраняем расшифрованный токен для обновления
+                            token_for_api_check = decrypted_token
                         else:
                             try:
                                 logger.info(f"Проверка двойного шифрования для {account_id}")
                                 decrypted_twice = cipher.decrypt(decrypted_token.encode()).decode()
                                 if decrypted_twice.startswith('vk1.a.'):
                                     logger.info(f"Токен для {account_id} был зашифрован дважды.")
-                                    token = decrypted_twice
-                                    decrypted_token_for_update = token # Сохраняем правильно расшифрованный токен
+                                    token_for_api_check = decrypted_twice
                                 else:
                                     logger.error(f"Невалидный формат токена после двойной расшифровки для {account_id}")
                                     status = "error"
@@ -2689,10 +2693,10 @@ async def check_vk_account_status(request: Request, account_id: str):
                         error_message = f"Ошибка расшифровки токена: {str(decrypt_error)}"
 
                 # --- Шаг 2: Проверка через API VK (если есть токен и нет ошибки) ---
-                if token and status == "unknown":
+                if token_for_api_check and status == "unknown":
                     try:
                         logger.info(f"Проверка токена через VK API для {account_id}")
-                        async with VKClient(token, proxy) as vk:
+                        async with VKClient(token_for_api_check, proxy) as vk:
                             result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
 
                             if not result or "response" not in result or not result["response"]:
@@ -2707,8 +2711,7 @@ async def check_vk_account_status(request: Request, account_id: str):
                     except Exception as api_e:
                         logger.error(f"Ошибка при проверке токена VK API для {account_id}: {api_e}")
                         error_message = str(api_e)
-                        # Определяем статус по ошибке API (логика остается)
-                        # ... (код определения error_code и status по api_e) ...
+                        # Определяем статус по ошибке API
                         if "error_code" in error_message:
                             try:
                                 error_code = int(error_message.split("error_code")[1].split(":")[1].strip().split(",")[0])
@@ -2730,31 +2733,28 @@ async def check_vk_account_status(request: Request, account_id: str):
                     if not error_message:
                         error_message = "Токен отсутствует или не удалось расшифровать"
 
-                # --- Шаг 3: Финальное обновление статуса в БД ---
+                # --- Шаг 3: Финальное обновление статуса в БД (БЕЗ ОБНОВЛЕНИЯ ТОКЕНА) ---
                 user_id_to_save = user_info.get('id') if user_info else None
                 user_name_to_save = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip() if user_info else None
-                
-                # Обновляем is_active на основе статуса
                 is_active_bool = status == "active"
 
-                # Обновляем и токен, если он был успешно расшифрован или изначально был верным
+                # Обновляем только статус и связанную информацию
                 update_query = '''
                     UPDATE vk_accounts SET
                         status = $1, user_id = $2, user_name = $3,
                         error_message = $4, error_code = $5, last_checked_at = $6,
-                        is_active = $7, token = $8 
-                    WHERE id = $9
+                        is_active = $7
+                    WHERE id = $8
                 '''
                 await conn.execute(
                     update_query,
                     status, user_id_to_save, user_name_to_save,
                     error_message, error_code,
-                    last_checked_at_dt, # <--- ИЗМЕНЕНО: передаем объект datetime
-                    is_active_bool, # Обновляем is_active
-                    decrypted_token_for_update, # Обновляем токен
+                    last_checked_at_dt,
+                    is_active_bool,
                     account_id
                 )
-                logger.info(f"Статус аккаунта {account_id} обновлен на '{status}' в БД (токен также обновлен при необходимости).")
+                logger.info(f"Статус аккаунта {account_id} обновлен на '{status}' в БД.")
                 # Транзакция закоммитится автоматически
 
         # --- Возвращаем результат ---
@@ -2772,24 +2772,24 @@ async def check_vk_account_status(request: Request, account_id: str):
         logger.error(f"Ошибка PostgreSQL при проверке статуса VK {account_id}: {db_err}", exc_info=True)
         raise HTTPException(500, f"Ошибка базы данных: {str(db_err)}")
     except Exception as final_e:
-        logger.error(f"Непредвиденная ошибка в check_vk_account_status для {account_id}: {final_e}\n{traceback.format_exc()}")
-        
+        logger.error(f"Непредвиденная ошибка в check_vk_account_status для {account_id}: {final_e}\\n{traceback.format_exc()}")
+
+        # Попытка обновить статус на 'error' при непредвиденной ошибке
         try:
             async with pool.acquire() as conn_err:
                 async with conn_err.transaction():
                     error_update_query = '''
-                        UPDATE vk_accounts 
-                        SET status = $1, error_message = $2, last_checked_at = $3, is_active = FALSE 
+                        UPDATE vk_accounts
+                        SET status = $1, error_message = $2, last_checked_at = $3, is_active = FALSE
                         WHERE id = $4 AND status != $1
                     '''
                     error_msg = f"Внутренняя ошибка: {str(final_e)[:150]}"
-                    # Используем новый объект datetime для блока ошибки
-                    error_time_dt = datetime.now(timezone.utc) # <--- ИЗМЕНЕНО: объект datetime
+                    error_time_dt = datetime.now(timezone.utc)
                     await conn_err.execute(error_update_query, 'error', error_msg, error_time_dt, account_id)
                     logger.info(f"Установлен статус 'error' для VK аккаунта {account_id} после исключения.")
         except Exception as update_err:
             logger.error(f"Не удалось обновить статус на 'error' для VK {account_id}: {update_err}")
-            
+
         raise HTTPException(500, f"Внутренняя ошибка сервера: {str(final_e)}")
 
 
@@ -3246,7 +3246,7 @@ async def get_accounts_statistics_detailed(request: Request):
                             # Используем cipher из user_manager
                             decrypted_token_vk = user_manager.cipher.decrypt(encrypted_token_str_vk.encode()).decode()
                         except Exception as decrypt_err:
-                            logger.warning(f"Не удалось расшифровать токен VK для {acc_id_vk}: {decrypt_err}")
+                            logger.warning(f"Не удалось расшифровать токен VK для {acc_id_vk}", exc_info=True)
                             decrypted_token_vk = "[Ошибка расшифровки]"
 
                     # Получаем статус деградации из пула VK
@@ -4002,33 +4002,37 @@ async def health_check():
 
 @app.post("/api/admin/fix-vk-tokens")
 async def fix_vk_tokens_endpoint(request: Request):
-    """Запускает процедуру исправления токенов VK."""
+    """Запускает процедуру проверки и исправления токенов VK:
+    - Шифрует незашифрованные токены.
+    - Исправляет дважды зашифрованные токены.
+    """
     admin_key = request.headers.get("X-Admin-Key")
     if not admin_key:
         admin_key = request.cookies.get("admin_key")
-    
+
     if not admin_key or not await verify_admin_key(admin_key):
         raise HTTPException(status_code=401, detail="Неверный admin ключ")
-    
+
     try:
-        from user_manager import fix_vk_tokens, get_db_pool
-        
-        # Получаем пул соединений для передачи в функцию
+        # from user_manager import fix_vk_tokens, get_db_pool # Импорт уже есть выше
+
         pool = await get_db_pool()
         if not pool:
             logger.error("Не удалось получить пул соединений к БД")
             raise HTTPException(status_code=500, detail="Ошибка сервера: База данных недоступна")
-        
-        # Вызываем асинхронную функцию для исправления токенов
-        fixed_count = await fix_vk_tokens()
-        
+
+        # Вызываем обновленную функцию, получаем оба счетчика
+        encrypted_count, fixed_double_count = await fix_vk_tokens()
+
         # Логируем результат
-        logger.info(f"Исправлено токенов VK: {fixed_count}")
-        
+        logger.info(f"Зашифровано {encrypted_count} токенов VK.")
+        logger.info(f"Исправлено {fixed_double_count} дважды зашифрованных токенов VK.")
+
         return {
-            "status": "success", 
-            "fixed_count": fixed_count,
-            "timestamp": datetime.now().isoformat()
+            "status": "success",
+            "encrypted_count": encrypted_count,
+            "fixed_double_count": fixed_double_count,
+            "timestamp": datetime.now().isoformat() # Используем импортированный datetime
         }
     except asyncpg.PostgresError as db_err:
         logger.error(f"Ошибка PostgreSQL при исправлении токенов VK: {db_err}", exc_info=True)
@@ -4103,10 +4107,16 @@ async def fix_single_vk_token_endpoint(account_id: str, request: Request):
                             result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
                             if "response" in result:
                                 logger.info(f"Токен для аккаунта {account_id} валиден и работает")
-                                # Обновляем токен в базе данных, возвращая его к незашифрованному состоянию
-                                update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                await conn.execute(update_query, decrypted_once, account_id)
-                                fixed = True
+                                # Обновляем токен в базе данных, СОХРАНЯЯ ЕГО ЗАШИФРОВАННЫМ
+                                try:
+                                    token_to_save = cipher.encrypt(decrypted_once.encode()).decode()
+                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                    await conn.execute(update_query, token_to_save, account_id)
+                                    logger.info(f"Зашифрованный токен сохранен для {account_id}")
+                                    fixed = True
+                                except Exception as enc_err:
+                                    logger.error(f"Не удалось зашифровать рабочий токен для {account_id}: {enc_err}")
+                                    # Не меняем токен в БД, если шифрование не удалось
                             else:
                                 logger.warning(f"Расшифрованный токен для аккаунта {account_id} имеет правильный формат, но не работает в API")
                                 # Не меняем токен, так как он не работает
@@ -4129,22 +4139,37 @@ async def fix_single_vk_token_endpoint(account_id: str, request: Request):
                                     result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
                                     if "response" in result:
                                         logger.info(f"Дважды расшифрованный токен для аккаунта {account_id} валиден и работает")
-                                        # Обновляем токен в базе - используем незашифрованный токен
-                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                        await conn.execute(update_query, decrypted_twice, account_id)
-                                        fixed = True
+                                        # Обновляем токен в базе - СОХРАНЯЕМ ЗАШИФРОВАННЫМ
+                                        try:
+                                            token_to_save = cipher.encrypt(decrypted_twice.encode()).decode()
+                                            update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                            await conn.execute(update_query, token_to_save, account_id)
+                                            logger.info(f"Зашифрованный токен (исправлен из дважды зашифрованного) сохранен для {account_id}")
+                                            fixed = True
+                                        except Exception as enc_err:
+                                            logger.error(f"Не удалось зашифровать дважды расшифрованный рабочий токен для {account_id}: {enc_err}")
                                     else:
                                         logger.warning(f"Дважды расшифрованный токен имеет правильный формат, но не работает в API")
-                                        # Несмотря на ошибку API, обновляем токен если формат правильный
-                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                        await conn.execute(update_query, decrypted_twice, account_id)
-                                        fixed = True
+                                        # Несмотря на ошибку API, обновляем токен, если формат правильный, СОХРАНЯЕМ ЗАШИФРОВАННЫМ
+                                        try:
+                                            token_to_save = cipher.encrypt(decrypted_twice.encode()).decode()
+                                            update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                            await conn.execute(update_query, token_to_save, account_id)
+                                            logger.warning(f"Зашифрованный токен (исправлен из дважды зашифрованного, API не прошел) сохранен для {account_id}")
+                                            fixed = True
+                                        except Exception as enc_err:
+                                            logger.error(f"Не удалось зашифровать дважды расшифрованный токен (API не прошел) для {account_id}: {enc_err}")
                             except Exception as e:
                                 logger.error(f"Ошибка при проверке дважды расшифрованного токена через API: {str(e)}")
-                                # Обновляем токен несмотря на ошибку API, если формат правильный
-                                update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                await conn.execute(update_query, decrypted_twice, account_id)
-                                fixed = True
+                                # Обновляем токен несмотря на ошибку API, если формат правильный, СОХРАНЯЕМ ЗАШИФРОВАННЫМ
+                                try:
+                                    token_to_save = cipher.encrypt(decrypted_twice.encode()).decode()
+                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                    await conn.execute(update_query, token_to_save, account_id)
+                                    logger.warning(f"Зашифрованный токен (исправлен из дважды зашифрованного, ошибка API) сохранен для {account_id}")
+                                    fixed = True
+                                except Exception as enc_err:
+                                    logger.error(f"Не удалось зашифровать дважды расшифрованный токен (ошибка API) для {account_id}: {enc_err}")
                         else:
                             # Пробуем найти подстроку 'vk1.a.' в дважды расшифрованном токене
                             if len(decrypted_twice) > 30 and 'vk1.a.' in decrypted_twice:
@@ -4160,22 +4185,37 @@ async def fix_single_vk_token_endpoint(account_id: str, request: Request):
                                                 result = await vk._make_request("users.get", {"fields": "photo_50,screen_name"})
                                                 if "response" in result:
                                                     logger.info(f"Извлеченный токен для аккаунта {account_id} валиден и работает")
-                                                    # Обновляем токен в базе
-                                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                                    await conn.execute(update_query, token_part, account_id)
-                                                    fixed = True
+                                                    # Обновляем токен в базе - СОХРАНЯЕМ ЗАШИФРОВАННЫМ
+                                                    try:
+                                                        token_to_save = cipher.encrypt(token_part.encode()).decode()
+                                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                                        await conn.execute(update_query, token_to_save, account_id)
+                                                        logger.info(f"Зашифрованный токен (извлечен из строки) сохранен для {account_id}")
+                                                        fixed = True
+                                                    except Exception as enc_err:
+                                                        logger.error(f"Не удалось зашифровать извлеченный рабочий токен для {account_id}: {enc_err}")
                                                 else:
                                                     logger.warning(f"Извлеченный токен имеет правильный формат, но не работает в API")
-                                                    # Обновляем токен несмотря на ошибку API
-                                                    update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                                    await conn.execute(update_query, token_part, account_id)
-                                                    fixed = True
+                                                    # Обновляем токен несмотря на ошибку API - СОХРАНЯЕМ ЗАШИФРОВАННЫМ
+                                                    try:
+                                                        token_to_save = cipher.encrypt(token_part.encode()).decode()
+                                                        update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                                        await conn.execute(update_query, token_to_save, account_id)
+                                                        logger.warning(f"Зашифрованный токен (извлечен из строки, API не прошел) сохранен для {account_id}")
+                                                        fixed = True
+                                                    except Exception as enc_err:
+                                                        logger.error(f"Не удалось зашифровать извлеченный токен (API не прошел) для {account_id}: {enc_err}")
                                         except Exception as e:
                                             logger.error(f"Ошибка при проверке извлеченного токена через API: {str(e)}")
-                                            # Обновляем токен несмотря на ошибку API
-                                            update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
-                                            await conn.execute(update_query, token_part, account_id)
-                                            fixed = True
+                                            # Обновляем токен несмотря на ошибку API - СОХРАНЯЕМ ЗАШИФРОВАННЫМ
+                                            try:
+                                                token_to_save = cipher.encrypt(token_part.encode()).decode()
+                                                update_query = 'UPDATE vk_accounts SET token = $1 WHERE id = $2'
+                                                await conn.execute(update_query, token_to_save, account_id)
+                                                logger.warning(f"Зашифрованный токен (извлечен из строки, ошибка API) сохранен для {account_id}")
+                                                fixed = True
+                                            except Exception as enc_err:
+                                                logger.error(f"Не удалось зашифровать извлеченный токен (ошибка API) для {account_id}: {enc_err}")
                     except Exception as inner_e:
                         logger.error(f"Ошибка при второй расшифровке токена для аккаунта {account_id}: {str(inner_e)}")
                 
@@ -4985,6 +5025,8 @@ async def request_telegram_auth_code(request: Request, account_id: str):
 #                      cursor_update.execute('UPDATE telegram_accounts SET status = ?, phone_code_hash = NULL WHERE id = ?', ('pending_code', account_id))
 #                      conn_update.commit()
 #                      conn_update.close()
+#                  except Exception as db_err:
+#                      logger.error(f"Не удалось обновить статус на 'pending_code' после ошибки кода для {account_id}: {db_err}")
 #                  except Exception as db_err:
 #                      logger.error(f"Не удалось обновить статус на 'pending_code' после ошибки кода для {account_id}: {db_err}")
 #                  raise HTTPException(status_code=400, detail=f"Ошибка кода: {str(e_code)}")

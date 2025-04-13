@@ -27,7 +27,13 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
     phone_code_hash TEXT,
     is_active BOOLEAN DEFAULT TRUE, 
     request_limit INTEGER DEFAULT 1000,
-    last_used TIMESTAMPTZ
+    last_used TIMESTAMPTZ,
+    -- Новые поля для TDATA
+    device_model TEXT,
+    system_version TEXT,
+    app_version TEXT,
+    lang_code TEXT,
+    system_lang_code TEXT
 );
 
 -- Таблица аккаунтов VK
