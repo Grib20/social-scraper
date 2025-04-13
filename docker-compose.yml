@@ -1,60 +1,82 @@
 version: '3.8'
 
+# Определение сервисов (контейнеров)
 services:
+  # Сервис основного приложения
   app:
+    # Инструкции по сборке образа (использует Dockerfile в текущей директории)
     build: .
-    container_name: social-scraper-app
-    restart: unless-stopped
+    container_name: social-scraper-app # Имя контейнера
+    restart: unless-stopped # Политика перезапуска: перезапускать, если не остановлен вручную
     ports:
+      # Проброс порта: <порт_на_хосте>:<порт_в_контейнере>
+      # Использует переменную PORT из .env, или 3030 по умолчанию
       - "${PORT:-3030}:3030"
     volumes:
-      - telegram_sessions:/app/telegram_sessions
-      - media_downloads:/app/media_downloads
-      - logs:/app/logs
-      - data:/app/data
-      - database:/app/database
+      # Привязка именованных томов для сохранения данных между перезапусками
+      - telegram_sessions:/app/telegram_sessions # Сессии Telegram
+      - media_downloads:/app/media_downloads # Скачанные медиафайлы
+      - logs:/app/logs # Логи приложения
+      - data:/app/data # Другие данные приложения
+      # Удаляем том для SQLite, т.к. используем PostgreSQL
+      # - database:/app/database
+      # Привязка локальной папки secrets к папке в контейнере
       - ./secrets:/app/secrets
     env_file:
+      # Загрузка переменных окружения из файла .env
       - .env
     environment:
-      - PYTHONUNBUFFERED=1
-      - PORT=3030
-      - REDIS_URL=redis://redis:6379/0
-      - LOG_DIR=/app/logs
-      - DB_PATH=/app/database/users.db
+      # Дополнительные переменные окружения (некоторые могут дублировать .env, но это ОК)
+      - PYTHONUNBUFFERED=1 # Отключает буферизацию вывода Python (для логов)
+      - PORT=3030 # Порт внутри контейнера
+      - REDIS_URL=redis://redis:6379/0 # Адрес Redis для подключения
+      - LOG_DIR=/app/logs # Путь к логам внутри контейнера
+      # Удаляем DB_PATH, т.к. используем PostgreSQL (данные в .env)
+      # - DB_PATH=/app/database/users.db
     depends_on:
+      # Зависимость от сервиса redis: приложение запустится после того, как redis будет готов
       redis:
-        condition: service_healthy
+        condition: service_healthy # Условие: сервис redis должен пройти healthcheck
     networks:
+      # Подключение к пользовательской сети
       - app-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3030/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      # Проверка работоспособности контейнера
+      test: ["CMD", "curl", "-f", "http://localhost:3030/health"] # Команда проверки
+      interval: 30s # Интервал между проверками
+      timeout: 10s # Макс. время ожидания ответа
+      retries: 3 # Кол-во попыток перед признанием контейнера нездоровым
+      start_period: 30s # Время на запуск контейнера перед началом проверок
     deploy:
+      # Настройки для развертывания в Swarm (также могут влиять на docker-compose up)
       resources:
+        # Ограничения ресурсов
         limits:
-          cpus: '1'
-          memory: 2G
+          cpus: '1' # Максимум 1 CPU
+          memory: 2G # Максимум 2ГБ ОЗУ
+        # Резервирование ресурсов
         reservations:
-          cpus: '0.5'
-          memory: 1G
+          cpus: '0.5' # Гарантированно 0.5 CPU
+          memory: 1G # Гарантированно 1ГБ ОЗУ
 
+  # Сервис Redis (кэш и брокер сообщений)
   redis:
-    image: redis:7-alpine
-    container_name: social-scraper-redis
-    restart: unless-stopped
+    image: redis:7-alpine # Используемый образ
+    container_name: social-scraper-redis # Имя контейнера
+    restart: unless-stopped # Политика перезапуска
     ports:
+      # Проброс порта Redis только на localhost хоста для безопасности
       - "127.0.0.1:6379:6379"
     volumes:
+      # Том для сохранения данных Redis
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes # Команда запуска Redis с включенным AOF
     networks:
+      # Подключение к пользовательской сети
       - app-network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Проверка работоспособности Redis
+      test: ["CMD", "redis-cli", "ping"] # Команда проверки
       interval: 30s
       timeout: 10s
       retries: 3
@@ -64,27 +86,32 @@ services:
           cpus: '0.5'
           memory: 512M
 
+# Определение именованных томов (volumes)
 volumes:
   redis_data:
-    driver: local
+    driver: local # Используем локальный драйвер для хранения данных Redis
   telegram_sessions:
-    driver: local
+    driver: local # Для сессий Telegram
   media_downloads:
-    driver: local
+    driver: local # Для скачанных медиа
   logs:
-    driver: local
+    driver: local # Для логов
   data:
-    driver: local
-  database:
-    driver: local
+    driver: local # Для прочих данных
+  # Удаляем том для SQLite
+  # database:
+  #   driver: local
 
+# Определение пользовательских сетей
 networks:
   app-network:
-    driver: bridge
-    
+    driver: bridge # Используем стандартный драйвер bridge
+
+# Определение секретов Docker
+# Позволяет безопасно передавать чувствительные данные из файлов в контейнеры
 secrets:
   aws_access_key:
-    file: ./secrets/aws_access_key.txt
+    file: ./secrets/aws_access_key.txt # Путь к файлу с секретом на хосте
   aws_secret_key:
     file: ./secrets/aws_secret_key.txt
   encryption_key:
