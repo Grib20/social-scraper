@@ -225,10 +225,20 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
 
             if rows_affected > 0:
                 logger.debug(f"Синхронизирована статистика для аккаунта {platform}:{account_id} (Count: {count}, LastUsed: {last_used_dt})")
-            # else: # Логируем, только если были данные для синхронизации
-            #     if count != 0 or last_used_dt is not None or force:
-            #          logger.warning(f"Аккаунт {platform}:{account_id} не найден в БД для синхронизации.")
-            return rows_affected > 0
+                return True # Успешная синхронизация
+            else:
+                # Аккаунт не найден в PostgreSQL, но статистика есть в Redis
+                # Логируем это и удаляем "осиротевшие" ключи из Redis
+                logger.warning(f"Аккаунт {platform}:{account_id} не найден в БД для синхронизации. "
+                               f"Удаляем статистику из Redis (Count: {count}, LastUsed: {last_used_str}).")
+                try:
+                    # Пытаемся удалить ключи из Redis
+                    await redis_client.delete(count_key, last_used_key)
+                    logger.info(f"Статистика из Redis для несуществующего аккаунта {platform}:{account_id} удалена.")
+                except aredis.RedisError as del_err:
+                    logger.error(f"Ошибка Redis при удалении статистики для {platform}:{account_id}: {del_err}")
+                # Возвращаем False, так как синхронизация с БД не удалась
+                return False
 
     except aredis.RedisError as e:
          logger.error(f"Ошибка Redis при синхронизации с БД ({platform}:{account_id}): {e}")
@@ -283,8 +293,8 @@ async def sync_all_accounts_stats():
 
                         # Синхронизируем каждый аккаунт только один раз за весь процесс
                         if account_tuple not in accounts_processed:
-                            # Добавляем задачу синхронизации в список
-                            sync_tasks.append(sync_account_stats_to_db(account_id, platform))
+                            # Добавляем кортеж с данными аккаунта и корутиной в список
+                            sync_tasks.append((account_id, platform, sync_account_stats_to_db(account_id, platform)))
                             accounts_processed.add(account_tuple)  # Отмечаем как запланированный к обработке
                         # else: # Отладка
                             # logger.debug(f"Аккаунт {account_tuple} уже обработан, пропуск.")
@@ -295,15 +305,23 @@ async def sync_all_accounts_stats():
 
             # Выполняем собранные задачи синхронизации для текущей пачки ключей
             if sync_tasks:
-                # logger.debug(f"Запуск {len(sync_tasks)} задач синхронизации для пачки ключей...")
-                results = await asyncio.gather(*sync_tasks, return_exceptions=True)
-                for result in results:
+                # Получаем только корутины для gather
+                coroutines = [task[2] for task in sync_tasks]
+                # logger.debug(f"Запуск {len(coroutines)} задач синхронизации для пачки ключей...")
+                results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+                # Итерируем по задачам и результатам вместе
+                for task_info, result in zip(sync_tasks, results):
+                    account_id, platform, _ = task_info # Извлекаем ID и платформу
                     if isinstance(result, Exception):
-                        logger.error(f"Ошибка во время выполнения задачи синхронизации: {result}")
+                        # Логируем ошибку с указанием аккаунта и полным трейсбеком
+                        logger.error(f"Ошибка синхронизации для аккаунта {platform}:{account_id}", exc_info=result)
                         error_count += 1
                     elif result:  # sync_account_stats_to_db вернул True
                         success_count += 1
                     else:  # sync_account_stats_to_db вернул False
+                        # Логируем как предупреждение, если sync_account_stats_to_db вернул False
+                        logger.warning(f"Синхронизация для аккаунта {platform}:{account_id} не удалась (вернула False).")
                         error_count += 1
                 # logger.debug(f"Задачи синхронизации для пачки завершены.")
 

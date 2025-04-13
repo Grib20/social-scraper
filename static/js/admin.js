@@ -284,14 +284,28 @@ async function displayUsers() {
             const telegramTitle = document.createElement('h4');
             telegramTitle.innerHTML = `<i class="fab fa-telegram"></i> Telegram аккаунты`;
             
+            // Create a container for the buttons
+            const telegramButtonContainer = document.createElement('div');
+            telegramButtonContainer.className = 'account-header-actions'; // Add a class for styling
+
             const addTelegramButton = document.createElement('button');
             addTelegramButton.className = 'add-account-btn';
             addTelegramButton.innerHTML = `<i class="fas fa-plus"></i> Добавить`;
             addTelegramButton.onclick = () => showTelegramModal(user.id);
-            
+            telegramButtonContainer.appendChild(addTelegramButton); // Add button to container
+
+            // === START NEW BUTTON ===
+            const addSessionJsonButton = document.createElement('button');
+            addSessionJsonButton.className = 'add-account-btn session-json-btn'; // Add specific class
+            addSessionJsonButton.innerHTML = '<i class="fas fa-file-upload"></i> + Session/JSON'; // Text or Icon
+            addSessionJsonButton.onclick = () => showSessionJsonModal(user.id);
+            addSessionJsonButton.title = 'Добавить через .session и .json файлы'; // Tooltip
+            telegramButtonContainer.appendChild(addSessionJsonButton); // Add button to container
+            // === END NEW BUTTON ===
+
             telegramHeader.appendChild(telegramTitle);
-            telegramHeader.appendChild(addTelegramButton);
-            
+            telegramHeader.appendChild(telegramButtonContainer); // Add the container to the header
+
             const telegramList = document.createElement('div');
             telegramList.className = 'accounts-list';
             
@@ -2876,3 +2890,163 @@ async function toggleAccountStatus(platform, accountId) {
 }
 
 // ... existing code ...
+
+// === Новые функции для добавления через Session+JSON ===
+
+// Показывает модальное окно для загрузки Session+JSON
+function showSessionJsonModal(userId) {
+    currentUser = userId; // Сохраняем ID текущего пользователя
+    
+    const modal = document.getElementById('sessionJsonModal');
+    const form = document.getElementById('addSessionJsonForm');
+    const userIdInput = document.getElementById('sessionJsonUserId');
+
+    if (modal && form && userIdInput) {
+        form.reset(); // Сбрасываем форму
+        userIdInput.value = userId; // Устанавливаем ID пользователя
+        modal.style.display = 'block'; // Показываем окно
+    } else {
+        console.error("Не удалось найти элементы модального окна Session+JSON");
+        showNotification("Ошибка: Не удалось открыть окно добавления аккаунта.", "error");
+    }
+}
+
+// Обрабатывает отправку формы Session+JSON
+async function handleAddSessionJsonSubmit(event) {
+    event.preventDefault();
+    const form = event.target;
+    const formData = new FormData(form);
+    const adminKey = getAdminKey();
+    // Получаем api_key пользователя из скрытого поля
+    const userApiKey = formData.get('userId'); 
+
+    if (!adminKey) {
+        showNotification("Ошибка: Админ-ключ не найден.", "error");
+        return;
+    }
+    if (!userApiKey) {
+         showNotification("Ошибка: Не удалось определить пользователя.", "error");
+         return;
+    }
+
+    const sessionFileInput = document.getElementById('session_file_input');
+    const jsonFileInput = document.getElementById('json_file_input');
+
+    if (!sessionFileInput.files.length || !jsonFileInput.files.length) {
+        showNotification("Пожалуйста, выберите оба файла (.session и .json)", "warning");
+        return;
+    }
+
+    // Добавляем файлы в FormData (уже должны быть там из new FormData(form))
+    // formData.append('session_file', sessionFileInput.files[0]);
+    // formData.append('json_file', jsonFileInput.files[0]);
+
+    // Добавляем прокси (Form параметр, тоже должен быть в formData)
+    // const proxyValue = document.getElementById('session_json_proxy').value;
+    // if (proxyValue) {
+    //     formData.append('proxy', proxyValue);
+    // }
+
+    const submitButton = form.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Добавление...';
+
+    try {
+        const response = await fetch('/api/v1/telegram/accounts/upload_session_json', {
+            method: 'POST',
+            headers: {
+                // 'Content-Type': 'multipart/form-data', // Не указываем Content-Type, браузер сам установит с boundary
+                'X-Admin-Key': adminKey,
+                'X-API-Key': userApiKey // Передаем API ключ пользователя
+            },
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            showNotification(result.message || 'Аккаунт успешно добавлен!', 'success');
+            closeModal('sessionJsonModal');
+            displayUsers(); // Обновляем список пользователей
+        } else {
+            showNotification(result.detail || 'Ошибка при добавлении аккаунта.', 'error');
+        }
+    } catch (error) {
+        console.error('Ошибка при добавлении аккаунта (Session+JSON):', error);
+        showNotification('Произошла сетевая ошибка при добавлении аккаунта.', 'error');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-plus-circle"></i> Добавить аккаунт';
+    }
+}
+
+// === Конец новых функций ===
+
+// Обработчик события загрузки DOM
+document.addEventListener('DOMContentLoaded', () => {
+    // Получаем админ-ключ из localStorage при загрузке
+    const savedAdminKey = localStorage.getItem('adminKey');
+    if (savedAdminKey) {
+        // Если ключ есть, можно сразу попробовать отобразить пользователей
+        // или выполнить другие действия, требующие ключа
+        // displayUsers(); 
+    } else {
+        // Если ключа нет, возможно, перенаправить на логин или скрыть админ-элементы
+        // window.location.href = '/login';
+    }
+
+    // Инициализация отображения пользователей
+    displayUsers();
+
+    // Обработчик для формы добавления пользователя
+    const addUserForm = document.getElementById('addUserForm');
+    if (addUserForm) {
+        addUserForm.addEventListener('submit', registerUser);
+    }
+
+    // Обработчик для формы добавления Telegram аккаунта (старый способ)
+    const addTelegramForm = document.getElementById('addTelegramForm');
+    if (addTelegramForm) {
+        addTelegramForm.addEventListener('submit', handleAddTelegramSubmit);
+    }
+
+    // Обработчик для формы добавления VK аккаунта
+    const addVkForm = document.getElementById('addVkForm');
+    if (addVkForm) {
+        addVkForm.addEventListener('submit', handleAddVkSubmit); 
+    }
+    
+    // Обработчик для формы подтверждения кода Telegram
+    const authForm = document.getElementById('telegramAuthForm');
+    if (authForm) {
+        authForm.addEventListener('submit', submitAuthCode);
+    }
+
+    // Обработчик для кнопки подтверждения 2FA
+    const submit2FAButton = document.getElementById('submit2FA');
+    if (submit2FAButton) {
+        submit2FAButton.addEventListener('click', submit2FAPassword);
+    }
+
+    // Обработчик для формы изменения прокси
+    const changeProxyForm = document.getElementById('changeProxyForm');
+    if (changeProxyForm) {
+        changeProxyForm.addEventListener('submit', updateProxy);
+    }
+
+    // Обработчик для новой формы добавления Session+JSON
+    const sessionJsonForm = document.getElementById('addSessionJsonForm');
+    if (sessionJsonForm) {
+        sessionJsonForm.addEventListener('submit', handleAddSessionJsonSubmit);
+    } else {
+         console.error("Форма addSessionJsonForm не найдена!");
+    }
+    
+    // Инициализация вкладок
+    const activeTab = localStorage.getItem('activeTab') || 'users';
+    switchTab(activeTab); // Активируем сохраненную вкладку
+});
+
+
+
+// ... остальной код admin.js ...
