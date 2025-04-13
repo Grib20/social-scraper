@@ -46,157 +46,206 @@ async def add_telegram_account_from_files(
         logger.warning(f"Неверный API ключ: {api_key[:5]}... при добавлении TG аккаунта из файлов")
         raise HTTPException(status_code=403, detail="Неверный API ключ")
 
-    json_data = {}
+    # Check if user exists before proceeding
+    if not await user_manager.get_user(api_key):
+        logger.warning(f"Попытка добавления аккаунта для несуществующего пользователя: {api_key[:5]}...")
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    # === ИЗМЕНЕНО: Инициализация переменных и обработка JSON ===
     account_data = {}
-    session_filename = None
-    saved_session_path = None
+    json_data = {}
+    session_file_path = None # Инициализируем здесь
 
     try:
-        # 2. Чтение и парсинг JSON файла
-        try:
-            json_content = await json_file.read()
-            # Пытаемся декодировать с BOM, если есть
+        # 1. Обработка JSON файла (если предоставлен)
+        if json_file:
+            logger.info(f"Обработка JSON-файла: {json_file.filename} для пользователя {api_key[:5]}...")
             try:
-                decoded_content = json_content.decode('utf-8-sig')
-            except UnicodeDecodeError:
-                decoded_content = json_content.decode('utf-8') # Пробуем без BOM
-            
-            json_data = json.loads(decoded_content)
-            logger.info(f"JSON файл {json_file.filename} успешно прочитан и распарсен.")
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка парсинга JSON файла {json_file.filename}: {e}")
-            raise HTTPException(status_code=400, detail=f"Некорректный формат JSON файла: {e}")
-        except Exception as e:
-            logger.error(f"Ошибка чтения JSON файла {json_file.filename}: {e}")
-            raise HTTPException(status_code=500, detail=f"Ошибка чтения JSON файла: {e}")
-        finally:
-            await json_file.close() # Закрываем файл JSON
+                json_content = await json_file.read()
+                # Проверяем, что контент не пустой
+                if not json_content:
+                     logger.error("Предоставлен пустой JSON-файл.")
+                     raise HTTPException(status_code=400, detail="JSON-файл не может быть пустым.")
+                
+                # Декодируем содержимое файла
+                try:
+                     json_data = json.loads(json_content.decode('utf-8'))
+                     logger.info("JSON-файл успешно прочитан и распарсен.")
+                except UnicodeDecodeError:
+                     # Попытка с другой кодировкой, если UTF-8 не сработал
+                     try:
+                         json_data = json.loads(json_content.decode('cp1251')) # Популярная для Windows
+                         logger.info("JSON-файл успешно прочитан и распарсен с кодировкой cp1251.")
+                     except Exception as decode_err:
+                         logger.error(f"Ошибка декодирования JSON-файла: {decode_err}. Файл не UTF-8 или cp1251.")
+                         raise HTTPException(status_code=400, detail="Ошибка кодировки JSON-файла. Убедитесь, что он в UTF-8.")
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"Ошибка парсинга JSON-файла: {json_err}")
+                    raise HTTPException(status_code=400, detail=f"Невалидный JSON-файл: {json_err}")
 
-        # 3. Извлечение данных из JSON
-        required_fields = ['app_id', 'app_hash']
-        # Телефон важен для имени файла сессии
-        phone = json_data.get('phone')
-        if not phone:
-             # Пытаемся взять из session_file в json, если phone отсутствует
-             phone_from_session = json_data.get('session_file')
-             if phone_from_session:
-                 phone = str(phone_from_session) # Преобразуем в строку на всякий случай
-                 logger.warning(f"Поле 'phone' отсутствует в JSON, используем 'session_file': {phone}")
-             else:
-                 logger.error("Отсутствует обязательное поле 'phone' или 'session_file' в JSON.")
-                 raise HTTPException(status_code=400, detail="Отсутствует обязательное поле 'phone' или 'session_file' в JSON")
+                # 2. Извлечение и валидация данных из JSON
+                phone = json_data.get('phone')
+                if not phone or not isinstance(phone, str):
+                    logger.error("Ключ 'phone' отсутствует или имеет неверный тип в JSON-файле.")
+                    raise HTTPException(status_code=400, detail="Отсутствует или некорректен 'phone' в JSON-файле")
+                account_data['phone'] = phone.strip() # Убираем лишние пробелы
+
+                # Валидация app_id (должен быть целым числом или строкой, конвертируемой в целое)
+                app_id_value = json_data.get('app_id')
+                if app_id_value is None:
+                    logger.error("Ключ 'app_id' отсутствует в JSON-файле.")
+                    raise HTTPException(status_code=400, detail="Отсутствует 'app_id' в JSON-файле")
+                
+                api_id_int = None
+                if isinstance(app_id_value, int):
+                    api_id_int = app_id_value
+                elif isinstance(app_id_value, str):
+                    try:
+                        api_id_int = int(app_id_value)
+                    except ValueError:
+                        logger.error(f"Не удалось конвертировать 'app_id' из строки в число: '{app_id_value}'")
+                        raise HTTPException(status_code=400, detail="Некорректное значение для 'app_id'. Ожидается целое число или строка, содержащая целое число.")
+                else:
+                     logger.error(f"Некорректный тип для 'app_id' в JSON: {type(app_id_value)}. Ожидается строка или число.")
+                     raise HTTPException(status_code=400, detail="Некорректный тип для 'app_id'. Ожидается строка или число.")
+
+                account_data['api_id'] = api_id_int # Сохраняем как int
+                logger.info(f"Получен api_id (int) из JSON: {account_data['api_id']}")
+
+                # Валидация app_hash
+                app_hash_value = json_data.get('app_hash')
+                if not app_hash_value or not isinstance(app_hash_value, str):
+                     logger.error("Ключ 'app_hash' отсутствует или имеет неверный тип в JSON-файле.")
+                     raise HTTPException(status_code=400, detail="Отсутствует или некорректен 'app_hash' в JSON-файле")
+                account_data['api_hash'] = app_hash_value.strip()
+                logger.info(f"Получен api_hash из JSON: {account_data['api_hash']}")
+
+            except HTTPException as http_exc:
+                 raise http_exc # Перебрасываем HTTP ошибки валидации
+            except Exception as e:
+                logger.error(f"Неожиданная ошибка при обработке JSON-файла {json_file.filename}: {e}")
+                raise HTTPException(status_code=500, detail=f"Ошибка обработки JSON-файла: {e}")
+            finally:
+                 # Убедимся, что JSON-файл закрыт, если он был предоставлен
+                 if json_file:
+                     await json_file.close()
         else:
-            phone = str(phone) # Убедимся, что это строка
+            # JSON файл не обязателен, если данные приходят из другого источника (например, будущие доработки)
+            # Но в данном случае он нужен для phone, api_id, api_hash
+            logger.error("JSON-файл не был предоставлен.")
+            raise HTTPException(status_code=400, detail="Необходим JSON-файл с данными аккаунта (phone, app_id, app_hash).")
 
-        account_data['phone'] = phone
-
-        for field in required_fields:
-            value = json_data.get(field) # Используем get для безопасного извлечения
-            if not value: # Проверяем на None или пустую строку/0
-                logger.error(f"Отсутствует или пустое обязательное поле '{field}' в JSON файле.")
-                raise HTTPException(status_code=400, detail=f"Отсутствует или пустое обязательное поле '{field}' в JSON файле.")
-            account_data[field] = value
-
-        # Извлечение необязательных, но рекомендуемых полей
-        account_data['device_model'] = json_data.get('device')
-        account_data['system_version'] = json_data.get('sdk')
-        account_data['app_version'] = json_data.get('app_version')
-        account_data['lang_code'] = json_data.get('lang_pack') or json_data.get('lang_code') # Пробуем оба варианта
-        account_data['system_lang_code'] = json_data.get('system_lang_pack') or json_data.get('system_lang_pack') # Пробуем оба варианта
-        # account_data['user_id'] = json_data.get('id') # user_id не хранится в telegram_accounts
-
-        # Проверяем api_id на число
-        try:
-            account_data['api_id'] = int(account_data['api_id'])
-        except (ValueError, TypeError):
-            logger.error(f"Некорректное значение api_id: {account_data['api_id']}. Ожидалось целое число.")
-            raise HTTPException(status_code=400, detail=f"Некорректное значение api_id: {account_data['api_id']}. Ожидалось целое число.")
-
-        logger.info("Необходимые данные из JSON извлечены.")
-
-        # 4. Проверка, существует ли аккаунт с таким телефоном
+        # 3. Проверка, существует ли аккаунт с таким телефоном
         user = await user_manager.get_user(api_key)
         if user:
+            phone_to_check = account_data.get('phone')
             for existing_account in user.get('telegram_accounts', []):
-                if existing_account.get('phone') == phone:
-                     logger.warning(f"Аккаунт с телефоном {phone} уже существует для пользователя {api_key[:5]}...")
-                     raise HTTPException(status_code=400, detail=f"Аккаунт с телефоном {phone} уже существует")
+                if existing_account.get('phone') == phone_to_check:
+                     logger.warning(f"Аккаунт с телефоном {phone_to_check} уже существует для пользователя {api_key[:5]}...")
+                     raise HTTPException(status_code=400, detail=f"Аккаунт с телефоном {phone_to_check} уже существует")
 
-        # 5. Определение имени и пути для файла сессии
-        # Убираем '+' из начала номера телефона для имени файла, если он есть
-        clean_phone = phone.lstrip('+')
-        session_filename = f"{clean_phone}.session"
-        saved_session_path = os.path.join(SESSION_DIR, session_filename)
-        account_data['session_file'] = saved_session_path # Сохраняем относительный путь в БД
+        # 4. Определение имени и пути для файла сессии
+        phone = account_data.get('phone') # Берем уже проверенный телефон
+        # Добавляем '+' если его нет (phone здесь гарантированно строка, но добавим проверку для линтера)
+        if phone and not phone.startswith('+'):
+            phone_with_plus = '+' + phone
+        elif phone: # Если телефон есть, но уже с плюсом
+            phone_with_plus = phone
+        else: 
+            # Этот случай не должен произойти из-за валидации выше, но обработаем
+            logger.error("Критическая ошибка: телефон отсутствует на этапе формирования имени файла сессии.")
+            raise HTTPException(status_code=500, detail="Внутренняя ошибка: не найден телефон для файла сессии.")
 
-        # 6. Сохранение файла сессии
+        sessions_dir = os.path.join('sessions', api_key) # Папка пользователя
+        os.makedirs(sessions_dir, exist_ok=True)
+        session_filename = f"{phone_with_plus}.session"
+        session_file_path = os.path.join(sessions_dir, session_filename) # Определяем путь здесь
+        logger.info(f"Путь для сохранения файла сессии: {session_file_path}")
+        account_data['session_file'] = session_file_path # Сохраняем путь в БД
+
+        # 5. Сохранение файла сессии (если предоставлен)
+        if not session_file:
+             logger.error("Файл сессии (.session) не был предоставлен.")
+             raise HTTPException(status_code=400, detail="Необходим файл сессии (.session).")
+        
+        logger.info(f"Сохранение файла сессии: {session_file.filename} -> {session_file_path}")
         try:
             # Проверяем, что файл не слишком большой (например, 10MB)
-            MAX_SESSION_SIZE = 10 * 1024 * 1024 
+            MAX_SESSION_SIZE = 10 * 1024 * 1024
             size = 0
-            with open(saved_session_path, "wb") as buffer:
+            with open(session_file_path, "wb") as buffer:
                 while content := await session_file.read(1024 * 1024): # Читаем по 1MB
                      size += len(content)
                      if size > MAX_SESSION_SIZE:
-                         raise HTTPException(status_code=413, detail="Файл сессии слишком большой (макс. 10MB)")
+                         logger.error(f"Файл сессии {session_file.filename} слишком большой ({size} > {MAX_SESSION_SIZE})")
+                         raise HTTPException(status_code=413, detail=f"Файл сессии слишком большой (макс. {MAX_SESSION_SIZE // 1024 // 1024}MB)")
                      buffer.write(content)
-            logger.info(f"Файл сессии сохранен как: {saved_session_path} (размер: {size} байт)")
+            logger.info(f"Файл сессии сохранен как: {session_file_path} (размер: {size} байт)")
         except HTTPException as http_exc:
-             raise http_exc # Перебрасываем ошибку размера файла
+             # Если ошибка размера файла, удаляем созданный пустой/частичный файл
+             if os.path.exists(session_file_path):
+                 try: os.remove(session_file_path)
+                 except OSError: pass
+             raise http_exc # Перебрасываем ошибку
         except Exception as e:
-            logger.error(f"Ошибка сохранения файла сессии {saved_session_path}: {e}")
+            logger.error(f"Ошибка сохранения файла сессии {session_file_path}: {e}")
             # Попытка удалить частично записанный файл
-            if os.path.exists(saved_session_path):
-                try: os.remove(saved_session_path)
+            if os.path.exists(session_file_path):
+                try: os.remove(session_file_path)
                 except OSError: pass
             raise HTTPException(status_code=500, detail=f"Ошибка сохранения файла сессии: {e}")
         finally:
             await session_file.close() # Закрываем файл сессии
 
-        # 7. Добавляем прокси
-        proxy_to_save = proxy # Используем переданный Form параметр
-        if not proxy_to_save:
+        # 6. Добавляем прокси (после успешного сохранения сессии)
+        proxy_to_save = proxy # Используем переданный Form параметр (приоритет)
+        if proxy_to_save:
+            logger.info(f"Используется прокси из Form: {proxy_to_save}")
+        elif not proxy_to_save and json_data:
             proxy_to_save = json_data.get('proxy') # Или берем из JSON
             if proxy_to_save:
                 logger.info(f"Используется прокси из JSON: {proxy_to_save}")
-        elif proxy_to_save:
-             logger.info(f"Используется прокси из Form: {proxy_to_save}")
 
         if proxy_to_save:
-            # Простая валидация формата прокси (можно улучшить)
-            # Допускаем разные схемы или без схемы (будет добавлена позже)
-            # if not (proxy_to_save.startswith(('socks5://', 'socks4://', 'http://', 'https://'))):
-            #     # Можно просто записывать как есть, Telethon разберется или выдаст ошибку
-            #     logger.warning(f"Формат прокси '{proxy_to_save}' не стандартный, используется как есть.")
-            account_data['proxy'] = proxy_to_save
+             if isinstance(proxy_to_save, str):
+                 account_data['proxy'] = proxy_to_save.strip()
+                 logger.info(f"Прокси '{account_data['proxy']}' будет сохранен.")
+             else:
+                 logger.warning(f"Прокси из источника ({'Form' if proxy else 'JSON'}) имеет неверный тип: {type(proxy_to_save)}. Прокси не будет сохранен.")
 
-        # Устанавливаем начальный статус
-        account_data['status'] = 'active' # Считаем активным, раз сессия загружена
-        account_data['is_active'] = True
+        # 7. Устанавливаем начальный статус и ID
+        account_data['status'] = 'need_check' # Требуется проверка после загрузки
+        account_data['is_active'] = False # Неактивен до проверки
+        account_id = str(uuid.uuid4())
+        account_data['id'] = account_id
+        
+        # === ИСПРАВЛЕНИЕ: Сохраняем номер с '+' в account_data ===
+        # phone_with_plus был создан ранее и содержит номер с '+'
+        if phone_with_plus:
+            account_data['phone'] = phone_with_plus 
+            logger.info(f"Номер телефона для сохранения в БД: {account_data['phone']}")
+        else:
+            # Этот случай не должен произойти, но для безопасности
+            logger.error("Критическая ошибка: phone_with_plus не был определен перед сохранением в БД.")
+            raise HTTPException(status_code=500, detail="Внутренняя ошибка: не удалось определить номер телефона для сохранения.")
+        # === КОНЕЦ ИСПРАВЛЕНИЯ ===
 
         # 8. Добавление аккаунта в БД
-        # Генерируем ID здесь, чтобы вернуть его
-        account_id = str(uuid.uuid4()) 
-        account_data['id'] = account_id # Добавляем ID в данные для сохранения
-
+        logger.info(f"Попытка добавления аккаунта {account_id} в БД для пользователя {api_key[:5]}...")
         success = await add_tg_account_db(api_key, account_data)
         if not success:
             logger.error("Ошибка добавления аккаунта Telegram в базу данных.")
-            # Попытаемся удалить сохраненный файл сессии
-            if saved_session_path and os.path.exists(saved_session_path):
+            # Попытаемся удалить сохраненный файл сессии, т.к. запись в БД не удалась
+            if session_file_path and os.path.exists(session_file_path):
                 try:
-                    os.remove(saved_session_path)
-                    logger.info(f"Удален файл сессии {saved_session_path} из-за ошибки добавления в БД.")
+                    os.remove(session_file_path)
+                    logger.info(f"Удален файл сессии {session_file_path} из-за ошибки добавления в БД.")
                 except OSError as remove_err:
-                    logger.error(f"Не удалось удалить файл сессии {saved_session_path} после ошибки БД: {remove_err}")
+                    logger.error(f"Не удалось удалить файл сессии {session_file_path} после ошибки БД: {remove_err}")
             raise HTTPException(status_code=500, detail="Ошибка добавления аккаунта в базу данных")
 
-        logger.info(f"Аккаунт Telegram {account_id} (телефон: {phone}) успешно добавлен для пользователя {api_key[:5]}...")
-
-        # --- Попытка инициализировать и проверить клиент (опционально, но полезно) ---
-        # Можно добавить вызов функции для создания клиента и проверки соединения здесь
-        # Например: check_client_connection(account_id, account_data)
-        # --- Конец проверки ---
+        logger.info(f"Аккаунт Telegram {account_id} (телефон: {phone}) успешно добавлен для пользователя {api_key[:5]}... Статус: {account_data['status']}")
+        # --- Конец ИЗМЕНЕНИЯ ---
 
         return JSONResponse(status_code=201, content={
             "message": "Аккаунт Telegram успешно добавлен",
@@ -208,22 +257,22 @@ async def add_telegram_account_from_files(
     except HTTPException as http_exc:
         # Перебрасываем HTTP исключения
         # Удаляем файл сессии, если он был создан до ошибки
-        if saved_session_path and os.path.exists(saved_session_path):
+        if session_file_path and os.path.exists(session_file_path):
              try:
-                 os.remove(saved_session_path)
-                 logger.info(f"Удален файл сессии {saved_session_path} из-за HTTP ошибки: {http_exc.detail}")
+                 os.remove(session_file_path)
+                 logger.info(f"Удален файл сессии {session_file_path} из-за HTTP ошибки: {http_exc.detail}")
              except OSError as remove_err:
-                  logger.error(f"Не удалось удалить файл сессии {saved_session_path} после HTTP ошибки: {remove_err}")
+                  logger.error(f"Не удалось удалить файл сессии {session_file_path} после HTTP ошибки: {remove_err}")
         raise http_exc
     except Exception as e:
         logger.error(f"Неожиданная ошибка при добавлении TG аккаунта из файлов: {e}")
         logger.error(traceback.format_exc())
         # Попытка удалить файл сессии, если он был сохранен до ошибки
-        if saved_session_path and os.path.exists(saved_session_path):
+        if session_file_path and os.path.exists(session_file_path):
             try:
-                os.remove(saved_session_path)
-                logger.info(f"Удален файл сессии {saved_session_path} из-за неожиданной ошибки.")
+                os.remove(session_file_path)
+                logger.info(f"Удален файл сессии {session_file_path} из-за неожиданной ошибки.")
             except OSError as remove_err:
-                logger.error(f"Не удалось удалить файл сессии {saved_session_path} после ошибки: {remove_err}")
+                logger.error(f"Не удалось удалить файл сессии {session_file_path} после ошибки: {remove_err}")
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {e}")
     # Файлы уже закрыты в блоках finally или через UploadFile 

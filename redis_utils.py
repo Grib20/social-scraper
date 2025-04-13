@@ -233,10 +233,15 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
                                f"Удаляем статистику из Redis (Count: {count}, LastUsed: {last_used_str}).")
                 try:
                     # Пытаемся удалить ключи из Redis
-                    await redis_client.delete(count_key, last_used_key)
-                    logger.info(f"Статистика из Redis для несуществующего аккаунта {platform}:{account_id} удалена.")
+                    deleted_count = await redis_client.delete(count_key, last_used_key)
+                    if deleted_count > 0:
+                         logger.info(f"Статистика из Redis для несуществующего аккаунта {platform}:{account_id} удалена ({deleted_count} ключей).")
+                    else:
+                         logger.warning(f"Не удалось удалить статистику из Redis для {platform}:{account_id} (ключи не найдены?).")
                 except aredis.RedisError as del_err:
                     logger.error(f"Ошибка Redis при удалении статистики для {platform}:{account_id}: {del_err}")
+                except Exception as del_exc: # Ловим ЛЮБУЮ другую ошибку при удалении
+                     logger.error(f"Неожиданная ошибка при удалении статистики Redis для {platform}:{account_id}", exc_info=True)
                 # Возвращаем False, так как синхронизация с БД не удалась
                 return False
 
@@ -374,35 +379,42 @@ async def get_account_stats_redis(account_id, platform):
         return None
 
 async def reset_account_stats_redis(account_id, platform):
-    """Сбрасывает статистику использования аккаунта в Redis."""
+    """Асинхронно сбрасывает (удаляет) статистику для аккаунта в Redis."""
     redis_client = await get_redis()
     if not redis_client:
-        logger.warning(f"Redis недоступен, не могу сбросить статистику для {platform}:{account_id}")
-        return False
-    
-    logger.info(f"Сброс статистики в Redis для аккаунта {platform}:{account_id}")
+        logger.warning(f"Redis недоступен, сброс статистики ({platform}:{account_id}) невозможен")
+        return False # Возвращаем False, если Redis недоступен
+
     try:
         count_key = f"account:{platform}:{account_id}:requests_count"
         last_used_key = f"account:{platform}:{account_id}:last_used"
         
-        # Используем await для команд set/delete
-        await redis_client.set(count_key, 0)
-        await redis_client.delete(last_used_key)
+        # Используем await для delete
+        deleted_count = await redis_client.delete(count_key, last_used_key)
         
-        await sync_account_stats_to_db(account_id, platform, force=True)
-        
-        return True
+        if deleted_count > 0:
+            logger.info(f"Статистика из Redis для аккаунта {platform}:{account_id} успешно сброшена (удалено {deleted_count} ключей).")
+            # Сбросим статистику и в БД (не обязательно, но для консистентности)
+            await sync_account_stats_to_db(account_id, platform, force=True) 
+            return True
+        else:
+            # Ключи не найдены, значит, уже сброшено или не было
+            logger.info(f"Статистика для аккаунта {platform}:{account_id} в Redis не найдена (уже сброшена?).")
+            # Можно дополнительно убедиться, что в БД тоже 0
+            await sync_account_stats_to_db(account_id, platform, force=True)
+            return True # Считаем успехом, так как ключей нет
+            
     except aredis.RedisError as e:
-        logger.error(f"Ошибка Redis при сбросе статистики для {platform}:{account_id}: {e}")
-        return False
+        logger.error(f"Ошибка Redis при сбросе статистики ({platform}:{account_id}): {e}")
+        return False # Возвращаем False при ошибке Redis
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при сбросе статистики Redis для {platform}:{account_id}: {e}")
+        logger.error(f"Неожиданная ошибка при сбросе статистики в Redis ({platform}:{account_id}): {e}")
         import traceback
         logger.error(traceback.format_exc())
         return False
 
 async def reset_all_account_stats():
-    """Сбрасывает статистику использования всех аккаунтов в Redis и синхронизирует с БД."""
+    """Асинхронно сбрасывает статистику для ВСЕХ аккаунтов в Redis."""
     redis_client = await get_redis()
     if not redis_client:
         logger.warning("Redis недоступен, сброс статистики невозможен")

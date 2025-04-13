@@ -576,7 +576,19 @@ def sanitize_proxy_for_logs(proxy: Optional[str]) -> str:
 # --- Конец перемещенных хелперов ---
 
 # --- Функция create_telegram_client ---
-async def create_telegram_client(session_path: str, api_id: int, api_hash: str, proxy: Optional[str] = None) -> TelegramClient:
+async def create_telegram_client(
+    session_path: str, 
+    api_id: int, 
+    api_hash: str, 
+    proxy: Optional[str] = None,
+    # === Новые параметры ===
+    device_model: str = "Social Scraper",
+    system_version: str = "1.0",
+    app_version: str = "1.0",
+    lang_code: str = "en",
+    system_lang_code: str = "en"
+    # =======================
+) -> TelegramClient:
     """Создает клиент Telegram с указанными параметрами."""
     try:
         # Настройка прокси
@@ -622,11 +634,13 @@ async def create_telegram_client(session_path: str, api_id: int, api_hash: str, 
             api_id,
             api_hash,
             proxy=proxy_config if proxy_config else {},
-            device_model="Social Scraper",
-            system_version="1.0",
-            app_version="1.0",
-            lang_code="ru",
-            system_lang_code="ru",
+            # === Использование новых параметров ===
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
+            # =====================================
             connection_retries=3,  # Запрещаем бесконечные попытки
             retry_delay=1,  # Минимальная задержка между попытками
             auto_reconnect=False,  # Запрещаем автоматическое переподключение
@@ -684,6 +698,15 @@ class TelegramClientPool(ClientPool):
         proxy = account.get('proxy')
         account_id = account.get('id')
         
+        # === ИСПРАВЛЕНИЕ: Гарантируем передачу строк ===
+        # Используем `or 'значение'`, чтобы None превратился в строку по умолчанию
+        device_model = account.get('device_model') or 'Social Scraper' 
+        system_version = account.get('system_version') or '1.0'
+        app_version = account.get('app_version') or '1.0'
+        lang_code = account.get('lang_code') or 'en'
+        system_lang_code = account.get('system_lang_code') or 'en'
+        # ================================================
+        
         # Проверяем наличие необходимых данных
         if not all([api_id, api_hash, session_file, account_id]):
             logger.error(f"Невозможно создать клиент Telegram для аккаунта {account_id}: отсутствуют необходимые данные")
@@ -712,7 +735,14 @@ class TelegramClientPool(ClientPool):
                     session_path=session_file,
                     api_id=api_id,
                     api_hash=api_hash,
-                    proxy=proxy
+                    proxy=proxy,
+                    # === Передача дополнительных полей ===
+                    device_model=device_model,
+                    system_version=system_version,
+                    app_version=app_version,
+                    lang_code=lang_code,
+                    system_lang_code=system_lang_code
+                    # =======================================
                 )
                 
                 if client:

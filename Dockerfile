@@ -37,12 +37,12 @@ RUN apt-get update && apt-get install -y \
     libmagic1 \
     ffmpeg \
     curl \
-    sqlite3 \
+    libpq-dev \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Создаем директории для данных и директорию для базы данных
-RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets /app/database \
-    && chmod -R 777 /app/database
+RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets /app/database
 
 # Создаем непривилегированного пользователя
 RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
@@ -60,7 +60,6 @@ USER appuser
 ENV PYTHONUNBUFFERED=1
 ENV PORT=3030
 ENV LOG_DIR=/app/logs
-ENV DB_PATH=/app/database/users.db
 
 # Открываем порт
 EXPOSE 3030

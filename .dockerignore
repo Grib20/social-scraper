@@ -81,7 +81,6 @@ LICENSE
 .coverage
 
 # Секреты и ключи
-secrets/
 *.pem
 *.key
 *.crt 

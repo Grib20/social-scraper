@@ -28,6 +28,14 @@ import ssl
 from telethon.tl.types import InputPeerUser, InputPeerChat
 from urllib.parse import urlparse
 import traceback
+import random
+import base64
+import io
+from telethon import TelegramClient # Убедимся, что импортирован
+from telethon.tl.types import InputPeerChannel, InputPeerUser, MessageMediaPhoto, MessageMediaDocument, DocumentAttributeFilename, Message # Добавили Message
+from telethon.errors import ChannelInvalidError, ChannelPrivateError, UserDeactivatedBanError, AuthKeyError, FloodWaitError, UserNotParticipantError, UsernameNotOccupiedError, UsernameInvalidError
+# Импортируем КЛАСС пула, а не экземпляр
+from client_pools import TelegramClientPool, TELEGRAM_DEGRADED_MODE_DELAY 
 
 # Определим перечисление для типов прокси, так как ProxyType недоступен в Telethon
 class ProxyType:
@@ -335,92 +343,201 @@ async def auth_telegram_2fa(client: TelegramClient, password: str) -> None:
         logger.error(f"Ошибка при авторизации 2FA: {e}")
         raise
 
-async def _find_channels_with_account(client: TelegramClient, keywords: List[str], min_members: int = 100000, max_channels: int = 20) -> Dict:
-    """Вспомогательная функция для поиска каналов с одним аккаунтом."""
-    # Используем словарь для хранения уникальных каналов по ID
-    unique_channels = {}
-    wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
-    
-    for keyword in keywords:
-        try:
-            async with REQUEST_SEMAPHORE:
-                # Используем правильный способ вызова поиска контактов
-                # Вместо передачи класса SearchRequest, создаем его экземпляр
-                search_request = functions.contacts.SearchRequest(
-                    q=keyword,
-                    limit=100 # Искать среди 100 первых результатов
-                )
-                
-                # Вызываем напрямую через клиент
-                result = await client(search_request)
-                
-                # Обрабатываем найденные чаты
-                for chat in result.chats:
-                    # Ищем только каналы (не мегагруппы)
-                    if isinstance(chat, types.Channel) and not chat.megagroup:
-                        # Прерываем, если уже нашли достаточно каналов
-                        if len(unique_channels) >= max_channels:
-                            break
-                            
-                        # Пропускаем, если канал уже был добавлен ранее
-                        if chat.id in unique_channels:
-                            logger.info(f"Канал {chat.title} (ID: {chat.id}) уже был добавлен по другому ключевому слову")
-                            continue
-                            
-                        # Получаем полное инфо для проверки количества участников
-                        try:
-                            # Используем id и access_hash из объекта chat
-                            if chat.access_hash is not None:
-                                input_channel = types.InputChannel(channel_id=chat.id, access_hash=chat.access_hash)
-                                full_request = functions.channels.GetFullChannelRequest(
-                                    channel=input_channel # Передаем созданный InputChannel
-                                )
-                                full_chat = await client(full_request)
-                            else:
-                                logger.warning(f"Не удалось получить полную информацию о канале {chat.title} (ID: {chat.id}), так как access_hash отсутствует")
-                                continue
-                            
-                            members_count = full_chat.full_chat.participants_count
-                            if members_count >= min_members:
-                                channel_id = f'@{chat.username}' if chat.username else str(chat.id)
-                                unique_channels[chat.id] = {
-                                    "id": chat.id,
-                                    "title": chat.title,
-                                    "username": chat.username,
-                                    "members_count": members_count,
-                                    "description": full_chat.full_chat.about
-                                }
-                                # Сохраняем в кэше количество участников канала
-                                channel_members_cache[channel_id] = members_count
-                                logger.info(f"Найден канал {chat.title} (ID: {chat.id}) по ключевому слову '{keyword}' с {members_count} участниками")
-                        except FloodWaitError as flood_e:
-                            logger.warning(f"Flood wait на {flood_e.seconds} секунд при получении информации о канале {getattr(chat, 'username', chat.id)}")
-                            await asyncio.sleep(flood_e.seconds)
-                        except Exception as e_inner:
-                            logger.error(f"Ошибка при получении информации о канале {getattr(chat, 'username', chat.id)}: {e_inner}")
-        except FloodWaitError as flood_e:
-            logger.warning(f"Flood wait на {flood_e.seconds} секунд при поиске по слову '{keyword}'")
-            await asyncio.sleep(flood_e.seconds)
-        except Exception as e:
-            logger.error(f"Ошибка при поиске каналов по ключевому слову {keyword}: {e}")
-            continue
-    
-    return unique_channels
+# --- Вспомогательная функция (код без изменений, только проверяем сигнатуру) ---
+async def _find_channels_with_account(client: TelegramClient, keywords: List[str], min_members: int = 100000, max_channels: int = 20) -> Dict[int, Dict]:
+    """Ищет каналы с использованием одного конкретного клиента."""
+    found_channels_dict = {}
+    processed_keywords = set()
 
-async def find_channels(client: TelegramClient, keywords: List[str], min_members: int = 100000, max_channels: int = 20, api_key: Optional[str] = None) -> List[Dict]:
-    """Находит каналы по ключевым словам."""
-    logger.info(f"Поиск каналов по ключевым словам: {keywords}")
-    # Используем напрямую переданный клиент
-    result_dict = await _find_channels_with_account(client, keywords, min_members, max_channels)
+    logger.info(f"Запуск поиска каналов для клиента ({client.session.filename if client.session else 'unknown'}) по словам: {keywords}")
+
+    try:
+        # Убедимся, что клиент подключен
+        if not client.is_connected():
+            logger.info(f"Клиент ({client.session.filename if client.session else 'unknown'}) не подключен. Подключаемся...")
+            await client.connect()
+
+        if not await client.is_user_authorized():
+            logger.warning(f"Клиент ({client.session.filename if client.session else 'unknown'}) не авторизован. Поиск каналов невозможен.")
+            return {}
+
+        # --- Основной цикл поиска ---
+        for keyword in keywords:
+            if keyword in processed_keywords:
+                continue
+            processed_keywords.add(keyword)
+
+            try:
+                logger.debug(f"Поиск по слову: '{keyword}' через клиент {client.session.filename if client.session else 'unknown'}")
+                # Используем SearchGlobalRequest для поиска по ключевому слову
+                # В Telethon v1 используем functions.contacts.SearchRequest
+                result = await client(functions.contacts.SearchRequest(
+                    q=keyword,
+                    limit=max_channels * 2 # Ищем с запасом, чтобы отфильтровать позже
+                ))
+
+                # Обрабатываем найденные каналы
+                if hasattr(result, 'chats'):
+                    for chat in result.chats:
+                        # Ищем только каналы (не мегагруппы)
+                        if isinstance(chat, types.Channel) and getattr(chat, 'megagroup', False) is False:
+                            channel_id = chat.id
+                            # Проверяем, не добавлен ли уже канал
+                            if channel_id not in found_channels_dict:
+                                try:
+                                    participants_count = None # Инициализируем
+                                    if chat.access_hash is not None: # Проверяем наличие access_hash
+                                        try:
+                                            input_channel = types.InputChannel(channel_id=chat.id, access_hash=chat.access_hash)
+                                            full_channel = await client(GetFullChannelRequest(channel=input_channel))
+                                            participants_count = full_channel.full_chat.participants_count
+                                        except Exception as e_gfc:
+                                            logger.error(f"Ошибка GetFullChannelRequest для канала {chat.id}: {e_gfc}")
+                                    else:
+                                        logger.warning(f"Канал {chat.id} ('{chat.title}') не имеет access_hash. Пропускаем GetFullChannelRequest.")
+
+
+                                    # Проверяем минимальное количество участников
+                                    if participants_count is not None and participants_count >= min_members:
+                                        # Получаем username, проверяем его наличие
+                                        username = getattr(chat, 'username', None)
+                                        link = f"https://t.me/{username}" if username else None
+
+                                        found_channels_dict[channel_id] = {
+                                            'id': channel_id,
+                                            'title': chat.title,
+                                            'username': username,
+                                            'link': link,
+                                            'members_count': participants_count
+                                        }
+                                        logger.debug(f"Найден подходящий канал: {chat.title} ({participants_count} участников)")
+                                        # Останавливаемся, если достигли лимита max_channels
+                                        if len(found_channels_dict) >= max_channels:
+                                            logger.info(f"Достигнут лимит ({max_channels}) найденных каналов по слову '{keyword}'.")
+                                            break # Прерываем внутренний цикл по чатам
+                                except ChannelPrivateError:
+                                    # logger.warning(f"Канал '{chat.title}' (ID: {channel_id}) приватный, пропускаем.")
+                                    pass # Просто пропускаем приватные
+                                except Exception as e_full:
+                                    logger.error(f"Ошибка при получении полной информации о канале {channel_id} ('{chat.title}'): {e_full}")
+                    # Выходим из внешнего цикла по ключевым словам, если достигли общего лимита
+                    if len(found_channels_dict) >= max_channels:
+                         logger.info(f"Достигнут общий лимит ({max_channels}) найденных каналов.")
+                         break
+                else:
+                     logger.debug(f"Результат поиска по '{keyword}' не содержит 'chats'.")
+
+            except FloodWaitError as e:
+                logger.warning(f"FloodWaitError при поиске по слову '{keyword}': ждем {e.seconds} секунд")
+                await asyncio.sleep(e.seconds + 1)
+            except (UsernameNotOccupiedError, UsernameInvalidError):
+                 # logger.warning(f"Поиск по '{keyword}' не дал результатов (UsernameNotOccupiedError/UsernameInvalidError).")
+                 pass # Это нормальная ситуация, просто нет таких каналов
+            except Exception as e_search:
+                logger.error(f"Ошибка при поиске по слову '{keyword}': {e_search}", exc_info=True)
+
+    except AuthKeyError:
+         logger.error(f"Ключ авторизации невалиден для клиента {client.session.filename if client.session else 'unknown'}. Поиск прерван.")
+         # Можно добавить логику деактивации аккаунта
+    except UserDeactivatedBanError:
+         logger.error(f"Аккаунт {client.session.filename if client.session else 'unknown'} заблокирован. Поиск прерван.")
+         # Можно добавить логику деактивации аккаунта
+    except Exception as e_outer:
+         logger.error(f"Общая ошибка в _find_channels_with_account ({client.session.filename if client.session else 'unknown'}): {e_outer}", exc_info=True)
+
+    logger.info(f"Завершен поиск для клиента ({client.session.filename if client.session else 'unknown'}). Найдено уникальных: {len(found_channels_dict)}")
+    return found_channels_dict
+
+# --- ИЗМЕНЕННАЯ Функция find_channels ---
+async def find_channels(
+    # client: TelegramClient, # <-- Убрали
+    telegram_pool: TelegramClientPool, # <-- Добавили
+    keywords: List[str],
+    min_members: int = 100000,
+    max_channels: int = 20,
+    api_key: Optional[str] = None
+    ) -> List[Dict]:
+    """Находит каналы по ключевым словам, используя ротацию аккаунтов."""
+    logger.info(f"Поиск каналов по ключевым словам: {keywords} для api_key: {api_key}")
     
-    # Преобразуем словарь в список
-    channels_list = list(result_dict.values())
-    
+    # Проверяем наличие пула и ключа API
+    if not telegram_pool:
+        logger.error("Экземпляр telegram_pool не передан в find_channels.")
+        return []
+    if not api_key:
+        logger.error("API ключ не передан в find_channels.")
+        return []
+    if not keywords:
+        logger.warning("Список ключевых слов пуст.")
+        return []
+
+    # --- Получаем активные аккаунты ЧЕРЕЗ ПУЛ (он создаст клиентов) --- 
+    try:
+        # from user_manager import get_active_accounts # <-- Убираем импорт
+        # Используем метод пула, который гарантирует создание клиентов
+        active_accounts = await telegram_pool.get_active_clients(api_key)
+        if not active_accounts:
+             logger.warning(f"Не найдено активных Telegram аккаунтов для ключа {api_key} через пул. Поиск невозможен.")
+             return []
+    except Exception as e_acc:
+        logger.error(f"Ошибка при получении активных аккаунтов через пул в find_channels: {e_acc}", exc_info=True)
+        return []
+    # -----------------------------------------------------------------
+
+    all_found_channels_dict: Dict[int, Dict] = {}
+    tasks = []
+
+    logger.info(f"Найдено {len(active_accounts)} активных аккаунтов. Запуск поиска каналов...")
+
+    # Запускаем поиск для каждого активного аккаунта
+    for account_info in active_accounts:
+        account_id = account_info.get('id')
+        if not account_id:
+            logger.warning("Найден аккаунт без ID в списке активных. Пропуск.")
+            continue
+
+        client = telegram_pool.get_client(account_id)
+        if not client or not isinstance(client, TelegramClient):
+            logger.warning(f"Клиент не найден или некорректен для аккаунта {account_id}. Пропуск.")
+            continue
+
+        # Каждый клиент ищет по всем ключевым словам
+        # Передаем копию списка keywords, на всякий случай
+        tasks.append(asyncio.create_task(
+            _find_channels_with_account(client, list(keywords), min_members, max_channels)
+        ))
+
+    # Ожидаем завершения всех задач
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            # Получаем ID для лога, даже если результат - ошибка
+            acc_id_log = "unknown_id"
+            if i < len(active_accounts) and isinstance(active_accounts[i], dict):
+                acc_id_log = active_accounts[i].get('id', f"index_{i}")
+
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка при поиске каналов аккаунтом {acc_id_log}: {result}", exc_info=result)
+            elif isinstance(result, dict):
+                logger.info(f"Аккаунт {acc_id_log} нашел {len(result)} каналов.")
+                # Объединяем результаты, новые каналы заменят старые, если ID совпадут
+                all_found_channels_dict.update(result)
+            else:
+                logger.warning(f"Неожиданный результат поиска от аккаунта {acc_id_log}: {type(result)}")
+
+    # Преобразуем объединенный словарь в список
+    channels_list = list(all_found_channels_dict.values())
+
     # Сортируем найденные каналы по количеству участников (по убыванию)
-    sorted_channels = sorted(channels_list, key=lambda x: x['members_count'], reverse=True)
-    
-    logger.info(f"Найдено {len(sorted_channels)} уникальных каналов Telegram")
-    return sorted_channels
+    sorted_channels = sorted(channels_list, key=lambda x: x.get('members_count', 0), reverse=True)
+
+    # Ограничиваем итоговый список
+    final_channels = sorted_channels[:max_channels]
+
+    logger.info(f"Итого найдено {len(final_channels)} уникальных каналов Telegram после ротации.")
+    return final_channels
+
+# --- Конец ИЗМЕНЕННОЙ Функции find_channels ---
 
 def _extract_media_details(media):
     """Извлекает детали медиа для дальнейшей обработки."""
@@ -866,7 +983,8 @@ async def get_album_messages(client, chat, main_message):
 async def get_trending_posts(
     client: TelegramClient, # Основной клиент (для случая без ротации)
     account_id_main: str,   # ID основного клиента
-    # Используем Sequence вместо List для ковариантности
+    # ---> Добавляем параметр для пула <---
+    telegram_pool: TelegramClientPool, 
     channel_ids: Sequence[Union[int, str]], 
     days_back: int = 7,
     posts_per_channel: int = 10,
@@ -928,26 +1046,38 @@ async def get_trending_posts(
 
         # Если есть несколько активных аккаунтов для ротации
         if active_accounts: # Если есть несколько активных аккаунтов для ротации
+            # Проверяем, передан ли пул
+            if not telegram_pool:
+                logger.error("Экземпляр telegram_pool не был передан в get_trending_posts. Ротация невозможна.")
+                active_accounts = [] # Отключаем ротацию
+
+        # Повторная проверка, так как пул мог не быть передан
+        if active_accounts and telegram_pool: 
             num_accounts = len(active_accounts)
-            # Распределяем каналы между аккаунтами
-            # + (len(flat_channel_ids_str) % num_accounts > 0) # Добавляем 1, если есть остаток
             channels_per_account = (len(flat_channel_ids_str) + num_accounts - 1) // num_accounts # Округление вверх
             tasks = []
             start_index = 0
             logger.info(f"Распределяем {len(flat_channel_ids_str)} каналов по {num_accounts} аккаунтам (примерно по {channels_per_account})")
 
             for i, account_info in enumerate(active_accounts):
-                 account_client = None
-                 account_id_rot = None # ID аккаунта для ротации
+                 account_id_rot = None
+                 # --- Получаем ID аккаунта --- 
                  if isinstance(account_info, dict):
-                     account_client = account_info.get('client')
                      account_id_rot = account_info.get('id')
-                 elif isinstance(account_info, (list, tuple)) and len(account_info) > 0:
-                      account_client = account_info[0]
-                      if len(account_info) > 1: account_id_rot = account_info[1]
+                 else:
+                     logger.warning(f"Неожиданный формат данных для аккаунта на позиции {i}. Пропуск.")
+                     continue
 
-                 if not account_client or not isinstance(account_client, TelegramClient) or not account_id_rot: # Проверяем и ID
-                     logger.warning(f"Клиент Telegram или ID не найден/некорректен для аккаунта {i}. Пропуск.")
+                 if not account_id_rot:
+                     logger.warning(f"Не удалось получить ID для аккаунта на позиции {i}. Пропуск.")
+                     continue
+                 
+                 # --- Используем ПЕРЕДАННЫЙ telegram_pool --- 
+                 account_client = telegram_pool.get_client(account_id_rot)
+
+                 # --- Используем account_id_rot для логирования --- 
+                 if not account_client or not isinstance(account_client, TelegramClient):
+                     logger.warning(f"Клиент Telegram не найден/некорректен для аккаунта ID: {account_id_rot} в переданном пуле. Пропуск.")
                      continue
 
                  # Определяем каналы для этого аккаунта
@@ -957,13 +1087,14 @@ async def get_trending_posts(
 
                  if not channels_for_this_account: continue # Пропускаем, если каналов не осталось
 
-                 logger.info(f"Аккаунт {account_id_rot} будет обрабатывать {len(channels_for_this_account)} каналов: {channels_for_this_account[:3]}...")
+                 # --- Используем account_id_rot для логирования --- 
+                 logger.info(f"Аккаунт ID: {account_id_rot} будет обрабатывать {len(channels_for_this_account)} каналов: {channels_for_this_account[:3]}...")
 
                  # Создаем задачу для аккаунта
                  task = asyncio.create_task(
                     _process_channels_for_trending(
-                        account_client, # Передаем клиента для выполнения запросов
-                        account_id_rot, # Передаем ID для фоновых задач
+                        account_client, # Корректный клиент
+                        account_id_rot, # Корректный ID
                         channels_for_this_account,
                         cutoff_date.replace(tzinfo=None),
                         posts_per_channel,
@@ -977,24 +1108,24 @@ async def get_trending_posts(
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
-                    acc_id_log = f"acc_{i}"
-                    # Пытаемся получить реальный ID, если возможно
+                    # --- Используем ID аккаунта для логирования ошибок --- 
+                    acc_id_log = f"index_{i}" # ID по умолчанию
                     if i < len(active_accounts):
                          info = active_accounts[i]
                          if isinstance(info, dict): acc_id_log = info.get('id', acc_id_log)
-                         elif isinstance(info, (list, tuple)) and len(info)>1: acc_id_log = info[1]
+                    # -----------------------------------------------------
 
                     if isinstance(result, Exception):
-                        logger.error(f"Ошибка при обработке каналов аккаунтом {acc_id_log}: {result}", exc_info=result)
+                        logger.error(f"Ошибка при обработке каналов аккаунтом ID: {acc_id_log}: {result}", exc_info=result)
                     elif isinstance(result, list):
-                        logger.info(f"Аккаунт {acc_id_log} успешно обработал каналы, найдено постов: {len(result)}")
+                        logger.info(f"Аккаунт ID: {acc_id_log} успешно обработал каналы, найдено постов: {len(result)}")
                         all_posts.extend(result)
                     else:
-                         logger.warning(f"Неожиданный результат от аккаунта {acc_id_log}: {type(result)}")
+                         logger.warning(f"Неожиданный результат от аккаунта ID: {acc_id_log}: {type(result)}")
 
         else:
-            # Если ротация не используется
-            logger.info(f"Ротация не используется. Обработка всех каналов основным клиентом {account_id_main}.")
+            # Если ротация не используется (или невозможна)
+            logger.info(f"Ротация не используется или невозможна. Обработка всех каналов основным клиентом {account_id_main}.")
             processed_posts = await _process_channels_for_trending(
                 client, # Используем основной клиент
                 account_id_main, # ID основного клиента

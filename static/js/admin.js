@@ -1,4 +1,7 @@
 let currentUser;
+let currentAccountId = null;
+let currentPlatform = null;
+let isSessionValid = false;
 
 // Переменные для хранения информации об аккаунте Telegram в процессе авторизации
 let currentTelegramAccountId = null;
@@ -2913,8 +2916,18 @@ function showSessionJsonModal(userId) {
 
 // Обрабатывает отправку формы Session+JSON
 async function handleAddSessionJsonSubmit(event) {
-    event.preventDefault();
-    const form = event.target;
+    console.log('--- handleAddSessionJsonSubmit CALLED ---'); // Moved to the very top
+    event.preventDefault(); 
+    
+    // Find the form the button belongs to
+    const button = event.currentTarget; // The button that was clicked
+    const form = button.closest('form'); // Find the closest parent form
+    if (!form) {
+        console.error("Could not find parent form for the clicked button!");
+        showNotification("Критическая ошибка: не найдена форма для кнопки.", "error");
+        return; // Stop execution if form is not found
+    }
+    
     const formData = new FormData(form);
     const adminKey = getAdminKey();
     // Получаем api_key пользователя из скрытого поля
@@ -2947,7 +2960,26 @@ async function handleAddSessionJsonSubmit(event) {
     //     formData.append('proxy', proxyValue);
     // }
 
-    const submitButton = form.querySelector('button[type="submit"]');
+    console.log('--- handleAddSessionJsonSubmit ---');
+    console.log('Admin Key:', adminKey ? 'Present' : 'MISSING!');
+    console.log('User API Key:', userApiKey ? userApiKey : 'MISSING!');
+    console.log('Session File Selected:', sessionFileInput.files.length > 0);
+    console.log('JSON File Selected:', jsonFileInput.files.length > 0);
+    // Выведем все данные формы для отладки
+    console.log('FormData Entries:');
+    for (let [key, value] of formData.entries()) { 
+        console.log(key, value); 
+    }
+    console.log('----------------------------------');
+
+    // const submitButton = form.querySelector('button[type="submit"]'); // Old selector based on type
+    const submitButton = document.getElementById('addSessionJsonSubmitButton'); // Find button by ID
+    if (!submitButton) {
+        console.error("Could not find submit button with ID addSessionJsonSubmitButton!");
+        // We might not need to show a user notification here if the form couldn't be found earlier
+        return; 
+    }
+
     submitButton.disabled = true;
     submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Добавление...';
 
@@ -2955,9 +2987,9 @@ async function handleAddSessionJsonSubmit(event) {
         const response = await fetch('/api/v1/telegram/accounts/upload_session_json', {
             method: 'POST',
             headers: {
-                // 'Content-Type': 'multipart/form-data', // Не указываем Content-Type, браузер сам установит с boundary
-                'X-Admin-Key': adminKey,
-                'X-API-Key': userApiKey // Передаем API ключ пользователя
+                // 'Content-Type': 'multipart/form-data', // Browser sets this with boundary
+                'X-Admin-Key': adminKey, // Keep admin key if needed elsewhere
+                'api-key': userApiKey // Correct header for user API key
             },
             body: formData
         });
@@ -2981,6 +3013,63 @@ async function handleAddSessionJsonSubmit(event) {
 }
 
 // === Конец новых функций ===
+
+// --- START MISSING FUNCTION ---
+async function handleAddVkSubmit(event) {
+    event.preventDefault();
+    const form = event.target;
+    const formData = new FormData(form);
+    const adminKey = getAdminKey();
+    const userId = formData.get('userId'); // Assuming hidden field exists
+    const token = formData.get('token');
+    const proxy = formData.get('vk_proxy'); // Check name in HTML
+
+    if (!adminKey || !userId) {
+        showNotification("Ошибка: Не удалось определить ключ или пользователя.", "error");
+        return;
+    }
+    if (!token) {
+         showNotification("Ошибка: Токен VK обязателен.", "error");
+         return;
+    }
+
+    const submitButton = form.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Добавление...';
+
+    try {
+        // Determine the correct endpoint - Assuming an admin endpoint exists like for Telegram
+        // Might need adjustment based on actual backend routes
+        const response = await fetch(`/admin/users/${userId}/vk`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': adminKey
+            },
+            body: JSON.stringify({
+                token: token,
+                proxy: proxy || null // Send null if empty
+            })
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            showNotification(result.message || 'VK аккаунт успешно добавлен!', 'success');
+            closeModal('vkModal');
+            displayUsers(); // Refresh user list
+        } else {
+            showNotification(result.detail || 'Ошибка при добавлении VK аккаунта.', 'error');
+        }
+    } catch (error) {
+        console.error('Ошибка при добавлении VK аккаунта:', error);
+        showNotification('Произошла сетевая ошибка при добавлении VK аккаунта.', 'error');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-plus-circle"></i> Добавить';
+    }
+}
+// --- END MISSING FUNCTION ---
 
 // Обработчик события загрузки DOM
 document.addEventListener('DOMContentLoaded', () => {
@@ -3034,12 +3123,20 @@ document.addEventListener('DOMContentLoaded', () => {
         changeProxyForm.addEventListener('submit', updateProxy);
     }
 
-    // Обработчик для новой формы добавления Session+JSON
-    const sessionJsonForm = document.getElementById('addSessionJsonForm');
-    if (sessionJsonForm) {
-        sessionJsonForm.addEventListener('submit', handleAddSessionJsonSubmit);
+    // УДАЛЯЕМ старый обработчик для формы submit
+    // const sessionJsonForm = document.getElementById('addSessionJsonForm');
+    // if (sessionJsonForm) {
+    //     sessionJsonForm.addEventListener('submit', handleAddSessionJsonSubmit);
+    // } else {
+    //      console.error("Форма addSessionJsonForm не найдена!");
+    // }
+    
+    // НАЗНАЧАЕМ новый обработчик на КЛИК кнопки
+    const addSessionJsonButton = document.getElementById('addSessionJsonSubmitButton');
+    if (addSessionJsonButton) {
+        addSessionJsonButton.addEventListener('click', handleAddSessionJsonSubmit);
     } else {
-         console.error("Форма addSessionJsonForm не найдена!");
+        console.error("Кнопка addSessionJsonSubmitButton не найдена!");
     }
     
     // Инициализация вкладок

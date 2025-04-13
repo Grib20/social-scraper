@@ -885,10 +885,10 @@ async def find_groups(request: Request):
         data = await request.json()
         keywords = data.get("keywords")
         api_key = data.get("api_key", "")
-        platform = data.get("platform", "vk")
+        platform = data.get("platform", "vk") # Изменено на vk по умолчанию? Или telegram?
         min_members = data.get("min_members", 10000)
         max_count = data.get("max_groups", 20)
-        
+
         # Получаем API ключ из заголовка запроса или из тела запроса
         if not api_key:
             api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
@@ -899,108 +899,84 @@ async def find_groups(request: Request):
 
         if not keywords:
             return JSONResponse(status_code=400, content={"error": "No keywords provided"})
-            
+
         if not api_key:
             return JSONResponse(status_code=401, content={"error": "API key is required"})
-        
-        # Проверяем API ключ с помощью verify_api_key вместо get_user
+
+        # Проверяем API ключ
         from user_manager import verify_api_key
         if not await verify_api_key(api_key):
             return JSONResponse(status_code=403, content={"error": "Invalid API key"})
-            
-        # Создаем новый запрос с API ключом в заголовке
-        # Вместо прямого изменения _headers, создаем новый объект scope
-        new_scope = dict(request.scope)
-        new_headers = [(k.lower().encode(), v.encode()) for k, v in request.headers.items()]
-        new_headers.append((b'api-key', api_key.encode()))
-        new_scope['headers'] = new_headers
-        request_for_auth = Request(new_scope)
-        
-        # Используем параллельную обработку для обоих платформ
+
+        # --- УБИРАЕМ создание request_for_auth, т.к. auth_middleware больше не нужен для Telegram ---
+
         if platform.lower() == "vk":
-            # Получаем клиент VK через auth_middleware
+            # ---> Используем ГЛОБАЛЬНЫЙ экземпляр пула VK <---\
+            vk_pool_instance = vk_pool # Обращаемся к глобальной переменной
+            # ---------------------------------------------------
+            if not vk_pool_instance:
+                 logger.error("Глобальный экземпляр vk_pool не найден.")
+                 raise HTTPException(500, "Внутренняя ошибка сервера: Пул клиентов VK недоступен.")
             try:
-                from vk_utils import find_groups_by_keywords
-                import inspect
-                
-                # Получаем клиент VK используя auth_middleware
-                vk_client = await auth_middleware(request_for_auth, 'vk')
+                from vk_utils import find_groups_by_keywords # Убедимся, что импорт есть
+                # Получаем клиента из пула
+                vk_client, vk_account_id = await vk_pool_instance.select_next_client(api_key)
                 if not vk_client:
                     return JSONResponse(
-                        status_code=400, 
+                        status_code=400,
                         content={"error": "No VK account available"}
                     )
-
-                # Проверяем, что vk_client не является bool
-                if isinstance(vk_client, bool):
-                     logger.error("auth_middleware вернул bool вместо клиента VK")
-                     return JSONResponse(
-                        status_code=500,
-                        content={"error": "Failed to initialize VK client (internal error)"}
-                    )
-
-                # --- Добавляем детальное логирование ---
-                logger.info(f"Тип полученного vk_client: {type(vk_client)}")
-                logger.info(f"Является ли vk_client экземпляром VKClient: {isinstance(vk_client, VKClient)}")
-                logger.info(f"Тип функции find_groups_by_keywords: {type(find_groups_by_keywords)}")
-                
-                # Создаем объект корутины перед await
-                coro_to_await = find_groups_by_keywords(vk_client, keywords, min_members, max_count, api_key)
-                
-                logger.info(f"Тип объекта для await: {type(coro_to_await)}")
-                logger.info(f"Является ли объект awaitable: {inspect.isawaitable(coro_to_await)}")
-                # --- Конец детального логирования ---
-                
-                # Ищем группы, ожидая уже созданную корутину
-                groups = await coro_to_await 
+                logger.info(f"Получен клиент VK {vk_account_id} для поиска групп.")
+                groups = await find_groups_by_keywords(vk_client, keywords, min_members, max_count, api_key)
                 return {"groups": groups, "count": len(groups)}
             except Exception as e:
-                logger.error(f"Error in find_groups for VK: {e}")
+                logger.error(f"Error in find_groups for VK: {e}", exc_info=True)
                 return JSONResponse(
                     status_code=500,
                     content={"error": f"Failed to find VK groups: {str(e)}"}
                 )
-        else:  # telegram
-            # Получаем клиент Telegram через auth_middleware
-            client = None # Инициализируем client как None
+        elif platform.lower() == "telegram": # Изменено на elif
             try:
-                from telegram_utils import find_channels # Убираем start_client и disconnect_client из импорта
+                # ---> Импортируем find_channels и класс пула <---
+                from telegram_utils import find_channels
+                from client_pools import TelegramClientPool # Убедимся, что класс импортирован
 
-                # Получаем Telegram клиент используя запрос с правильным заголовком
-                client = await auth_middleware(request_for_auth, 'telegram')
-                if not client:
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": "No Telegram account available"}
-                    )
-                
-                logger.info(f"Получен клиент Telegram для поиска каналов. Подключение...")
-                # Подключаем клиент перед использованием напрямую
-                await client.connect() 
-                logger.info(f"Клиент Telegram подключен.")
+                # ---> Используем ГЛОБАЛЬНЫЙ экземпляр пула <---
+                telegram_pool_instance = telegram_pool # Обращаемся к глобальной переменной
+                # -------------------------------------------
 
-                # Ищем каналы
-                channels = await find_channels(client, keywords, min_members, max_count, api_key)
+                if not telegram_pool_instance or not isinstance(telegram_pool_instance, TelegramClientPool):
+                     logger.error("Глобальный экземпляр telegram_pool не найден или имеет неверный тип.")
+                     raise HTTPException(500, "Внутренняя ошибка сервера: Пул клиентов Telegram недоступен.")
+
+                # ---> УБИРАЕМ получение одного клиента через auth_middleware <---
+                # client = await auth_middleware(request_for_auth, 'telegram')
+                # ---> УБИРАЕМ client.connect() <---
+
+                logger.info(f"Запуск поиска каналов Telegram с использованием пула...")
+                # ---> Передаем ПУЛ в find_channels, а не клиента <---
+                channels = await find_channels(
+                    telegram_pool=telegram_pool_instance, # <--- Передаем пул
+                    keywords=keywords,
+                    min_members=min_members,
+                    max_channels=max_count,
+                    api_key=api_key # api_key нужен для получения активных аккаунтов внутри
+                )
                 logger.info(f"Поиск каналов завершен, найдено: {len(channels)}")
-                
                 return {"groups": channels, "count": len(channels)}
-            
+
             except Exception as e:
-                # Логируем ошибку перед возвратом ответа
-                logger.error(f"Ошибка в find_groups для Telegram: {e}", exc_info=True) # Добавляем exc_info=True
+                logger.error(f"Ошибка в find_groups для Telegram: {e}", exc_info=True)
                 return JSONResponse(
                     status_code=500,
                     content={"error": f"Failed to find Telegram channels: {str(e)}"}
                 )
-            finally:
-                # Гарантированно отключаем клиент, если он был создан
-                if client and client.is_connected(): # Проверяем, что клиент существует и подключен
-                    logger.info("Отключение клиента Telegram после поиска каналов...")
-                    # Отключаем клиент напрямую
-                    await client.disconnect() 
-                    logger.info("Клиент Telegram отключен.")
+            # ---> УБИРАЕМ блок finally с client.disconnect() <---
+        else:
+            raise HTTPException(400, "Платформа не поддерживается")
+
     except Exception as e:
-        logger.error(f"Error in find_groups: {e}")
+        logger.error(f"Error in find_groups: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={"error": f"Internal server error: {str(e)}"}
@@ -1011,28 +987,30 @@ async def trending_posts(request: Request, data: dict):
     # Инициализируем планировщик медиа
     from media_utils import init_scheduler
     await init_scheduler()
-    
+    # Импортируем нужные функции и классы
+    from telegram_utils import get_trending_posts
+    from client_pools import TelegramClientPool # Убедимся, что класс импортирован
+    from vk_utils import get_vk_posts_in_groups # Импорт для VK
+
     platform = data.get('platform', 'telegram')
     group_ids_input = data.get('group_ids', [])
     if not group_ids_input:
         raise HTTPException(400, "ID групп обязательны")
 
-    # --- Гарантируем, что group_ids - это список --- 
+    # Гарантируем, что group_ids - это список строк
     if isinstance(group_ids_input, (int, str)):
-        logger.warning(f"Получен не список group_ids: {group_ids_input}. Преобразуем в список.")
-        group_ids = [str(group_ids_input)] # Преобразуем в список строк
+        group_ids = [str(group_ids_input)]
     elif isinstance(group_ids_input, list):
-        group_ids = [str(gid) for gid in group_ids_input if gid is not None] # Преобразуем все элементы в строки
+        group_ids = [str(gid) for gid in group_ids_input if gid is not None]
     else:
         logger.error(f"Некорректный тип для group_ids: {type(group_ids_input)}")
         raise HTTPException(400, "Некорректный формат group_ids")
-    # ---------------------------------------------
-        
+
     days_back = data.get('days_back', 7)
     posts_per_group = data.get('posts_per_group', 10)
     min_views = data.get('min_views', 0)
 
-    # Получаем API ключ из заголовка для передачи в функцию get_trending_posts
+    # Получаем API ключ из заголовка
     api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
     if not api_key:
         auth_header = request.headers.get('authorization')
@@ -1040,44 +1018,82 @@ async def trending_posts(request: Request, data: dict):
             api_key = auth_header.split(' ')[1]
 
     if platform == 'telegram':
-        client = None 
+        client = None
         account_id = None
+
+        # ---> Используем ГЛОБАЛЬНЫЙ экземпляр пула <---
+        telegram_pool_instance = telegram_pool # Обращаемся к глобальной переменной
+        # -------------------------------------------
+
+        if not telegram_pool_instance or not isinstance(telegram_pool_instance, TelegramClientPool):
+             logger.error("Глобальный экземпляр telegram_pool не найден или имеет неверный тип.")
+             raise HTTPException(500, "Внутренняя ошибка сервера: Пул клиентов Telegram недоступен.")
+
         if api_key is None:
             logger.error("API ключ не предоставлен")
             raise HTTPException(status_code=401, detail="API ключ не предоставлен")
         try:
-            # Получаем КЛИЕНТА и ID АККАУНТА из auth_middleware
-            client, account_id = await telegram_pool.select_next_client(api_key)
+            # Получаем *основного* КЛИЕНТА и ID АККАУНТА из пула для начала
+            client, account_id = await telegram_pool_instance.select_next_client(api_key)
             if not client or not account_id:
                  logger.error(f"Не удалось получить Telegram клиент или account_id для API ключа {api_key}")
                  raise HTTPException(400, "Не удалось получить Telegram клиент")
 
-            logger.info(f"Получен клиент Telegram {account_id} для trending-posts. Подключение...")
-            await client.connect()
+            logger.info(f"Получен основной клиент Telegram {account_id} для trending-posts. Подключение...")
+            await client.connect() # Подключаем основного клиента
             logger.info(f"Клиент Telegram {account_id} подключен.")
 
-            # Передаем client, account_id и список group_ids
+            # ---> Передаем ГЛОБАЛЬНЫЙ экземпляр пула в get_trending_posts <--
             result = await get_trending_posts(
-                client, 
-                account_id, # <--- Передаем account_id
-                group_ids, # <--- Передаем гарантированно список
-                days_back, 
-                posts_per_group, 
-                min_views, 
+                client=client,                  # Основной клиент
+                account_id_main=account_id,     # ID основного клиента
+                telegram_pool=telegram_pool_instance, # <--- ПЕРЕДАЕМ ПУЛ
+                channel_ids=group_ids,
+                days_back=days_back,
+                posts_per_channel=posts_per_group,
+                min_views=min_views,
                 api_key=api_key
             )
             return result
 
         except Exception as e:
             logger.error(f"Ошибка в trending_posts для Telegram: {e}", exc_info=True)
-            # В случае ошибки возвращаем 500
             raise HTTPException(status_code=500, detail=f"Ошибка при получении трендовых постов: {str(e)}")
         finally:
-            # ... (блок finally остается без disconnect) ...
-            pass 
+            # Не отключаем клиента здесь, пускай пул управляет
+            pass
     elif platform == 'vk':
-        vk = await auth_middleware(request, 'vk')
-        return await get_vk_posts_in_groups(vk, group_ids, count=posts_per_group * len(group_ids), min_views=min_views, days_back=days_back)
+        # ---> Используем ГЛОБАЛЬНЫЙ экземпляр пула VK <--
+        vk_pool_instance = vk_pool # Обращаемся к глобальной переменной
+        # --------------------------------------------------
+        if not vk_pool_instance:
+             logger.error("Глобальный экземпляр vk_pool не найден.")
+             raise HTTPException(500, "Внутренняя ошибка сервера: Пул клиентов VK недоступен.")
+
+        if api_key is None: # Добавим проверку ключа и для VK
+            logger.error("API ключ не предоставлен для VK")
+            raise HTTPException(status_code=401, detail="API ключ не предоставлен")
+
+        try:
+             vk_client, vk_account_id = await vk_pool_instance.select_next_client(api_key)
+             if not vk_client:
+                  logger.error(f"Не удалось получить VK клиент для API ключа {api_key}")
+                  raise HTTPException(400, "Не удалось получить VK клиент")
+
+             logger.info(f"Получен клиент VK {vk_account_id} для trending-posts.")
+             # Форматируем ID групп для VK
+             formatted_group_ids = []
+             for gid in group_ids:
+                  gid_str = str(gid)
+                  if gid_str.isdigit():
+                      gid_str = f"-{gid_str}"
+                  formatted_group_ids.append(gid_str)
+
+             return await get_vk_posts_in_groups(vk_client, formatted_group_ids, count=posts_per_group * len(group_ids), min_views=min_views, days_back=days_back)
+        except Exception as e:
+            logger.error(f"Ошибка в trending_posts для VK: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Ошибка при получении трендовых постов VK: {str(e)}")
+
     raise HTTPException(400, "Платформа не поддерживается")
 
 @app.post("/posts")
@@ -2321,7 +2337,7 @@ async def check_telegram_account_status(request: Request, account_id: str):
         logger.error("API ключ не предоставлен или в неверном формате")
         raise HTTPException(status_code=401, detail="API ключ обязателен")
     admin_key = auth_header.split(' ')[1]
-    
+
     # Проверяем админ-ключ
     if not await verify_admin_key(admin_key):
         logger.error("Неверный админ-ключ")
@@ -2338,82 +2354,86 @@ async def check_telegram_account_status(request: Request, account_id: str):
     api_id_int = None
     api_hash = None
     proxy = None
+    current_status_db = 'unknown' # Initialize here
+    is_authorized = False # Initialize authorization status
 
     try:
+        # --- Шаг 1: Получение данных аккаунта из БД ---
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                # 1. Получаем данные аккаунта
-                query = '''
-                    SELECT api_id, api_hash, session_file, proxy, status
-                    FROM telegram_accounts
-                    WHERE id = $1
-                '''
-                account_record = await conn.fetchrow(query, account_id)
-
-                if not account_record:
-                    logger.warning(f"Аккаунт {account_id} не найден для проверки статуса")
-                    raise HTTPException(status_code=404, detail="Аккаунт не найден")
-
-                # Сохраняем текущий статус на случай ошибки
-                current_status_db = account_record['status']
-                new_status = current_status_db  # По умолчанию оставляем старый статус
-
-                # Извлекаем данные
-                api_id_str = account_record['api_id']
-                api_hash = account_record['api_hash']
-                session_file = account_record['session_file']
-                proxy = account_record['proxy']
-
-                # 2. Проверяем наличие необходимых данных
-                if not api_id_str or not api_hash or not session_file:
-                    logger.warning(f"Неполные данные для аккаунта {account_id} (api_id, api_hash или session_file отсутствуют)")
-                    new_status = 'error'
-                    # Обновляем статус в рамках транзакции
-                    if new_status != current_status_db:
-                        update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
-                        await conn.execute(update_query, new_status, account_id)
-                    # Транзакция закоммитится
-                    raise HTTPException(status_code=400, detail="Неполные данные для проверки аккаунта")
-
-                # 3. Преобразуем api_id
-                try:
-                    api_id_int = int(api_id_str)
-                except (ValueError, TypeError):
-                    logger.warning(f"Неверный формат api_id ('{api_id_str}') для аккаунта {account_id}")
-                    new_status = 'error'
-                    # Обновляем статус в рамках транзакции
-                    if new_status != current_status_db:
-                        update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
-                        await conn.execute(update_query, new_status, account_id)
-                    # Транзакция закоммитится
-                    raise HTTPException(status_code=400, detail="Неверный формат api_id для аккаунта")
-
-                # 4. Проверяем статус через Telethon
-                logger.info(f"Создание клиента Telethon для проверки статуса аккаунта {account_id}")
-                from client_pools import create_telegram_client  # Импорт внутри для ясности
-                client = await create_telegram_client(session_file, api_id_int, api_hash, proxy)
-
-        await client.connect()
-        is_authorized = await client.is_user_authorized()
-        logger.info(f"Статус авторизации Telethon для {account_id}: {is_authorized}")
-
-        new_status = 'active' if is_authorized else 'pending'
-
-        # 5. Обновляем статус в БД, если он изменился
-        if new_status != current_status_db:
-            logger.info(f"Обновление статуса для аккаунта {account_id} с '{current_status_db}' на '{new_status}'")
-            update_query = '''
-                UPDATE telegram_accounts
-                SET status = $1
-                WHERE id = $2
+            # Не используем транзакцию для простого SELECT
+            query = '''
+                SELECT api_id, api_hash, session_file, proxy, status
+                FROM telegram_accounts
+                WHERE id = $1
             '''
-            await conn.execute(update_query, new_status, account_id)
-            # Транзакция закоммитится
+            account_record = await conn.fetchrow(query, account_id)
+
+            if not account_record:
+                logger.warning(f"Аккаунт {account_id} не найден для проверки статуса")
+                raise HTTPException(status_code=404, detail="Аккаунт не найден")
+
+            # Сохраняем текущий статус
+            current_status_db = account_record['status']
+            new_status = current_status_db  # Default to current status
+
+            # Извлекаем данные
+            api_id_str = account_record['api_id']
+            api_hash = account_record['api_hash']
+            session_file = account_record['session_file']
+            proxy = account_record['proxy']
+
+            # --- Проверка и подготовка данных аккаунта ---
+            if not api_id_str or not api_hash or not session_file:
+                logger.warning(f"Неполные данные для аккаунта {account_id} (api_id, api_hash или session_file отсутствуют)")
+                new_status = 'error'
+                # Обновляем статус на ошибку *здесь*, если нужно
+                if new_status != current_status_db:
+                     async with conn.transaction(): # Транзакция для обновления
+                         update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                         await conn.execute(update_query, new_status, account_id)
+                         logger.info(f"Установлен статус 'error' (неполные данные) для {account_id}.")
+                raise HTTPException(status_code=400, detail="Неполные данные для проверки аккаунта")
+
+            try:
+                api_id_int = int(api_id_str)
+            except (ValueError, TypeError):
+                logger.warning(f"Неверный формат api_id ('{api_id_str}') для аккаунта {account_id}")
+                new_status = 'error'
+                # Обновляем статус на ошибку *здесь*, если нужно
+                if new_status != current_status_db:
+                     async with conn.transaction(): # Транзакция для обновления
+                         update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                         await conn.execute(update_query, new_status, account_id)
+                         logger.info(f"Установлен статус 'error' (неверный api_id) для {account_id}.")
+                raise HTTPException(status_code=400, detail="Неверный формат api_id для аккаунта")
+
+        # --- Шаг 2: Подключение к Telegram (вне блока `async with conn`) ---
+        if api_id_int and api_hash and session_file:
+            logger.info(f"Создание клиента Telethon для проверки статуса аккаунта {account_id}")
+            from client_pools import create_telegram_client
+            client = await create_telegram_client(session_file, api_id_int, api_hash, proxy)
+
+            await client.connect()
+            is_authorized = await client.is_user_authorized()
+            logger.info(f"Статус авторизации Telethon для {account_id}: {is_authorized}")
+            new_status = 'active' if is_authorized else 'pending_code' # Или 'inactive', 'error'? Зависит от логики
+        else:
+            # Этот случай не должен произойти из-за проверок выше
+            logger.error(f"Критическая ошибка: Недостаточно данных для создания клиента Telethon для {account_id}")
+            new_status = 'error'
+
+        # --- Шаг 3: Обновление статуса в БД (отдельная операция) ---
+        if new_status != current_status_db:
+            logger.info(f"Обновление статуса для аккаунта {account_id} с '{current_status_db}' на '{new_status}' (отдельная операция)")
+            async with pool.acquire() as conn_update: # Получаем новое соединение
+                async with conn_update.transaction(): # Транзакция для обновления
+                    update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2'
+                    await conn_update.execute(update_query, new_status, account_id)
         else:
             logger.info(f"Статус для аккаунта {account_id} не изменился ('{current_status_db}')")
 
-        # Если все прошло успешно внутри транзакции
-        return {"account_id": account_id, "status": new_status, "is_authorized": new_status == 'active'}
+        # Возвращаем результат
+        return {"account_id": account_id, "status": new_status, "is_authorized": is_authorized}
 
     except HTTPException as http_exc:
         # Просто перебрасываем HTTP ошибки (404, 400)
@@ -2427,7 +2447,7 @@ async def check_telegram_account_status(request: Request, account_id: str):
                     update_query = 'UPDATE telegram_accounts SET status = $1 WHERE id = $2 AND status != $1'
                     await conn_err.execute(update_query, 'error', account_id)
                     logger.info(f"Установлен статус 'error' для аккаунта {account_id} после исключения.")
-                    new_status = 'error'  # Обновляем для ответа
+                    new_status = 'error' # Обновляем для возможного возврата ниже (хотя будет 500)
         except Exception as db_err:
             logger.error(f"Не удалось обновить статус на 'error' для аккаунта {account_id} после основной ошибки: {db_err}")
             # new_status останется тем, что было до ошибки (или 'unknown')
@@ -2439,12 +2459,8 @@ async def check_telegram_account_status(request: Request, account_id: str):
         # Гарантированно отключаем клиент, если он был создан и подключен
         if client:
             try:
-                # Проверяем, нужно ли использовать await
-                if client.is_connected():  # Сначала проверка, что он вообще подключен
-                    if asyncio.iscoroutinefunction(client.disconnect):
-                        await client.disconnect()
-                    else:
-                        client.disconnect()
+                if client.is_connected():
+                    await client.disconnect() # type: ignore # Упрощенный вызов, так как disconnect должен быть async
                     logger.info(f"Клиент Telethon для проверки статуса {account_id} отключен.")
             except Exception as disc_err:
                 logger.error(f"Ошибка при отключении клиента Telethon для {account_id}: {disc_err}", exc_info=True)
@@ -3363,6 +3379,7 @@ async def api_trending_posts_extended(request: Request, data: dict):
             posts = await get_trending_posts(
                 client, 
                 account_id_str, # Добавляем account_id как второй аргумент
+                telegram_pool,
                 channel_ids, 
                 days_back=days_back, 
                 posts_per_channel=posts_per_channel,
