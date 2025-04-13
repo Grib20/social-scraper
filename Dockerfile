@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     libpq-dev \
     postgresql-client \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Создаем директории для данных и директорию для базы данных
