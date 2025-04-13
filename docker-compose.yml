@@ -18,8 +18,6 @@ services:
       - media_downloads:/app/media_downloads # Скачанные медиафайлы
       - logs:/app/logs # Логи приложения
       - data:/app/data # Другие данные приложения
-      # Удаляем том для SQLite, т.к. используем PostgreSQL
-      # - database:/app/database
       # Привязка локальной папки secrets к папке в контейнере
       - ./secrets:/app/secrets
     env_file:
