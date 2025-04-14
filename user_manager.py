@@ -522,37 +522,62 @@ async def update_telegram_account(api_key: str, account_id: str, account_data: D
         # Пул управляет соединением
 
 async def delete_telegram_account(api_key: str, account_id: str) -> bool:
-    """Удаляет аккаунт Telegram."""
+    """Удаляет аккаунт Telegram из БД и соответствующий файл сессии."""
     pool = None
+    session_file_path = None # Для хранения пути к файлу сессии
     try:
         pool = await get_db_connection()
         if not pool: return False
         
         async with pool.acquire() as conn:
-             # Используем транзакцию, хотя здесь одна команда DELETE
-             async with conn.transaction(): 
+            # 1. Получаем путь к файлу сессии ПЕРЕД удалением записи
+            session_file_path = await conn.fetchval(
+                'SELECT session_file FROM telegram_accounts WHERE id = $1 AND user_api_key = $2',
+                account_id, api_key
+            )
+
+            # 2. Удаляем запись из БД
+            deleted_count = 0
+            # Используем транзакцию, хотя здесь одна команда DELETE
+            async with conn.transaction(): 
                 result_str = await conn.execute(
                     'DELETE FROM telegram_accounts WHERE id = $1 AND user_api_key = $2',
                     account_id, api_key
                 )
                 # execute возвращает 'DELETE N'
                 deleted_count = int(result_str.split()[1])
-                if deleted_count > 0:
-                    logger.info(f"Удален TG аккаунт id={account_id} для api_key={api_key}")
-                    return True
+
+            # 3. Если запись из БД удалена, пытаемся удалить файлы сессии
+            if deleted_count > 0:
+                logger.info(f"Удален TG аккаунт id={account_id} из БД для api_key={api_key}. Попытка удаления файла сессии...")
+                if session_file_path:
+                    # Пытаемся удалить основной файл сессии
+                    try:
+                        os.remove(session_file_path)
+                        logger.info(f"Успешно удален файл сессии: {session_file_path}")
+                    except FileNotFoundError:
+                        logger.warning(f"Файл сессии не найден (возможно, уже удален): {session_file_path}")
+                    except OSError as e:
+                        logger.error(f"Ошибка при удалении файла сессии {session_file_path}: {e}")
+                    
+                    # Пытаемся удалить файл журнала (-journal)
+                    journal_file_path = session_file_path + "-journal"
+                    try:
+                        # Проверяем существование перед удалением, чтобы избежать лишних ошибок
+                        if os.path.exists(journal_file_path):
+                            os.remove(journal_file_path)
+                            logger.info(f"Успешно удален файл журнала сессии: {journal_file_path}")
+                    except OSError as e:
+                        # Логируем ошибку, но не прерываем операцию из-за файла журнала
+                        logger.error(f"Ошибка при удалении файла журнала сессии {journal_file_path}: {e}")
                 else:
-                    logger.warning(f"Попытка удалить несуществующий TG аккаунт: id={account_id}, api_key={api_key}")
-                    return False
+                    logger.warning(f"Путь к файлу сессии не найден в БД для аккаунта {account_id}, удаление файла невозможно.")
+                return True # Успех, если запись из БД удалена
+            else:
+                logger.warning(f"Попытка удалить несуществующий TG аккаунт из БД: id={account_id}, api_key={api_key}")
+                return False
     except asyncpg.PostgresError as e:
         logger.error(f"Ошибка PostgreSQL в delete_telegram_account (id={account_id}, api_key={api_key}): {e}")
-        return False
-    except ConnectionError as e:
-         logger.error(f"Ошибка соединения в delete_telegram_account (id={account_id}, api_key={api_key}): {e}")
-         return False
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка в delete_telegram_account (id={account_id}, api_key={api_key}): {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return False
     # finally:
         # Пул управляет соединением

@@ -1195,156 +1195,83 @@ async function registerUser(e) {
     }
 }
 
-// Обновленная функция: Открыть модальное окно для редактирования Telegram (с запросом данных)
+// Обновленная функция: Открыть модальное окно для редактирования Telegram
 async function openEditTelegramModal(accountId) {
     console.log(`Запрос данных для редактирования Telegram аккаунта: ${accountId}`);
-
     const adminKey = getAdminKey();
-    if (!adminKey) {
-        window.location.href = '/login';
-        return;
-    }
+    if (!adminKey) { window.location.href = '/login'; return; }
 
-    // --- ИЗМЕНЕНИЕ: Показываем глобальный лоадер или блокируем UI (пока пропустим для простоты) ---
-    // Можно добавить: document.body.classList.add('loading-active');
-
-    // Запрашиваем актуальные данные аккаунта с сервера
     try {
         const response = await fetch(`/api/telegram/accounts/${accountId}/details`, {
-            headers: {
-                'Authorization': `Bearer ${adminKey}`
-            }
+            headers: { 'Authorization': `Bearer ${adminKey}` }
         });
-
         if (!response.ok) {
-            // Пытаемся получить детали ошибки из JSON
             let errorDetail = `Ошибка HTTP: ${response.status}`;
-            try {
-                 const errorData = await response.json();
-                 errorDetail = errorData.detail || errorDetail;
-            } catch (jsonError) { /* игнорируем ошибку парсинга */ }
+            try { const errorData = await response.json(); errorDetail = errorData.detail || errorDetail; } catch (e) {}
             throw new Error(errorDetail);
         }
-
         const accountData = await response.json();
-        console.log("Получены данные аккаунта:", accountData);
 
-        // --- ДАННЫЕ ПОЛУЧЕНЫ, ТЕПЕРЬ НАСТРАИВАЕМ МОДАЛЬНОЕ ОКНО ---
+        resetTelegramModalToAddState(accountData.user_id || null); // Сбрасываем в состояние добавления
 
-        // 1. Сбросить модальное окно в состояние "Добавления"
-        // Передаем user_id, если он есть в ответе, иначе null
-        resetTelegramModalToAddState(accountData.user_id || null);
-
-        // 2. Получить ссылки на элементы формы ПОСЛЕ сброса
+        const form = document.getElementById('addTelegramForm');
         const phoneInput = document.getElementById('phone');
         const apiIdInput = document.getElementById('api_id');
         const apiHashInput = document.getElementById('api_hash');
         const proxyInput = document.getElementById('proxy');
+        const sessionFileInput = document.getElementById('session_file');
         const modalTitle = document.getElementById('telegramModalTitle');
-        const form = document.getElementById('addTelegramForm');
-        const submitButton = form ? form.querySelector('button[type="submit"]') : null;
+        const submitButton = form.querySelector('button[type="submit"]');
 
-        // Проверка наличия элементов формы
-        if (!phoneInput || !apiIdInput || !apiHashInput || !proxyInput || !modalTitle || !form || !submitButton) {
-           console.error("Не найдены все необходимые элементы формы в telegramModal для редактирования после сброса.");
+        if (!form || !phoneInput || !apiIdInput || !apiHashInput || !proxyInput || !sessionFileInput || !modalTitle || !submitButton) {
            throw new Error("Ошибка интерфейса: структура модального окна нарушена.");
         }
 
-        // 3. Предзаполнить поля и настроить режим редактирования
         phoneInput.value = accountData.phone || '';
-        phoneInput.readOnly = true; // Запрещаем менять номер
-
-        // Скрываем поля API ID и API Hash при редактировании
-        apiIdInput.closest('.form-group').style.display = 'none';
-        apiIdInput.value = accountData.api_id || ''; // Заполняем, если бэкенд отдает
-        apiIdInput.readOnly = true;
-
+        phoneInput.readOnly = true; // Блокируем номер
+        apiIdInput.closest('.form-group').style.display = 'none'; // Скрываем ненужные поля
         apiHashInput.closest('.form-group').style.display = 'none';
-        apiHashInput.value = accountData.api_hash || ''; // Заполняем, если бэкенд отдает
-        apiHashInput.readOnly = true;
+        sessionFileInput.closest('.form-group').style.display = 'none';
 
-        // Поле прокси
         proxyInput.value = accountData.proxy || '';
         proxyInput.readOnly = false; // Разрешаем менять прокси
-        proxyInput.focus(); // Фокус на поле прокси
+        proxyInput.closest('.form-group').style.display = 'block';
+        proxyInput.focus();
 
-        // Скрываем ненужные блоки (авторизации)
-        const authBlock = document.getElementById('telegramAuthBlock');
-        if (authBlock) authBlock.style.display = 'none';
-        const twoFABlock = document.getElementById('telegram2FABlock');
-        if (twoFABlock) twoFABlock.style.display = 'none';
+        document.getElementById('telegramAuthBlock').style.display = 'none'; // Скрываем блоки авторизации
+        document.getElementById('telegram2FABlock').style.display = 'none';
 
-        // 4. Изменить заголовок и текст кнопки
-        if (modalTitle) {
-           modalTitle.innerHTML = '<i class="fab fa-telegram"></i> Редактировать аккаунт';
-        }
-        if (submitButton) {
-           submitButton.innerHTML = '<i class="fas fa-save"></i> Сохранить изменения';
-           submitButton.style.display = 'block';
-           submitButton.disabled = false;
-        }
+        modalTitle.innerHTML = '<i class="fab fa-telegram"></i> Редактировать аккаунт'; // Меняем заголовок
+        submitButton.innerHTML = '<i class="fas fa-save"></i> Сохранить изменения'; // Меняем кнопку
+        submitButton.style.display = 'block';
+        submitButton.disabled = false;
 
-        // 5. Добавить accountId в форму (как data-атрибут)
-        form.dataset.editingAccountId = accountId;
+        form.dataset.editingAccountId = accountId; // Устанавливаем ID для режима редактирования
         console.log(`Установлен data-editing-account-id: ${form.dataset.editingAccountId}`);
 
-        // 6. Назначить обработчик для СОХРАНЕНИЯ изменений
-        form.onsubmit = handleEditTelegramSubmit;
-        console.log('Назначен обработчик handleEditTelegramSubmit');
+        // Обработчик УЖЕ назначен через onsubmit в DOMContentLoaded
 
-        // --- ИЗМЕНЕНИЕ: Убираем глобальный лоадер ---
-        // Можно добавить: document.body.classList.remove('loading-active');
-
-        // 7. Показать настроенное модальное окно
-        const modal = document.getElementById('telegramModal');
-        if (modal) {
-           modal.style.display = 'block';
-        } else {
-           console.error("Модальное окно telegramModal не найдено при попытке его показать.");
-            throw new Error("Ошибка интерфейса: не найдено модальное окно.");
-        }
+        document.getElementById('telegramModal').style.display = 'block'; // Показываем окно
 
     } catch (error) {
         console.error('Ошибка при подготовке к редактированию Telegram аккаунта:', error);
         showNotification(`Не удалось загрузить данные для редактирования: ${error.message}`, 'error');
-        // --- ИЗМЕНЕНИЕ: Убираем глобальный лоадер в случае ошибки ---
-        // Можно добавить: document.body.classList.remove('loading-active');
     }
 }
 
-// --- НОВАЯ ФУНКЦИЯ: Обработка сохранения изменений Telegram ---
-async function handleEditTelegramSubmit(event) {
-    event.preventDefault(); // Предотвращаем стандартную отправку
+ // Функция обработки сохранения ИЗМЕНЕНИЙ Telegram (вызывается из handleAddTelegramSubmit)
+ async function handleEditTelegramSubmit(event) {
+    event.preventDefault();
     console.log("Сработал обработчик handleEditTelegramSubmit");
     const form = event.target;
-
-    // Проверяем, есть ли form и dataset
-    if (!form || !form.dataset) {
-         console.error("Ошибка: не найден элемент формы или его dataset при сохранении изменений.");
-         showNotification("Ошибка интерфейса при сохранении.", "error");
-         return;
-    }
     const accountId = form.dataset.editingAccountId;
     const proxyInput = document.getElementById('proxy');
-    // Получаем значение прокси, удаляем пробелы по краям, пустая строка или null становятся null
     const proxy = proxyInput ? (proxyInput.value.trim() || null) : null;
 
-    if (!accountId) {
-        showNotification('Ошибка: не удалось определить ID редактируемого аккаунта.', 'error');
-        console.error("accountId не найден в form.dataset.editingAccountId при отправке");
-        return;
-    }
-
-    console.log(`Сохранение изменений для Telegram аккаунта ${accountId}, новое прокси: ${proxy}`);
-
+    if (!accountId) { showNotification('Ошибка: ID редактируемого аккаунта не найден.', 'error'); return; }
     const adminKey = getAdminKey();
-    if (!adminKey) {
-        // Перенаправляем на логин, если нет ключа
-        window.location.href = '/login';
-        return;
-    }
+    if (!adminKey) { window.location.href = '/login'; return; }
 
-    // Показываем индикатор загрузки на кнопке
     const submitButton = form.querySelector('button[type="submit"]');
     let originalButtonText = '<i class="fas fa-save"></i> Сохранить изменения';
     if (submitButton) {
@@ -1354,62 +1281,32 @@ async function handleEditTelegramSubmit(event) {
     }
 
     try {
-        // Отправляем PUT запрос на бэкенд
         const response = await fetch(`/api/telegram/accounts/${accountId}`, {
             method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${adminKey}`
-            },
-            // Отправляем null, если прокси пустой, чтобы очистить его в БД
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminKey}` },
             body: JSON.stringify({ proxy: proxy })
         });
 
-        // Восстанавливаем кнопку сразу после получения ответа (до обработки JSON)
-        if (submitButton) {
-            submitButton.disabled = false;
-            submitButton.innerHTML = originalButtonText;
-        }
+        let responseBody = null;
+        try { responseBody = await response.json(); } catch (e) {}
 
-        // Обработка ответа
         if (!response.ok) {
-            // Пытаемся получить детали ошибки из JSON, если не получается - используем статус
-            let errorDetail = `Ошибка HTTP: ${response.status}`;
-            try {
-                 const errorData = await response.json();
-                 // Используем errorData.detail, если есть, иначе оставляем HTTP статус
-                 errorDetail = errorData.detail || errorDetail;
-            } catch (jsonError) {
-                 // Если тело ответа не JSON или пустое
-                 console.error("Не удалось разобрать JSON ошибки или тело пустое:", jsonError);
-            }
-            // Выбрасываем ошибку с полученным сообщением
-            throw new Error(errorDetail);
+            throw new Error(responseBody?.detail || `Ошибка HTTP: ${response.status}`);
         }
 
-        // Успешный ответ (даже если тело пустое)
-        let resultMessage = 'Изменения успешно сохранены.';
-         try {
-             const result = await response.json();
-             resultMessage = result.message || resultMessage; // Используем сообщение из ответа, если оно есть
-         } catch (jsonError) {
-              console.log("Тело успешного ответа не является JSON или пустое.");
-         }
-
-        showNotification(resultMessage, 'success');
-        closeModal('telegramModal'); // Закрываем окно после успеха (closeModal вызовет resetTelegramModalToAddState)
-        displayUsers(); // Обновляем список пользователей, чтобы увидеть изменения
+        showNotification(responseBody?.message || 'Изменения успешно сохранены.', 'success');
+        closeModal('telegramModal');
+        displayUsers();
 
     } catch (error) {
         console.error('Ошибка при сохранении изменений Telegram аккаунта:', error);
         showNotification(`Ошибка сохранения: ${error.message}`, 'error');
-        // Кнопка уже должна быть восстановлена выше, но на всякий случай
-         if (submitButton && submitButton.disabled) {
-             submitButton.disabled = false;
-             submitButton.innerHTML = originalButtonText;
-         }
+    } finally {
+        if (submitButton) {
+            submitButton.disabled = false;
+            submitButton.innerHTML = originalButtonText;
+        }
     }
-    // finally блок не нужен, так как очистка dataset и сброс обработчика теперь делаются в closeModal/resetTelegramModalToAddState
 }
 
 // Инициализация формы добавления VK-аккаунта
@@ -2383,8 +2280,8 @@ function setupTelegramModalForCodeEntry(phone) {
 
 // Вспомогательная функция для сброса telegramModal в состояние добавления
 // --- Убедимся, что эта функция НЕ удалена --- 
+// Функция для сброса состояния модального окна Telegram в режим добавления
 function resetTelegramModalToAddState(userId = null) {
-    // ... (код этой функции должен быть здесь)
     const modal = document.getElementById('telegramModal');
     const form = document.getElementById('addTelegramForm');
     const authBlock = document.getElementById('telegramAuthBlock');
@@ -2393,6 +2290,7 @@ function resetTelegramModalToAddState(userId = null) {
     const apiIdInput = document.getElementById('api_id');
     const apiHashInput = document.getElementById('api_hash');
     const proxyInput = document.getElementById('proxy');
+    const sessionFileInput = document.getElementById('session_file');
     const userIdInput = form.querySelector('input[name="userId"]');
     const submitButton = form.querySelector('button[type="submit"]');
 
@@ -2416,17 +2314,20 @@ function resetTelegramModalToAddState(userId = null) {
     apiIdInput.closest('.form-group').style.display = 'block';
     apiHashInput.closest('.form-group').style.display = 'block';
     proxyInput.closest('.form-group').style.display = 'block';
+    sessionFileInput.closest('.form-group').style.display = 'block'; // Показываем поле файла
 
     // Показ кнопки submit
     if (submitButton) {
-        submitButton.style.display = 'block'; // или 'inline-block'
-        submitButton.disabled = false; // Убедимся, что кнопка активна
-        submitButton.innerHTML = '<i class="fas fa-plus"></i> Добавить аккаунт'; // Возвращаем текст кнопки
+        submitButton.style.display = 'block';
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-plus"></i> Добавить аккаунт';
     }
 
      // Установка User ID
     if (userIdInput && userId) {
         userIdInput.value = userId;
+    } else if (userIdInput) {
+        userIdInput.value = '';
     }
 
     // Сброс глобальной переменной
@@ -2435,125 +2336,106 @@ function resetTelegramModalToAddState(userId = null) {
     // Сброс заголовка
      document.getElementById('telegramModalTitle').textContent = 'Добавить аккаунт Telegram';
 
-    // Назначение обработчика для ДОБАВЛЕНИЯ аккаунта
-    form.onsubmit = handleAddTelegramSubmit;
+    // Удаляем атрибут редактирования, если он был
+    delete form.dataset.editingAccountId;
+
+    // --- УДАЛЕНО: Больше не назначаем обработчик здесь ---
 }
 
 // Обработчик для формы ДОБАВЛЕНИЯ аккаунта
-// --- Убедимся, что эта функция НЕ удалена --- 
-function handleAddTelegramSubmit(event) {
-    // ... (код этой функции должен быть здесь)
-     event.preventDefault(); // Предотвращаем стандартную отправку формы
+// Основной обработчик для формы Telegram (добавление ИЛИ редактирование)
+async function handleAddTelegramSubmit(event) {
+    event.preventDefault();
+    const form = event.target;
+    const editingAccountId = form.dataset.editingAccountId;
 
-        // Получаем данные из формы
-        const form = event.target; // Используем event.target
+    if (editingAccountId) {
+        // --- РЕЖИМ РЕДАКТИРОВАНИЯ ---
+        console.log("handleAddTelegramSubmit -> Вызов handleEditTelegramSubmit");
+        await handleEditTelegramSubmit(event);
+    } else {
+        // --- РЕЖИМ ДОБАВЛЕНИЯ ---
+        console.log("handleAddTelegramSubmit -> Режим Добавления");
         const formData = new FormData(form);
         const userId = formData.get('userId');
         const phone = formData.get('phone');
         const apiId = formData.get('api_id');
         const apiHash = formData.get('api_hash');
-        const proxy = formData.get('proxy') || null;
 
         if (!userId || !phone || !apiId || !apiHash) {
-            showNotification('Все поля (кроме прокси) обязательны для заполнения.', 'warning');
+            showNotification('Все поля (кроме прокси и файла сессии) обязательны.', 'warning');
             return;
         }
-
         const adminKey = getAdminKey();
-        if (!adminKey) {
-            window.location.href = '/login';
-            return;
-        }
+        if (!adminKey) { window.location.href = '/login'; return; }
 
-        // Показываем индикатор загрузки
         const submitButton = form.querySelector('button[type="submit"]');
         const originalButtonText = submitButton.innerHTML;
         submitButton.disabled = true;
         submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Добавление...';
 
-        // Отправляем данные на бэкенд
-        fetch('/api/telegram/accounts', {
-            method: 'POST',
-            headers: {
-                // НЕ указываем Content-Type, браузер сделает это сам для FormData
-                'Authorization': `Bearer ${adminKey}`,
-                'X-User-Id': userId // Заголовок с ID пользователя
-            },
-            body: formData // Отправляем объект FormData напрямую
-        })
-        .then(response => {
-            // Восстанавливаем кнопку независимо от результата
-            submitButton.disabled = false;
-            submitButton.innerHTML = originalButtonText;
-            // Проверяем статус перед чтением JSON
-             if (!response.ok && response.status !== 409) { // 409 (Conflict) тоже может вернуть JSON с detail
-                return response.json().then(error => {
-                     throw new Error(error.detail || `Ошибка HTTP: ${response.status}`);
-                }).catch(() => {
-                     throw new Error(`Ошибка HTTP: ${response.status}`);
-                });
-             }
-            return response.json().then(data => ({ status: response.status, body: data }));
-        })
-        .then(({ status, body }) => {
-            // Условие для немедленно активного аккаунта: статус 200 или 201 и body.status 'active'
-            if ((status === 200 || status === 201) && body.status === 'active') {
-                 // Если статус 'active', значит аккаунт успешно добавлен (уже был и авторизован)
-                 showNotification('Аккаунт Telegram успешно добавлен (уже авторизован).', 'success');
-                 closeModal('telegramModal');
-                 displayUsers(); // Обновляем список пользователей
-            } else if (status === 200 && body.status === 'pending') {
-                // Если статус 'pending', значит нужен код
-                showNotification('Требуется код подтверждения. Введите его ниже.', 'info');
-                currentTelegramAccountId = body.account_id; // Устанавливаем ID
+        try {
+            const response = await fetch('/api/telegram/accounts', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${adminKey}`, 'X-User-Id': userId },
+                body: formData
+            });
 
-                // Показываем блок для ввода кода, скрываем кнопку submit
+            let responseBody = null;
+            try { responseBody = await response.json(); } catch (e) {}
+
+            if (!response.ok) {
+                 if (response.status === 409) {
+                    showNotification(responseBody?.detail || 'Аккаунт с таким номером уже существует.', 'warning');
+                     submitButton.disabled = false;
+                     submitButton.innerHTML = originalButtonText;
+                     return;
+                 }
+                throw new Error(responseBody?.detail || `Ошибка HTTP: ${response.status}`);
+            }
+
+            const body = responseBody;
+
+            if (body.status === 'active') {
+                showNotification('Аккаунт Telegram успешно добавлен (уже авторизован).', 'success');
+                closeModal('telegramModal');
+                displayUsers();
+            } else if (body.status === 'pending') {
+                showNotification('Требуется код подтверждения. Введите его ниже.', 'info');
+                currentTelegramAccountId = body.account_id;
                 document.getElementById('telegramAuthBlock').style.display = 'block';
                 document.getElementById('authCode').focus();
-                if (submitButton) submitButton.style.display = 'none'; // Скрываем кнопку "Добавить"
-                form.onsubmit = submitAuthCode; // Меняем обработчик на верификацию
-
-            } else if (status === 201 && body.status === 'active') {
-                 // Если статус 'active', значит аккаунт успешно добавлен (уже был и авторизован)
-                 showNotification('Аккаунт Telegram успешно добавлен (уже авторизован).', 'success');
-                 closeModal('telegramModal');
-                 displayUsers(); // Обновляем список пользователей
-            } else if (status >= 200 && status < 300 && body.status === 'pending_2fa') {
-                // Если сразу требуется 2FA (новый аккаунт или существующий без сессии)
+                if (submitButton) submitButton.style.display = 'none';
+                // --- УДАЛЕНО: Не меняем обработчик ---
+            } else if (body.status === 'pending_2fa') {
                 showNotification('Аккаунт добавлен, но требуется пароль 2FA.', 'warning');
-                 currentTelegramAccountId = body.account_id; // Устанавливаем ID
-
-                 document.getElementById('telegram2FABlock').style.display = 'block';
-                 document.getElementById('two_fa_password').focus();
-                 if (submitButton) submitButton.style.display = 'none'; // Скрываем кнопку "Добавить"
-                 form.onsubmit = submitAuthCode; // submitAuthCode обработает 2FA
-
-            } else if (status === 409) {
-                 // Обработка случая, когда аккаунт уже существует (Conflict)
-                 showNotification(body.detail || 'Аккаунт с таким номером уже существует.', 'warning');
-                 // Оставляем модальное окно открытым для исправления
-                 form.onsubmit = handleAddTelegramSubmit; // Оставляем обработчик добавления
-                 if (submitButton) submitButton.style.display = 'block'; // Показываем кнопку
-
+                currentTelegramAccountId = body.account_id;
+                document.getElementById('telegram2FABlock').style.display = 'block';
+                document.getElementById('two_fa_password').focus();
+                if (submitButton) submitButton.style.display = 'none';
+                // --- УДАЛЕНО: Не меняем обработчик ---
             } else {
-                 // Обрабатываем другие непредвиденные ошибки
-                 throw new Error(body.detail || 'Неизвестная ошибка при добавлении аккаунта');
+                 console.warn("Неожиданный успешный ответ при добавлении:", {status: response.status, body});
+                 showNotification(body?.detail || 'Аккаунт добавлен, но статус неопределен.', 'warning');
+                 closeModal('telegramModal');
+                 displayUsers();
             }
-        })
-        .catch(error => {
+        } catch (error) {
             console.error('Ошибка при добавлении аккаунта Telegram:', error);
             showNotification(`Ошибка: ${error.message}`, 'error');
-             // Восстанавливаем кнопку и обработчик
-             if (submitButton) {
+            currentTelegramAccountId = null;
+             document.getElementById('telegramAuthBlock').style.display = 'none';
+             document.getElementById('telegram2FABlock').style.display = 'none';
+        } finally {
+            const authBlockVisible = document.getElementById('telegramAuthBlock').style.display === 'block';
+            const twoFABlockVisible = document.getElementById('telegram2FABlock').style.display === 'block';
+            if (submitButton && !authBlockVisible && !twoFABlockVisible) {
                  submitButton.disabled = false;
                  submitButton.innerHTML = originalButtonText;
                  submitButton.style.display = 'block';
-             }
-             document.getElementById('telegramAuthBlock').style.display = 'none';
-             document.getElementById('telegram2FABlock').style.display = 'none';
-             currentTelegramAccountId = null;
-             form.onsubmit = handleAddTelegramSubmit;
-        });
+            }
+        }
+    }
 }
 
 // Назначение ИСХОДНОГО обработчика для формы добавления
@@ -3078,79 +2960,119 @@ async function handleAddVkSubmit(event) {
 }
 // --- END MISSING FUNCTION ---
 
-// Обработчик события загрузки DOM
-document.addEventListener('DOMContentLoaded', () => {
-    // Получаем админ-ключ из localStorage при загрузке
-    const savedAdminKey = localStorage.getItem('adminKey');
-    if (savedAdminKey) {
-        // Если ключ есть, можно сразу попробовать отобразить пользователей
-        // или выполнить другие действия, требующие ключа
-        // displayUsers(); 
-    } else {
-        // Если ключа нет, возможно, перенаправить на логин или скрыть админ-элементы
-        // window.location.href = '/login';
-    }
+    // Обработчик события загрузки DOM
+    document.addEventListener('DOMContentLoaded', () => {
+        // --- Проверка авторизации ---
+        (async () => { // Оборачиваем в async IIFE для await
+            console.log('Страница загружена, проверка авторизации...');
+            try {
+                let adminKey = getAdminKey();
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlAdminKey = urlParams.get('admin_key');
+                if (urlAdminKey) {
+                    adminKey = urlAdminKey;
+                    saveAdminKey(adminKey);
+                    const newUrl = window.location.pathname;
+                    window.history.replaceState({}, document.title, newUrl);
+                }
 
-    // Инициализация отображения пользователей
-    displayUsers();
+                if (!adminKey) {
+                    window.location.href = '/login'; return;
+                }
 
-    // Обработчик для формы добавления пользователя
-    const addUserForm = document.getElementById('addUserForm');
-    if (addUserForm) {
-        addUserForm.addEventListener('submit', registerUser);
-    }
+                const response = await fetch('/admin/validate', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${adminKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
 
-    // Обработчик для формы добавления Telegram аккаунта (старый способ)
-    const addTelegramForm = document.getElementById('addTelegramForm');
-    if (addTelegramForm) {
-        addTelegramForm.addEventListener('submit', handleAddTelegramSubmit);
-    }
+                if (!response.ok) {
+                    localStorage.removeItem('adminKey');
+                    window.location.href = '/login'; return;
+                }
 
-    // Обработчик для формы добавления VK аккаунта
-    const addVkForm = document.getElementById('addVkForm');
-    if (addVkForm) {
-        addVkForm.addEventListener('submit', handleAddVkSubmit); 
-    }
-    
-    // Обработчик для формы подтверждения кода Telegram
-    const authForm = document.getElementById('telegramAuthForm');
-    if (authForm) {
-        authForm.addEventListener('submit', submitAuthCode);
-    }
+                console.log('Админ-ключ валиден.');
+                saveAdminKey(adminKey); // Обновляем на случай получения из URL
+                await displayUsers(); // Загружаем пользователей
 
-    // Обработчик для кнопки подтверждения 2FA
-    const submit2FAButton = document.getElementById('submit2FA');
-    if (submit2FAButton) {
-        submit2FAButton.addEventListener('click', submit2FAPassword);
-    }
+                // --- Назначение обработчиков ПОСЛЕ проверки ключа ---
 
-    // Обработчик для формы изменения прокси
-    const changeProxyForm = document.getElementById('changeProxyForm');
-    if (changeProxyForm) {
-        changeProxyForm.addEventListener('submit', updateProxy);
-    }
+                // Форма добавления пользователя
+                const addUserForm = document.getElementById('addUserForm');
+                if (addUserForm) {
+                    addUserForm.removeEventListener('submit', registerUser);
+                    addUserForm.addEventListener('submit', registerUser);
+                }
 
-    // УДАЛЯЕМ старый обработчик для формы submit
-    // const sessionJsonForm = document.getElementById('addSessionJsonForm');
-    // if (sessionJsonForm) {
-    //     sessionJsonForm.addEventListener('submit', handleAddSessionJsonSubmit);
-    // } else {
-    //      console.error("Форма addSessionJsonForm не найдена!");
-    // }
-    
-    // НАЗНАЧАЕМ новый обработчик на КЛИК кнопки
-    const addSessionJsonButton = document.getElementById('addSessionJsonSubmitButton');
-    if (addSessionJsonButton) {
-        addSessionJsonButton.addEventListener('click', handleAddSessionJsonSubmit);
-    } else {
-        console.error("Кнопка addSessionJsonSubmitButton не найдена!");
-    }
-    
-    // Инициализация вкладок
-    const activeTab = localStorage.getItem('activeTab') || 'users';
-    switchTab(activeTab); // Активируем сохраненную вкладку
-});
+                // Форма добавления/редактирования Telegram (onsubmit)
+                const addTelegramForm = document.getElementById('addTelegramForm');
+                if (addTelegramForm) {
+                    addTelegramForm.onsubmit = handleAddTelegramSubmit; // Единственный обработчик
+                }
 
+                // Форма добавления VK (addEventListener)
+                const addVkForm = document.getElementById('addVkForm');
+                if (addVkForm) {
+                    addVkForm.removeEventListener('submit', handleAddVkSubmit);
+                    addVkForm.addEventListener('submit', handleAddVkSubmit);
+                }
+
+                // Форма ввода кода Telegram (addEventListener)
+                const authForm = document.getElementById('telegramAuthForm');
+                if (authForm) {
+                    authForm.removeEventListener('submit', submitAuthCode);
+                    authForm.addEventListener('submit', submitAuthCode);
+                     // КРАЙНЕ ВАЖНО: Убедись, что убрал onsubmit="submitAuthCode(event)" из HTML для этой формы!
+                } else { console.error("Форма telegramAuthForm не найдена!"); }
+
+                // Кнопка 2FA (addEventListener)
+                const submit2FAButton = document.getElementById('submit2FA');
+                if (submit2FAButton) {
+                    submit2FAButton.removeEventListener('click', submit2FAPassword);
+                    submit2FAButton.addEventListener('click', submit2FAPassword);
+                } else { console.error("Кнопка submit2FA не найдена!"); }
+
+                // Кнопка добавления Session+JSON (addEventListener)
+                const addSessionJsonButton = document.getElementById('addSessionJsonSubmitButton');
+                if (addSessionJsonButton) {
+                    addSessionJsonButton.removeEventListener('click', handleAddSessionJsonSubmit);
+                    addSessionJsonButton.addEventListener('click', handleAddSessionJsonSubmit);
+                } else { console.error("Кнопка addSessionJsonSubmitButton не найдена!"); }
+
+                // Форма изменения прокси (если она динамически добавляется, обработчик нужно вешать иначе)
+                // Если она всегда есть в DOM:
+                const changeProxyForm = document.getElementById('changeProxyForm');
+                if (changeProxyForm) {
+                     changeProxyForm.removeEventListener('submit', updateProxy);
+                     changeProxyForm.addEventListener('submit', updateProxy);
+                }
+
+                 // Восстановление активной вкладки
+                 const activeTab = localStorage.getItem('activeTab') || 'users';
+                 if (typeof window.switchTab === 'function') {
+                     window.switchTab(activeTab);
+                 } else { // Ручное переключение, если функция не глобальна
+                     const tabs = document.querySelectorAll('.tab-content');
+                     const buttons = document.querySelectorAll('.tab-btn');
+                     tabs.forEach(tab => tab.classList.remove('active'));
+                     buttons.forEach(btn => btn.classList.remove('active'));
+                     const activeTabElement = document.getElementById(activeTab + 'Tab');
+                     if (activeTabElement) activeTabElement.classList.add('active');
+                     const activeButton = document.querySelector(`.tab-btn[onclick="switchTab('${activeTab}')"]`);
+                     if (activeButton) activeButton.classList.add('active');
+                     if (activeTab === 'stats' && typeof displayAccountsStats === 'function') {
+                         displayAccountsStats();
+                     }
+                 }
+
+            } catch (error) {
+                console.error('Ошибка при инициализации админ-панели:', error);
+                alert('Ошибка при инициализации: ' + error.message);
+                // Можно перенаправить на логин при серьезных ошибках
+                 // window.location.href = '/login';
+            }
+        })(); // Вызов асинхронной IIFE
+    });
 
 
 // ... остальной код admin.js ...

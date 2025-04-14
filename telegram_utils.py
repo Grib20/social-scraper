@@ -66,6 +66,10 @@ except ImportError as e:
         logger.error("process_single_media_background не может быть вызвана из-за ошибки импорта.")
         pass
 
+# --- Добавляем константы (значения из media_utils.py) ---
+MAX_FILE_SIZE = 50 * 1024 * 1024 
+S3_LINK_TEMPLATE = os.getenv('S3_LINK_TEMPLATE', 'https://scraper.website.yandexcloud.net/{filename}')
+# ----------------------------------------------------
 
 # load_dotenv()
 # logging.basicConfig(level=logging.INFO) # <-- УДАЛЕНО
@@ -90,14 +94,11 @@ TELEGRAM_DEGRADED_MODE_DELAY = 0.5
 class TelegramClientWrapper:
     def __init__(self, client: TelegramClient, account_id: str, api_key: Optional[str] = None):
         self.client = client
-        self.account_id = account_id
+        self.account_id = account_id # Используем переданный ID напрямую
         self.api_key = api_key
-        self.last_request_time = 0
-        self.last_group_request_time = 0
-        self.requests_count = 0
-        self.degraded_mode = False
-        
-        # Получаем информацию о прокси, если он установлен
+        logger.info(f"TelegramClientWrapper инициализирован с account_id: {self.account_id}")
+
+        # --- Убираем сложную логику извлечения ID, оставляем только получение инфо о прокси ---
         proxy_dict = getattr(client.session, 'proxy', None)
         self.has_proxy = proxy_dict is not None
         if self.has_proxy:
@@ -105,10 +106,16 @@ class TelegramClientWrapper:
             host = proxy_dict.get('addr', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
             port = proxy_dict.get('port', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
             self.proxy_str = f"{self.proxy_type}://{host}:{port}"
-            logger.info(f"Клиент {account_id} использует прокси.")
+            logger.info(f"Клиент {self.account_id} использует прокси.")
         else:
-            logger.info(f"Клиент {account_id} работает без прокси")
+            logger.info(f"Клиент {self.account_id} работает без прокси")
+        # --- Конец упрощения ---
 
+        self.last_request_time = 0
+        self.last_group_request_time = 0
+        self.requests_count = 0
+        self.degraded_mode = False
+        
     def set_degraded_mode(self, degraded: bool):
         """Устанавливает режим пониженной производительности."""
         self.degraded_mode = degraded
@@ -141,17 +148,11 @@ class TelegramClientWrapper:
             try:
                 # Используем Redis для обновления статистики аккаунтов
                 from redis_utils import update_account_usage_redis
-                result = await update_account_usage_redis(self.api_key, self.account_id, "telegram")
-                if isinstance(result, bool):
-                    if result:
-                        logger.info(f"Статистика использования для аккаунта {self.account_id} успешно обновлена в Redis.")
-                elif result is not None:
-                    logger.warning(f"Неожиданный результат от update_account_usage_redis: {result}")
+                await update_account_usage_redis(self.api_key, self.account_id, "telegram")
             except ImportError:
                 # Если Redis не доступен, используем обычное обновление
                 from user_manager import update_account_usage
                 await update_account_usage(self.api_key, self.account_id, "telegram")
-                logger.info(f"Статистика использования для аккаунта {self.account_id} обновлена через user_manager.")
         
         # Логируем информацию о запросе с учетом прокси
         proxy_info = " через прокси" if self.has_proxy else " без прокси"
@@ -344,22 +345,44 @@ async def auth_telegram_2fa(client: TelegramClient, password: str) -> None:
         raise
 
 # --- Вспомогательная функция (код без изменений, только проверяем сигнатуру) ---
-async def _find_channels_with_account(client: TelegramClient, keywords: List[str], min_members: int = 100000, max_channels: int = 20) -> Dict[int, Dict]:
-    """Ищет каналы с использованием одного конкретного клиента."""
+async def _find_channels_with_account(
+    client: TelegramClient,
+    account_id: str, # <<<--- ДОБАВЛЕН ПАРАМЕТР
+    keywords: List[str],
+    min_members: int = 100000,
+    max_channels: int = 20,
+    api_key: Optional[str] = None
+    ) -> Dict[int, Dict]:
+    """Ищет каналы с использованием одного конкретного клиента и обновляет статистику.
+
+    Args:
+        client: Экземпляр TelegramClient.
+        account_id: ID аккаунта (UUID из БД).
+        keywords: Список ключевых слов.
+        min_members: Минимальное количество участников.
+        max_channels: Максимальное количество каналов.
+        api_key: API ключ пользователя для обновления статистики.
+
+    Returns:
+        Словарь найденных каналов.
+    """
     found_channels_dict = {}
     processed_keywords = set()
 
-    logger.info(f"Запуск поиска каналов для клиента ({client.session.filename if client.session else 'unknown'}) по словам: {keywords}")
+    # Используем переданный account_id для логирования
+    logger.info(f"Запуск поиска каналов для клиента ({account_id}) по словам: {keywords}")
+
+    # <<<--- Создаем wrapper с переданным account_id ---
+    if not api_key:
+        logger.warning(f"[Acc: {account_id}] API ключ не предоставлен для _find_channels_with_account, статистика не будет обновлена.")
+    # Передаем корректный account_id (UUID) в wrapper
+    wrapper = TelegramClientWrapper(client, account_id, api_key)
+    # --------------------------------------------------
 
     try:
-        # Убедимся, что клиент подключен
-        if not client.is_connected():
-            logger.info(f"Клиент ({client.session.filename if client.session else 'unknown'}) не подключен. Подключаемся...")
-            await client.connect()
-
-        if not await client.is_user_authorized():
-            logger.warning(f"Клиент ({client.session.filename if client.session else 'unknown'}) не авторизован. Поиск каналов невозможен.")
-            return {}
+        # <<<--- Проверку подключения/авторизации можно убрать, если пул это гарантирует
+        # if not client.is_connected(): ...
+        # if not await client.is_user_authorized(): ...
 
         # --- Основной цикл поиска ---
         for keyword in keywords:
@@ -368,41 +391,41 @@ async def _find_channels_with_account(client: TelegramClient, keywords: List[str
             processed_keywords.add(keyword)
 
             try:
-                logger.debug(f"Поиск по слову: '{keyword}' через клиент {client.session.filename if client.session else 'unknown'}")
-                # Используем SearchGlobalRequest для поиска по ключевому слову
-                # В Telethon v1 используем functions.contacts.SearchRequest
-                result = await client(functions.contacts.SearchRequest(
+                logger.debug(f"[Acc: {account_id}] Поиск по слову: '{keyword}'")
+                # <<<--- Используем wrapper._make_request для SearchRequest ---
+                result = await wrapper._make_request( # Заменяем client(...) на wrapper._make_request
+                    functions.contacts.SearchRequest,
                     q=keyword,
-                    limit=max_channels * 2 # Ищем с запасом, чтобы отфильтровать позже
-                ))
+                    limit=max_channels * 2
+                )
+                # ------------------------------------------------------------
 
-                # Обрабатываем найденные каналы
-                if hasattr(result, 'chats'):
+                if result is not None and hasattr(result, 'chats'):
                     for chat in result.chats:
-                        # Ищем только каналы (не мегагруппы)
                         if isinstance(chat, types.Channel) and getattr(chat, 'megagroup', False) is False:
                             channel_id = chat.id
-                            # Проверяем, не добавлен ли уже канал
                             if channel_id not in found_channels_dict:
                                 try:
-                                    participants_count = None # Инициализируем
-                                    if chat.access_hash is not None: # Проверяем наличие access_hash
+                                    participants_count = None
+                                    if chat.access_hash is not None:
                                         try:
                                             input_channel = types.InputChannel(channel_id=chat.id, access_hash=chat.access_hash)
-                                            full_channel = await client(GetFullChannelRequest(channel=input_channel))
-                                            participants_count = full_channel.full_chat.participants_count
+                                            # <<<--- Используем wrapper._make_request для GetFullChannelRequest ---
+                                            full_channel = await wrapper._make_request( # Заменяем client(...) на wrapper._make_request
+                                                GetFullChannelRequest,
+                                                channel=input_channel
+                                            )
+                                            # ------------------------------------------------------------------
+                                            if full_channel and hasattr(full_channel, 'full_chat') and full_channel.full_chat:
+                                                participants_count = full_channel.full_chat.participants_count
                                         except Exception as e_gfc:
-                                            logger.error(f"Ошибка GetFullChannelRequest для канала {chat.id}: {e_gfc}")
+                                            logger.error(f"[Acc: {account_id}] Ошибка GetFullChannelRequest для канала {chat.id}: {e_gfc}")
                                     else:
-                                        logger.warning(f"Канал {chat.id} ('{chat.title}') не имеет access_hash. Пропускаем GetFullChannelRequest.")
+                                        logger.warning(f"[Acc: {account_id}] Канал {chat.id} ('{chat.title}') не имеет access_hash. Пропускаем GetFullChannelRequest.")
 
-
-                                    # Проверяем минимальное количество участников
                                     if participants_count is not None and participants_count >= min_members:
-                                        # Получаем username, проверяем его наличие
                                         username = getattr(chat, 'username', None)
                                         link = f"https://t.me/{username}" if username else None
-
                                         found_channels_dict[channel_id] = {
                                             'id': channel_id,
                                             'title': chat.title,
@@ -410,102 +433,116 @@ async def _find_channels_with_account(client: TelegramClient, keywords: List[str
                                             'link': link,
                                             'members_count': participants_count
                                         }
-                                        logger.debug(f"Найден подходящий канал: {chat.title} ({participants_count} участников)")
-                                        # Останавливаемся, если достигли лимита max_channels
+                                        logger.debug(f"[Acc: {account_id}] Найден подходящий канал: {chat.title} ({participants_count} участников)")
                                         if len(found_channels_dict) >= max_channels:
-                                            logger.info(f"Достигнут лимит ({max_channels}) найденных каналов по слову '{keyword}'.")
-                                            break # Прерываем внутренний цикл по чатам
+                                            logger.info(f"[Acc: {account_id}] Достигнут лимит ({max_channels}) найденных каналов по слову '{keyword}'.")
+                                            break
                                 except ChannelPrivateError:
-                                    # logger.warning(f"Канал '{chat.title}' (ID: {channel_id}) приватный, пропускаем.")
-                                    pass # Просто пропускаем приватные
+                                    pass
                                 except Exception as e_full:
-                                    logger.error(f"Ошибка при получении полной информации о канале {channel_id} ('{chat.title}'): {e_full}")
-                    # Выходим из внешнего цикла по ключевым словам, если достигли общего лимита
+                                    logger.error(f"[Acc: {account_id}] Ошибка при получении полной информации о канале {channel_id} ('{chat.title}'): {e_full}")
                     if len(found_channels_dict) >= max_channels:
-                         logger.info(f"Достигнут общий лимит ({max_channels}) найденных каналов.")
+                         logger.info(f"[Acc: {account_id}] Достигнут общий лимит ({max_channels}) найденных каналов.")
                          break
                 else:
-                     logger.debug(f"Результат поиска по '{keyword}' не содержит 'chats'.")
+                     logger.debug(f"[Acc: {account_id}] Результат поиска по '{keyword}' не содержит 'chats'.")
 
             except FloodWaitError as e:
-                logger.warning(f"FloodWaitError при поиске по слову '{keyword}': ждем {e.seconds} секунд")
+                logger.warning(f"[Acc: {account_id}] FloodWaitError при поиске по слову '{keyword}': ждем {e.seconds} секунд")
                 await asyncio.sleep(e.seconds + 1)
             except (UsernameNotOccupiedError, UsernameInvalidError):
-                 # logger.warning(f"Поиск по '{keyword}' не дал результатов (UsernameNotOccupiedError/UsernameInvalidError).")
-                 pass # Это нормальная ситуация, просто нет таких каналов
+                 pass
             except Exception as e_search:
-                logger.error(f"Ошибка при поиске по слову '{keyword}': {e_search}", exc_info=True)
+                logger.error(f"[Acc: {account_id}] Ошибка при поиске по слову '{keyword}': {e_search}", exc_info=True)
 
     except AuthKeyError:
-         logger.error(f"Ключ авторизации невалиден для клиента {client.session.filename if client.session else 'unknown'}. Поиск прерван.")
-         # Можно добавить логику деактивации аккаунта
+         logger.error(f"[Acc: {account_id}] Ключ авторизации невалиден. Поиск прерван.")
     except UserDeactivatedBanError:
-         logger.error(f"Аккаунт {client.session.filename if client.session else 'unknown'} заблокирован. Поиск прерван.")
-         # Можно добавить логику деактивации аккаунта
+         logger.error(f"[Acc: {account_id}] Аккаунт заблокирован. Поиск прерван.")
     except Exception as e_outer:
-         logger.error(f"Общая ошибка в _find_channels_with_account ({client.session.filename if client.session else 'unknown'}): {e_outer}", exc_info=True)
+         logger.error(f"[Acc: {account_id}] Общая ошибка в _find_channels_with_account: {e_outer}", exc_info=True)
 
-    logger.info(f"Завершен поиск для клиента ({client.session.filename if client.session else 'unknown'}). Найдено уникальных: {len(found_channels_dict)}")
+    logger.info(f"[Acc: {account_id}] Завершен поиск для клиента. Найдено уникальных: {len(found_channels_dict)}")
     return found_channels_dict
 
 # --- ИЗМЕНЕННАЯ Функция find_channels ---
 async def find_channels(
-    # client: TelegramClient, # <-- Убрали
-    telegram_pool: TelegramClientPool, # <-- Добавили
+    telegram_pool: TelegramClientPool,
     keywords: List[str],
     min_members: int = 100000,
     max_channels: int = 20,
     api_key: Optional[str] = None
     ) -> List[Dict]:
-    """Находит каналы по ключевым словам, используя ротацию аккаунтов."""
+    """Находит каналы по ключевым словам, распределяя слова между активными аккаунтами."""
     logger.info(f"Поиск каналов по ключевым словам: {keywords} для api_key: {api_key}")
-    
-    # Проверяем наличие пула и ключа API
-    if not telegram_pool:
-        logger.error("Экземпляр telegram_pool не передан в find_channels.")
-        return []
-    if not api_key:
-        logger.error("API ключ не передан в find_channels.")
-        return []
-    if not keywords:
-        logger.warning("Список ключевых слов пуст.")
-        return []
 
-    # --- Получаем активные аккаунты ЧЕРЕЗ ПУЛ (он создаст клиентов) --- 
+    # Проверки входных данных
+    if not telegram_pool: logger.error("Экземпляр telegram_pool не передан в find_channels."); return []
+    if not api_key: logger.error("API ключ не передан в find_channels."); return []
+    if not keywords: logger.warning("Список ключевых слов пуст."); return []
+
+    # Получаем активные аккаунты
     try:
-        # from user_manager import get_active_accounts # <-- Убираем импорт
-        # Используем метод пула, который гарантирует создание клиентов
         active_accounts = await telegram_pool.get_active_clients(api_key)
         if not active_accounts:
-             logger.warning(f"Не найдено активных Telegram аккаунтов для ключа {api_key} через пул. Поиск невозможен.")
-             return []
+             logger.warning(f"Не найдено активных Telegram аккаунтов для ключа {api_key} через пул."); return []
+        num_accounts = len(active_accounts)
+        logger.info(f"Найдено {num_accounts} активных аккаунтов. Распределение {len(keywords)} ключевых слов...")
     except Exception as e_acc:
         logger.error(f"Ошибка при получении активных аккаунтов через пул в find_channels: {e_acc}", exc_info=True)
         return []
-    # -----------------------------------------------------------------
 
     all_found_channels_dict: Dict[int, Dict] = {}
     tasks = []
+    keywords_distributed = 0
 
-    logger.info(f"Найдено {len(active_accounts)} активных аккаунтов. Запуск поиска каналов...")
-
-    # Запускаем поиск для каждого активного аккаунта
-    for account_info in active_accounts:
+    # --- Распределение ключевых слов и запуск задач --- 
+    for i, account_info in enumerate(active_accounts):
         account_id = account_info.get('id')
-        if not account_id:
-            logger.warning("Найден аккаунт без ID в списке активных. Пропуск.")
-            continue
-
+        if not account_id: logger.warning(f"Найден аккаунт без ID в списке активных (индекс {i}). Пропуск."); continue
+        
         client = telegram_pool.get_client(account_id)
-        if not client or not isinstance(client, TelegramClient):
-            logger.warning(f"Клиент не найден или некорректен для аккаунта {account_id}. Пропуск.")
-            continue
+        if not client or not isinstance(client, TelegramClient): logger.warning(f"Клиент не найден/некорректен для аккаунта {account_id}. Пропуск."); continue
 
-        # Каждый клиент ищет по всем ключевым словам
-        # Передаем копию списка keywords, на всякий случай
+        # --- Проверка подключения/авторизации ПЕРЕД созданием задачи ---
+        try:
+            if not client.is_connected():
+                logger.info(f"[find_channels] Клиент {account_id} не подключен. Попытка подключения...")
+                await client.connect()
+                if not client.is_connected(): logger.error(f"[find_channels] Не удалось подключить клиент {account_id}. Пропуск."); continue
+                logger.info(f"[find_channels] Клиент {account_id} успешно подключен.")
+            if not await client.is_user_authorized():
+                logger.warning(f"[find_channels] Клиент {account_id} НЕ авторизован. Пропуск.")
+                continue
+            logger.info(f"[find_channels] Клиент {account_id} готов к работе.")
+        except (FloodWaitError, AuthKeyError, ConnectionError, Exception) as e_check:
+            logger.error(f"[find_channels] Ошибка при проверке/подключении клиента {account_id}: {e_check}. Пропуск.")
+            continue
+        # --- Конец проверки --- 
+
+        # Распределяем ключевые слова (round-robin)
+        keywords_for_account = keywords[i::num_accounts] # Берем каждое N-ое слово, начиная с i
+        
+        if not keywords_for_account:
+             logger.info(f"Для аккаунта {account_id} не осталось ключевых слов для обработки.")
+             continue
+        
+        keywords_distributed += len(keywords_for_account)
+        logger.info(f"Аккаунт {account_id} будет искать по {len(keywords_for_account)} словам: {keywords_for_account[:3]}..." )
+        
+        # Создаем задачу, передавая только нужные слова
         tasks.append(asyncio.create_task(
-            _find_channels_with_account(client, list(keywords), min_members, max_channels)
+            _find_channels_with_account(
+                client=client, # Передаем рабочий клиент
+                account_id=account_id, 
+                keywords=keywords_for_account, # <<< Передаем ЧАСТЬ слов
+                min_members=min_members,
+                max_channels=max_channels,
+                api_key=api_key
+            )
         ))
+
+    logger.info(f"Всего распределено ключевых слов: {keywords_distributed}. Запускаем {len(tasks)} задач поиска...")
 
     # Ожидаем завершения всех задач
     if tasks:
@@ -546,15 +583,24 @@ def _extract_media_details(media):
     media_object = None # Объект Telethon для скачивания
     file_ext = '.bin'
     mime_type = 'application/octet-stream'
+    file_size = 0 # <<< Инициализируем размер файла
 
     # Фото
-    if isinstance(media, types.MessageMediaPhoto) and media.photo:
+    # <<< Добавляем проверку на PhotoEmpty перед доступом к photo.sizes >>>
+    if isinstance(media, types.MessageMediaPhoto) and media.photo and not isinstance(media.photo, types.PhotoEmpty):
         media_type = 'photo'
         media_object = media.photo # Берем сам объект Photo
         if hasattr(media_object, 'id'):
             file_id = str(media_object.id)
             file_ext = '.jpg'
             mime_type = 'image/jpeg'
+            # <<< Размер для фото: берем размер самой большой версии (photo.sizes)
+            if hasattr(media_object, 'sizes') and media_object.sizes:
+                largest_size = max(media_object.sizes, key=lambda s: getattr(s, 'size', 0), default=None)
+                # --- Добавляем проверку типа перед доступом к size ---
+                if largest_size and not isinstance(largest_size, (types.PhotoSizeEmpty, types.PhotoCachedSize, types.PhotoStrippedSize, types.PhotoPathSize, types.PhotoSizeProgressive)) and hasattr(largest_size, 'size'):
+                # ----------------------------------------------------
+                    file_size = largest_size.size 
         else:
             logger.warning("Обнаружен объект Photo без ID.")
             return None # Не можем обработать без ID
@@ -564,6 +610,7 @@ def _extract_media_details(media):
         if hasattr(media_object, 'id'):
             file_id = str(media_object.id)
             mime_type = getattr(media_object, 'mime_type', 'application/octet-stream').lower()
+            file_size = getattr(media_object, 'size', 0) # <<< Получаем размер документа
 
             # Определяем тип по mime_type
             if mime_type.startswith('video/'):
@@ -618,7 +665,7 @@ def _extract_media_details(media):
               logger.warning(f"Не удалось получить file_id или media_object для медиа типа {media_type}")
               return None
 
-    return media_type, file_id, media_object, file_ext, mime_type
+    return media_type, file_id, media_object, file_ext, mime_type, file_size # <<< Возвращаем file_size
 
 
 # --- Полная функция _process_channels_for_trending ---
@@ -632,225 +679,209 @@ async def _process_channels_for_trending(
     min_reactions: Optional[int],
     min_comments: Optional[int],
     min_forwards: Optional[int],
-    background_tasks_queue: List[Dict]
+    background_tasks_queue: List[Dict],
+    api_key: Optional[str] = None # <<<--- Добавляем api_key
     ) -> List[Dict]:
     processed_posts_for_these_channels = []
     logger = logging.getLogger(__name__)
- 
+
+    # <<<--- Создаем wrapper здесь ---
+    if not api_key:
+        logger.warning(f"[Acc: {account_id}] API ключ не предоставлен для _process_channels_for_trending, статистика не будет обновлена.")
+    wrapper = TelegramClientWrapper(client, account_id, api_key)
+    # ------------------------------
+
     try: # Добавляем try/except вокруг проверки клиента
-        # Проверка подключения клиента (остается здесь для основного потока)
-        if not client.is_connected():
-            # ... (код подключения, как и был) ...
-            try:
-                logger.info(f"[_process_channels_for_trending] Клиент {account_id} не подключен. Попытка подключения...")
-                await client.connect()
-                if not await client.is_user_authorized():
-                     logger.error(f"[_process_channels_for_trending] Клиент {account_id} НЕ АВТОРИЗОВАН!")
-                     return []
-                logger.info(f"[_process_channels_for_trending] Клиент {account_id} успешно подключен.")
-            except Exception as connect_err:
-                logger.error(f"[_process_channels_for_trending] Ошибка подключения клиента {account_id}: {connect_err}", exc_info=True)
-                return []
- 
+        # <<<--- Проверку подключения/авторизации можно убрать, если пул это гарантирует
+        # if not client.is_connected(): ...
+
         for channel_id_input in channel_ids:
             channel_processed_posts_count = 0
-            # --- Начало try для обработки одного канала --- 
+            peer_identifier = channel_id_input # Initialize for logging in except blocks
             try:
                 logger.info(f"--- [Acc: {account_id}] Начало обработки канала Input ID: {channel_id_input} ---")
 
                 # --- Подготовка ID и username ---
-                peer_identifier = channel_id_input # То, что будем передавать в API
                 entity_username = None
-                chat_entity_id_for_data = None # ID для сохранения в post_data
+                chat_entity_id_for_data = None
                 try:
                     numeric_id = int(channel_id_input)
-                    chat_entity_id_for_data = numeric_id # Сохраняем исходный числовой ID
-                    if numeric_id > 0:
-                        peer_identifier = int(f"-100{numeric_id}")
-                        logger.debug(f"[Шаг 0] Преобразование ID: {numeric_id} -> {peer_identifier}")
-                    else:
-                        peer_identifier = numeric_id
+                    chat_entity_id_for_data = numeric_id
+                    if numeric_id > 0: peer_identifier = int(f"-100{numeric_id}")
+                    else: peer_identifier = numeric_id
                 except ValueError:
-                    if isinstance(channel_id_input, str):
-                        peer_identifier = channel_id_input.lstrip('@')
-                        entity_username = peer_identifier
-                        logger.debug(f"[Шаг 0] ID '{channel_id_input}' -> username '{peer_identifier}'")
-                    else:
-                        logger.warning(f"[Шаг 0] Неожиданный тип ID: {type(channel_id_input)}. Пропуск.")
-                        continue
+                    if isinstance(channel_id_input, str): peer_identifier = channel_id_input.lstrip('@'); entity_username = peer_identifier
+                    else: logger.warning(f"[Шаг 0] Неожиданный тип ID: {type(channel_id_input)}. Пропуск."); continue
                 logger.debug(f"[Шаг 0] Идентификатор для запросов: {peer_identifier} (тип: {type(peer_identifier)})")
 
-                # --- Шаг 1: Получение сущности (для title, username, subscribers) ---
-                # ВАЖНО: Не используем chat_entity в iter_messages!
+                # --- Используем wrapper для get_entity ---
                 chat_entity = None
-                logger.debug(f"[Шаг 1] Вызов client.get_entity({peer_identifier}) для получения информации")
+                logger.debug(f"[Шаг 1] Вызов wrapper.get_entity({peer_identifier}) для получения информации")
                 try:
-                    chat_entity = await client.get_entity(peer_identifier)
-                    if not chat_entity:
-                        logger.error(f"[Шаг 1] ОШИБКА: get_entity вернул None для {peer_identifier}. Пропуск.")
-                        continue
+                    # chat_entity = await client.get_entity(peer_identifier)
+                    chat_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, peer_identifier)
+                    if not chat_entity: logger.error(f"[Шаг 1] ОШИБКА: get_entity через wrapper вернул None для {peer_identifier}. Пропуск."); continue
                     logger.debug(f"[Шаг 1] Успех! Получена сущность: ID={chat_entity.id}, Type={type(chat_entity)}")
-                    if not entity_username:
-                        entity_username = getattr(chat_entity, 'username', None)
-                    # Используем ID из полученной сущности для post_data
+                    if not entity_username: entity_username = getattr(chat_entity, 'username', None)
                     chat_entity_id_for_data = chat_entity.id
-                except (ValueError, TypeError) as e_val_type:
-                    logger.warning(f"[Шаг 1] ОШИБКА ({type(e_val_type).__name__}) для {peer_identifier}. Пропуск.", exc_info=True)
-                    continue
-                except FloodWaitError as flood:
-                    logger.warning(f"[Шаг 1] Flood wait ({flood.seconds}s) для {peer_identifier}. Пропуск.")
-                    await asyncio.sleep(flood.seconds)
-                    continue
-                except Exception as e_entity:
-                    logger.error(f"[Шаг 1] Неожиданная ошибка get_entity для {peer_identifier}: {e_entity}", exc_info=True)
-                    continue
+                except (ValueError, TypeError) as e_val_type: logger.warning(f"[Шаг 1] ОШИБКА ({type(e_val_type).__name__}) для {peer_identifier}. Пропуск.", exc_info=True); continue
+                except FloodWaitError as flood: logger.warning(f"[Шаг 1] Flood wait ({flood.seconds}s) для {peer_identifier}. Пропуск."); await asyncio.sleep(flood.seconds); continue
+                except Exception as e_entity: logger.error(f"[Шаг 1] Неожиданная ошибка get_entity для {peer_identifier}: {e_entity}", exc_info=True); continue
+                # -----------------------------------------
 
                 # --- Извлечение данных из chat_entity ---
                 channel_title = getattr(chat_entity, 'title', None) or f"{getattr(chat_entity, 'first_name', '')} {getattr(chat_entity, 'last_name', '')}".strip() or f"Unknown ({chat_entity_id_for_data})"
-                subscribers = getattr(chat_entity, 'participants_count', None) # Получаем None по умолчанию
+                subscribers = getattr(chat_entity, 'participants_count', None)
 
-                # Пытаемся получить подписчиков через GetFullChannelRequest, если их нет или 0
+                # --- Используем wrapper для GetFullChannelRequest ---
                 if subscribers is None or subscribers == 0:
-                    logger.debug(f"Subscribers count is {subscribers}. Trying GetFullChannelRequest...")
+                    logger.debug(f"Subscribers count is {subscribers}. Trying GetFullChannelRequest via wrapper...")
                     try:
-                        # Явно создаем InputPeerChannel, если есть access_hash
                         input_peer = None
-                        # Проверяем, что это канал и у него есть access_hash
                         if isinstance(chat_entity, types.Channel) and hasattr(chat_entity, 'access_hash') and chat_entity.access_hash is not None:
-                            # Используем types.InputChannel вместо types.InputPeerChannel
                             input_peer = types.InputChannel(channel_id=chat_entity.id, access_hash=chat_entity.access_hash)
-                        # else: # Блок else все еще закомментирован/удален
-                        #    logger.warning(f"Access hash not found for {chat_entity.id}. Using chat_entity directly for GetFullChannelRequest.")
-                        #    input_peer = chat_entity
-                        
-                        # Проверяем на types.InputChannel
                         if input_peer and isinstance(input_peer, types.InputChannel):
-                            full_chat_result = await client(functions.channels.GetFullChannelRequest(channel=input_peer))
+                            # full_chat_result = await client(functions.channels.GetFullChannelRequest(channel=input_peer))
+                            full_chat_result = await wrapper._make_request(functions.channels.GetFullChannelRequest, channel=input_peer)
                             subscribers = getattr(getattr(full_chat_result, 'full_chat', None), 'participants_count', None)
-                            if subscribers is not None:
-                                logger.debug(f"Successfully retrieved subscribers ({subscribers}) via GetFullChannelRequest.")
-                            else:
-                                logger.warning(f"GetFullChannelRequest did not return participants_count for {chat_entity.id}.")
-                        else:
-                            logger.warning(f"Could not create InputPeerChannel for GetFullChannelRequest for {chat_entity.id}.")
-                         
-                    except Exception as e_full:
-                        logger.warning(f"Error getting full channel info for {chat_entity.id}: {e_full}")
-                        # Оставляем subscribers как None, если произошла ошибка
+                            if subscribers is not None: logger.debug(f"Successfully retrieved subscribers ({subscribers}) via GetFullChannelRequest.")
+                            else: logger.warning(f"GetFullChannelRequest did not return participants_count for {chat_entity.id}.")
+                        else: logger.warning(f"Could not create InputPeerChannel for GetFullChannelRequest for {chat_entity.id}.")
+                    except Exception as e_full: logger.warning(f"Error getting full channel info for {chat_entity.id}: {e_full}")
+                # -----------------------------------------------
 
-                # ---- НОВОЕ: Попытка получить подписчиков через get_entity(username), если другие способы не сработали ----
+                # --- Используем wrapper для get_entity(username) ---
                 if subscribers is None and entity_username:
-                    logger.debug(f"Failed to get subscribers via ID/GetFullChannelRequest. Trying get_entity('{entity_username}') with force_fetch=True...")
+                    logger.debug(f"Failed to get subscribers via ID/GetFullChannelRequest. Trying wrapper.get_entity('{entity_username}')...")
                     try:
-                        # Удаляем несуществующий параметр force_fetch=True
-                        refreshed_entity = await client.get_entity(entity_username)
+                        # refreshed_entity = await client.get_entity(entity_username)
+                        refreshed_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, entity_username)
                         subscribers = getattr(refreshed_entity, 'participants_count', None)
-                        if subscribers is not None:
-                            # Убираем упоминание force_fetch из лога тоже
-                            logger.debug(f"Successfully retrieved subscribers ({subscribers}) via get_entity(username).") 
-                        else:
-                            logger.warning(f"get_entity('{entity_username}', force_fetch=True) did not return participants_count.")
-                    except Exception as e_refresh:
-                        logger.warning(f"Error getting entity by username '{entity_username}' with force_fetch=True: {e_refresh}")
-                # ---- Конец новой попытки ----
+                        if subscribers is not None: logger.debug(f"Successfully retrieved subscribers ({subscribers}) via get_entity(username).")
+                        else: logger.warning(f"get_entity('{entity_username}') did not return participants_count.")
+                    except Exception as e_refresh: logger.warning(f"Error getting entity by username '{entity_username}': {e_refresh}")
+                # -------------------------------------------------
 
-                # ---- НОВОЕ: Попытка получить подписчиков через SearchGlobalRequest(username), если другие способы не сработали ----
+                # --- Используем wrapper для SearchRequest ---
                 if subscribers is None and entity_username:
-                    logger.debug(f"Failed to get subscribers actively. Trying SearchGlobalRequest for '{entity_username}'...")
+                    logger.debug(f"Failed to get subscribers actively. Trying SearchRequest via wrapper for '{entity_username}'...")
                     try:
-                        search_result = await client(functions.contacts.SearchRequest(q=entity_username, limit=5))
+                        # search_result = await client(functions.contacts.SearchRequest(q=entity_username, limit=5))
+                        search_result = await wrapper._make_request(functions.contacts.SearchRequest, q=entity_username, limit=5)
                         found_chat_with_hash = None
-                        for found_chat in search_result.chats:
-                            # Ищем совпадение по ID и проверяем наличие access_hash
-                            if found_chat.id == chat_entity.id and hasattr(found_chat, 'access_hash') and found_chat.access_hash:
-                                found_chat_with_hash = found_chat
-                                break
-                        
+                        if search_result and hasattr(search_result, 'chats'): # Add check here
+                            for found_chat in search_result.chats:
+                                if found_chat.id == chat_entity.id and hasattr(found_chat, 'access_hash') and found_chat.access_hash: found_chat_with_hash = found_chat; break
                         if found_chat_with_hash:
-                            logger.debug(f"Found channel via search with access_hash. Trying GetFullChannelRequest again...")
+                            logger.debug(f"Found channel via search with access_hash. Trying GetFullChannelRequest again via wrapper...")
                             try:
                                 input_channel = types.InputChannel(channel_id=found_chat_with_hash.id, access_hash=found_chat_with_hash.access_hash)
-                                full_chat_result = await client(functions.channels.GetFullChannelRequest(channel=input_channel))
+                                # full_chat_result = await client(functions.channels.GetFullChannelRequest(channel=input_channel))
+                                full_chat_result = await wrapper._make_request(functions.channels.GetFullChannelRequest, channel=input_channel)
                                 subscribers = getattr(getattr(full_chat_result, 'full_chat', None), 'participants_count', None)
-                                if subscribers is not None:
-                                    logger.info(f"Successfully retrieved subscribers ({subscribers}) via Search + GetFullChannelRequest.")
-                                else:
-                                    logger.warning("GetFullChannelRequest after search did not return participants_count.")
-                            except Exception as e_gfc_search:
-                                logger.warning(f"Error during GetFullChannelRequest after search: {e_gfc_search}")
-                        else:
-                            logger.warning(f"Channel '{entity_username}' not found via SearchRequest or no access_hash in result.")
-                         
-                    except FloodWaitError as flood:
-                        logger.warning(f"Flood wait ({flood.seconds}s) during SearchRequest for '{entity_username}'.")
-                        await asyncio.sleep(flood.seconds) 
-                    except Exception as e_search:
-                        logger.warning(f"Error during SearchRequest for '{entity_username}': {e_search}")
-                # ---- Конец новой попытки через поиск ----
+                                if subscribers is not None: logger.info(f"Successfully retrieved subscribers ({subscribers}) via Search + GetFullChannelRequest.")
+                                else: logger.warning("GetFullChannelRequest after search did not return participants_count.")
+                            except Exception as e_gfc_search: logger.warning(f"Error during GetFullChannelRequest after search: {e_gfc_search}")
+                        else: logger.warning(f"Channel '{entity_username}' not found via SearchRequest or no access_hash in result.")
+                    except FloodWaitError as flood: logger.warning(f"Flood wait ({flood.seconds}s) during SearchRequest for '{entity_username}'."); await asyncio.sleep(flood.seconds)
+                    except Exception as e_search: logger.warning(f"Error during SearchRequest for '{entity_username}': {e_search}")
+                # -------------------------------------------
 
-                # ---- Проверка кэша, если подписчики все еще None ----
+                # ... (проверка кэша и установка subscribers_for_calc как раньше) ...
                 if subscribers is None:
-                    # Определяем ключ для кэша (username или ID)
                     cache_key = f"@{entity_username}" if entity_username else str(chat_entity_id_for_data)
                     cached_subs = channel_members_cache.get(cache_key)
-                    if cached_subs is not None:
-                        logger.info(f"Subscribers count not found actively for {chat_entity_id_for_data}. Using cached value: {cached_subs}")
-                        subscribers = cached_subs
-                    else:
-                        logger.warning(f"Subscribers count not found actively AND not in cache for {chat_entity_id_for_data}. Cache key tried: '{cache_key}'.")
-                # ---- Конец проверки кэша ----
+                    if cached_subs is not None: logger.info(f"Subscribers count not found actively for {chat_entity_id_for_data}. Using cached value: {cached_subs}"); subscribers = cached_subs
+                    else: logger.warning(f"Subscribers count not found actively AND not in cache for {chat_entity_id_for_data}. Cache key tried: '{cache_key}'.")
 
-                # Устанавливаем значение для расчетов, с резервным значением 10 и логгированием
-                if subscribers is None:
-                    logger.warning(f"Using 10 for trend score calculation for channel {chat_entity_id_for_data} ('{entity_username}' / {peer_identifier}).")
-                    subscribers_count_for_calc = 10  # Используем 10 вместо 0
-                else:
-                    subscribers_count_for_calc = int(subscribers)  # Убедимся, что это int
-
-                # Используем минимум 10 для избежания деления на ноль или логарифма от нуля/единицы
+                if subscribers is None: logger.warning(f"Using 10 for trend score calculation for channel {chat_entity_id_for_data} ('{entity_username}' / {peer_identifier})."); subscribers_count_for_calc = 10
+                else: subscribers_count_for_calc = int(subscribers)
                 subscribers_for_calc = max(subscribers_count_for_calc, 10)
                 logger.debug(f"Информация для '{channel_title}' (ID: {chat_entity_id_for_data}, User: {entity_username}): Подписчики={subscribers}, Используется для расчета={subscribers_for_calc}")
 
                 # --- Шаг 2: Получение Истории через iter_messages ---
                 logger.debug(f"[Шаг 2] Начинаем итерацию сообщений для {channel_id_input} (передаем: {peer_identifier})")
                 processed_in_channel_count = 0
+                # --- Обновляем статистику перед iter_messages (приблизительно) ---
+                if api_key:
+                    try:
+                        from redis_utils import update_account_usage_redis
+                        await update_account_usage_redis(api_key, account_id, "telegram") # Используем account_id из параметров
+                        logger.info(f"[Acc: {account_id}] [Chan: {channel_id_input}] Статистика обновлена (Redis) перед iter_messages.")
+                    except ImportError:
+                        from user_manager import update_account_usage
+                        await update_account_usage(api_key, account_id, "telegram")
+                        logger.info(f"[Acc: {account_id}] [Chan: {channel_id_input}] Статистика обновлена (user_manager) перед iter_messages.")
+                    except Exception as stats_err:
+                        logger.error(f"[Acc: {account_id}] [Chan: {channel_id_input}] Ошибка обновления статистики перед iter_messages: {stats_err}")
+                else:
+                    logger.warning(f"[Acc: {account_id}] [Chan: {channel_id_input}] API ключ не предоставлен, статистика не обновлена перед iter_messages.")
+                # -----------------------------------------------------------------------
+
+                # <<<--- ИСПРАВЛЯЕМ ОТСТУПЫ ЗДЕСЬ (УБИРАЕМ ЛИШНИЙ ОТСТУП) ---<<<
+                cutoff_date_naive = cutoff_date.replace(tzinfo=None)
+                iter_count = 0 # Счетчик итераций
+                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Начинаем client.iter_messages. Cutoff: {cutoff_date_naive.isoformat()}, Min Views: {min_views}")
+                
+                # --- ДИАГНОСТИКА: Пытаемся получить 1 сообщение напрямую ---
                 try:
-                    # *** Используем peer_identifier (ID или username), который сработал для get_entity ***
-                    async for post in client.iter_messages(
-                        entity=peer_identifier,  # Use the identifier that worked for get_entity
-                        limit=3000,  # Используем большой лимит вместо 100 или None
-                        # reverse=True  # Изменяем на True, чтобы итерировать от новых к старым
-                    ):
-                        # ... (вся остальная логика фильтрации, сборки post_data, обработки медиа - КАК РАНЬШЕ) ...
-                        if not post or not isinstance(post, types.Message) or not post.date: continue
+                    latest_messages = await client.get_messages(peer_identifier, limit=1)
+                    if latest_messages:
+                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) successful. Latest post ID: {latest_messages[0].id}, Date: {latest_messages[0].date}")
+                    else:
+                        logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) returned an empty list.")
+                except Exception as e_get_msg:
+                    logger.error(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: Error calling get_messages(limit=1): {e_get_msg}", exc_info=True)
+                # --------------------------------------------------------
 
-                        # --- Сравнение дат как NAIVE --- 
-                        # Сначала получаем дату поста
-                        post_date_original = post.date
-                        # Делаем дату поста наивной, если она aware
-                        post_date_naive = post_date_original.replace(tzinfo=None) if post_date_original.tzinfo is not None else post_date_original
-                        # Делаем cutoff_date наивной (она изначально aware UTC)
-                        cutoff_date_naive = cutoff_date.replace(tzinfo=None)
-
-                        # Сравниваем наивные даты
+                # --- ДИАГНОСТИКА: Оборачиваем iter_messages в try...except ---
+                try:
+                    async for post in client.iter_messages(entity=peer_identifier, limit=3000):
+                        iter_count += 1
+                        if not post or not isinstance(post, types.Message) or not post.date:
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пропуск (None, не Message или нет даты)")
+                            continue
+                        
+                        post_date_naive = post.date.replace(tzinfo=None) if post.date.tzinfo is not None else post.date
+                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Post ID={post.id}, Date={post_date_naive.isoformat()}")
+                        
                         if post_date_naive < cutoff_date_naive:
-                            post_date_str = post.date.isoformat()
-                            cutoff_date_str = cutoff_date.isoformat()
-                            logger.debug(f"Пост {post.id} слишком старый ({post_date_str} <= {cutoff_date_str}), прекращаем итерацию для {channel_id_input}.")
-                            break
-                        if not post.message: continue
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} слишком старый ({post_date_naive.isoformat()} < {cutoff_date_naive.isoformat()}). Прерываем цикл.")
+                            break # Прерываем цикл, т.к. сообщения идут от новых к старым
+                            
+                        # --- УБИРАЕМ ПРОВЕРКУ ТЕКСТА ЗДЕСЬ ---
+                        # if not post.message:
+                        #     logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (нет текста).")
+                        #     continue
+                        # -------------------------------------
+                            
                         views = getattr(post, 'views', 0) if post.views is not None else 0
-                        if min_views is not None and views < min_views: continue
-                        reactions = 0
-                        comments = 0
-                        forwards = 0
-                        if post.reactions and post.reactions.results: reactions = sum(r.count for r in post.reactions.results)
-                        if min_reactions is not None and reactions < min_reactions: continue
-                        if post.replies: comments = post.replies.replies
-                        if min_comments is not None and comments < min_comments: continue
-                        if post.forwards: forwards = post.forwards
-                        if min_forwards is not None and forwards < min_forwards: continue
+                        if min_views is not None and views < min_views:
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (просмотры {views} < min_views {min_views}).")
+                            continue
+                            
+                        reactions = 0; comments = 0; forwards = 0
+                        if post.reactions and post.reactions.results: 
+                            reactions = sum(r.count for r in post.reactions.results)
+                        if min_reactions is not None and reactions < min_reactions:
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (реакции {reactions} < min_reactions {min_reactions}).")
+                            continue
+                            
+                        if post.replies: 
+                            comments = post.replies.replies
+                        if min_comments is not None and comments < min_comments:
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (комментарии {comments} < min_comments {min_comments}).")
+                            continue
+                            
+                        if post.forwards: 
+                            forwards = post.forwards
+                        if min_forwards is not None and forwards < min_forwards:
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (форварды {forwards} < min_forwards {min_forwards}).")
+                            continue
 
+                        # --- Если пост прошел все проверки, логируем это --- 
+                        # logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} ПРОШЕЛ все фильтры. Добавляем.") # Логируем после проверки текста
+                        
                         # --- Собираем данные поста ---
                         post_data = {
                             'id': post.id,
@@ -858,134 +889,187 @@ async def _process_channels_for_trending(
                             'channel_title': channel_title,
                             'channel_username': entity_username,
                             'subscribers': subscribers,
-                            'text': post.message,
-                            'views': views,
-                            'reactions': reactions,
-                            'comments': comments,
-                            'forwards': forwards,
+                            'text': "", # Инициализируем текст пустым
+                            'views': views, 'reactions': reactions, 'comments': comments, 'forwards': forwards,
                             'date': post.date.isoformat(),
-                            'url': None,
+                            'url': f"https://t.me/{entity_username}/{post.id}" if entity_username else f"https://t.me/c/{abs(chat_entity_id_for_data)}/{post.id}",
                             'media': [],
                             'trend_score': 0.0
                         }
-                        if entity_username:
-                            post_data['url'] = f"https://t.me/{entity_username}/{post.id}"
-                        else:
-                            post_data['url'] = f"https://t.me/c/{abs(chat_entity_id_for_data)}/{post.id}"
-                        # --- Обработка медиа ---
+
+                        # --- Обработка медиа и Поиск Текста ---
                         media_objects_to_process = []
-                        if hasattr(post, 'grouped_id') and post.grouped_id:
+                        post_text_found = post.message or "" # Получаем текст из основного сообщения
+
+                        if hasattr(post, 'grouped_id') and post.grouped_id: # Проверяем, является ли пост частью альбома
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Post {post.id} is part of album {post.grouped_id}. Fetching album messages...")
                             try:
-                                from telegram_utils import get_album_messages
-                                # Передаем peer_identifier для получения альбома
-                                album_messages = await get_album_messages(client, peer_identifier, post)
+                                album_messages = await get_album_messages(wrapper, peer_identifier, post)
+                                found_text_in_album = False
                                 for album_msg in album_messages:
-                                    if album_msg and album_msg.media: media_objects_to_process.append(album_msg.media)
-                            except Exception as e_album:
-                                logger.error(f"Ошибка получения альбома для поста {post.id}: {e_album}")
-                            if post.media: media_objects_to_process.append(post.media)
-                        elif post.media: media_objects_to_process.append(post.media)
-                        media_tasks_for_post = {}
+                                    # Собираем медиа со всех сообщений альбома
+                                    if album_msg and album_msg.media: 
+                                        media_objects_to_process.append(album_msg.media)
+                                    # Ищем первый непустой текст в альбоме
+                                    if album_msg and album_msg.message and not found_text_in_album:
+                                        post_text_found = album_msg.message # Перезаписываем текст, если нашли в альбоме
+                                        found_text_in_album = True
+                                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Found text for album {post.grouped_id} in message {album_msg.id}")
+                                
+                                if not found_text_in_album:
+                                    logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: No text found in album {post.grouped_id}, using main message text ('{post_text_found[:20]}...')")
+                            except Exception as e_album: 
+                                logger.error(f"[Acc: {account_id}][Chan: {channel_id_input}] Error fetching album for post {post.id}: {e_album}")
+                                # Используем текст из основного сообщения, если был
+
+                        elif post.media: # Если это не альбом, но есть медиа
+                            media_objects_to_process.append(post.media)
+
+                        # --- НОВАЯ ПРОВЕРКА: Пропускаем, если текст так и не найден ---
+                        if not post_text_found:
+                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (нет текста ни в основном сообщении, ни в альбоме).")
+                            continue
+                        # ----------------------------------------------------------
+                        
+                        # Логируем успешное прохождение всех фильтров (включая текст)
+                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} ПРОШЕЛ все фильтры (включая текст). Добавляем.")
+
+                        # Обновляем текст в post_data
+                        post_data['text'] = post_text_found
+
+                        # --- Модифицированная обработка медиа --- 
+                        media_tasks_for_post = {} # Словарь для уникальных задач загрузки
+                        processed_media_urls = set() # Чтобы не добавлять одинаковые URL
+                        # Инициализируем post_data['media'] как пустой список
+                        post_data['media'] = []
+
                         for media_obj_container in media_objects_to_process:
-                            media_details = _extract_media_details(media_obj_container)
-                            if not media_details: continue
-                            media_type, file_id, media_object, file_ext, mime_type = media_details
+                            media_details_tuple = _extract_media_details(media_obj_container)
+                            if not media_details_tuple: continue
+                            
+                            # Распаковываем с file_size
+                            media_type, file_id, media_object, file_ext, mime_type, file_size = media_details_tuple
+                            
+                            # Пропускаем ненужные типы или если нет ID/объекта
                             if media_type in ['poll', 'geo', 'contact', 'venue'] or not file_id or not media_object: continue
-                            s3_filename = f"mediaTg/{file_id}{file_ext}"
-                            preliminary_s3_url = S3_LINK_TEMPLATE.format(filename=s3_filename)
-                            if preliminary_s3_url not in post_data['media']: post_data['media'].append(preliminary_s3_url)
+                            
+                            is_placeholder = False
+                            s3_url_to_add = None
+                            s3_filename = None # <<< Инициализируем None
+                            s3_thumb_filename = None # <<< Инициализируем None
+                            
+                            # Проверяем размер видео
+                            if media_type == 'video' and file_size > MAX_FILE_SIZE:
+                                is_placeholder = True
+                                s3_thumb_filename = f"mediaTg/{file_id}_thumb.jpg"
+                                s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_thumb_filename)
+                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Media {file_id} ({media_type}) - Large file ({file_size} > {MAX_FILE_SIZE}), using placeholder URL: {s3_url_to_add}")
+                            else:
+                                s3_filename = f"mediaTg/{file_id}{file_ext}"
+                                s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_filename)
+                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Media {file_id} ({media_type}) - Regular file ({file_size}), using main URL: {s3_url_to_add}")
+
+                            # Добавляем информацию о медиа в структурированном виде, если URL еще не добавлен
+                            if s3_url_to_add and s3_url_to_add not in processed_media_urls:
+                                media_entry = {
+                                    'type': media_type,
+                                    'url': s3_url_to_add,
+                                    'is_placeholder': is_placeholder,
+                                    'mime_type': mime_type # Добавляем mime_type для информации
+                                }
+                                post_data['media'].append(media_entry)
+                                processed_media_urls.add(s3_url_to_add)
+                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Added media entry to post_data: {media_entry}")
+                            elif not s3_url_to_add:
+                                logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Could not determine S3 URL for media {file_id} ({media_type})")
+
+                            # Добавляем задачу на скачивание/загрузку в S3 (если еще нет для этого file_id)
+                            # Передаем file_size в задачу (хотя media_utils.py его сам получит)
                             if file_id not in media_tasks_for_post:
                                 media_tasks_for_post[file_id] = {
-                                    "account_id": account_id,  # <--- ИЗМЕНЕНИЕ
-                                    "media_object": media_object,
-                                    "file_id": file_id,
-                                    "s3_filename": s3_filename
+                                    "account_id": account_id, 
+                                    "media_object": media_object, 
+                                    "file_id": file_id, 
+                                    "s3_filename": s3_filename # <<< Убираем file_size и s3_thumb_filename
+                                    # "s3_thumb_filename": s3_thumb_filename if is_placeholder else None, 
+                                    # "file_size": file_size
                                 }
+                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Added background task for file_id {file_id}")
+                                
+                        # Добавляем все уникальные задачи для этого поста в общую очередь
+                        # Важно: убедитесь, что background_tasks_queue ожидает такой формат словаря!
+                        # Возможно, нужно будет скорректировать background_tasks.py/media_utils.py
                         background_tasks_queue.extend(media_tasks_for_post.values())
+                        # --- Конец модифицированной обработки медиа ---
+
                         # --- Расчет trend_score ---
-                        # log_views = math.log10(views + 1); log_subs = math.log10(subscribers_for_calc) if subscribers_for_calc > 0 else 1
-                        # engagement_rate = (reactions + comments * 2 + forwards * 5) / subscribers_for_calc if subscribers_for_calc > 0 else 0
-                        # engagement_rate = min(engagement_rate, 0.1)
-                        # trend_score = (log_views * 0.6) + (engagement_rate * 100 * 0.4)
-
-                        # Новая формула:
                         raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
-                        log_subs = math.log10(subscribers_for_calc) if subscribers_for_calc > 1 else 1  # Используем 1, если подписчиков <=1, чтобы избежать log10(1)=0
-                        trend_score = raw_engagement_score / log_subs if log_subs != 0 else raw_engagement_score  # Делим, если log_subs не 0
-
-                        # Округляем до целого числа
+                        subscribers_for_calc = subscribers if subscribers and subscribers > 0 else 1 # Защита от 0
+                        log_subs = math.log10(subscribers_for_calc) if subscribers_for_calc > 1 else 1 # Защита от <=1
+                        trend_score = raw_engagement_score / log_subs if log_subs != 0 else raw_engagement_score # Защита от деления на 0 (хотя log_subs не будет 0)
                         post_data['trend_score'] = int(trend_score)
 
                         processed_posts_for_these_channels.append(post_data)
                         processed_in_channel_count += 1
-                        if processed_in_channel_count >= posts_per_channel:
-                            logger.debug(f"Достигнут лимит ({posts_per_channel}) постов для {channel_id_input}. Прерываем итерацию.")
-                            break  # Прерываем async for
-
-                except FloodWaitError as flood:
-                    logger.warning(f"[Шаг 2] Flood wait ({flood.seconds}s) при iter_messages для {peer_identifier}. Прерываем.")
-                    await asyncio.sleep(flood.seconds)
+                        if processed_in_channel_count >= posts_per_channel: break
                 except Exception as e_iter:
-                    # Логируем ошибку с указанием идентификатора, который передавали
-                    logger.error(f"[Шаг 2] ОШИБКА iter_messages для {peer_identifier}: {e_iter}", exc_info=True)
-                    # Дополнительно проверяем на ошибку 'entity corresponding to'
-                    if 'Cannot find any entity corresponding to' in str(e_iter):
-                        logger.error(f"ПОДТВЕРЖДЕНИЕ: Ошибка 'Cannot find any entity' при iter_messages({peer_identifier}). Проблема с доступом?")
+                     logger.error(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: Error during client.iter_messages loop: {e_iter}", exc_info=True)
+                # ------------------------------------------------------------
 
-            except Exception as e_channel:
-                logger.error(f"--- Критическая ошибка при обработке канала {channel_id_input}: {e_channel} ---", exc_info=True)
-                # --- Конец except для обработки одного канала --- 
-
+                # --- Логирование завершения (без изменений) ---
+                logger.info(f"--- Завершена обработка канала {channel_id_input}. Собрано постов: {channel_processed_posts_count} ---")
+            except FloodWaitError as e:
+                logger.warning(f"[Шаг 2] Flood wait ({e.seconds}s) при iter_messages для {peer_identifier}. Прерываем."); await asyncio.sleep(e.seconds)
+            except Exception as e_iter:
+                logger.error(f"[Шаг 2] ОШИБКА iter_messages для {peer_identifier}: {e_iter}", exc_info=True)
             logger.info(f"--- Завершена обработка канала {channel_id_input}. Собрано постов: {channel_processed_posts_count} ---")
-
-    except Exception as main_err: # Добавляем except для внешней try/except
+    except Exception as main_err:
         logger.error(f"Критическая ошибка в _process_channels_for_trending перед циклом обработки каналов: {main_err}", exc_info=True)
-        # В случае ошибки на этом этапе, возвращаем пустой список
         return []
-
-    # Гарантированный возврат списка в конце функции
     logger.info(f"=== Завершена обработка ВСЕХ каналов для этого вызова, собрано итого: {len(processed_posts_for_these_channels)} постов ===")
     return processed_posts_for_these_channels
 
 
-async def get_album_messages(client, chat, main_message):
+async def get_album_messages(wrapper: TelegramClientWrapper, chat, main_message): # <<< Принимаем wrapper
     """Получает все сообщения альбома."""
     if not hasattr(main_message, 'grouped_id') or not main_message.grouped_id:
         return [main_message]  # Это не альбом
-        
+
     album_id = main_message.grouped_id
     main_id = main_message.id
-    
+
     # Получаем ID сообщений выше (предположительно более новые части альбома)
     # и ниже (предположительно более старые части)
     album_messages = [main_message]
-    
+
     # Ищем в обоих направлениях от основного сообщения
     # Максимальное количество медиа в альбоме Telegram - 10
     for offset_id in [main_id + 1, main_id - 1]:  # Ищем в обе стороны
         direction = 1 if offset_id > main_id else -1
         for i in range(9):  # Максимум 9 дополнительных сообщений (10 всего в альбоме)
             try:
-                msg = await client.get_messages(chat, ids=offset_id + (i * direction))
-                if msg and hasattr(msg, 'grouped_id') and msg.grouped_id == album_id:
+                # --- Используем wrapper для get_messages --- 
+                # msg = await client.get_messages(chat, ids=offset_id + (i * direction))
+                msg = await wrapper.make_high_level_request(wrapper.client.get_messages, chat, ids=offset_id + (i * direction))
+                # ---------------------------------------------------------
+                # Check if msg is a Message object before accessing grouped_id
+                if msg and isinstance(msg, types.Message) and hasattr(msg, 'grouped_id') and msg.grouped_id == album_id:
                     album_messages.append(msg)
                 else:
                     # Если сообщение не часть альбома, прекращаем поиск в этом направлении
                     break
             except Exception as e:
+                # Лог ошибки остается прежним
                 logger.error(f"Ошибка при получении сообщения {offset_id + (i * direction)}: {e}")
                 break
-    
+
     logger.info(f"Найдено {len(album_messages)} сообщений в альбоме {album_id}")
     return album_messages
 
 # --- Основная функция get_trending_posts ---
 async def get_trending_posts(
-    client: TelegramClient, # Основной клиент (для случая без ротации)
-    account_id_main: str,   # ID основного клиента
-    # ---> Добавляем параметр для пула <---
-    telegram_pool: TelegramClientPool, 
-    channel_ids: Sequence[Union[int, str]], 
+    telegram_pool: TelegramClientPool,
+    channel_ids: Sequence[Union[int, str]],
     days_back: int = 7,
     posts_per_channel: int = 10,
     min_views: Optional[int] = None,
@@ -1028,114 +1112,174 @@ async def get_trending_posts(
             try:
                 from user_manager import get_active_accounts # Импорт внутри try
                 active_accounts = await get_active_accounts(api_key, "telegram")
-                if not active_accounts:
-                     logger.warning(f"Не найдено активных Telegram аккаунтов для ключа {api_key}. Будет использован основной клиент.")
-                elif len(active_accounts) == 1:
-                     logger.info(f"Найден 1 активный Telegram аккаунт для ключа {api_key}. Ротация не требуется.")
-                     # Используем основной клиент, переданный в функцию
-                     active_accounts = [] # Сбрасываем, чтобы использовать стандартный путь ниже
-                else:
-                     logger.info(f"Найдено {len(active_accounts)} активных Telegram аккаунтов. Распределение нагрузки...")
+                # Логируем результат получения аккаунтов ДО проверки их количества
+                logger.info(f"Найдено {len(active_accounts)} активных Telegram аккаунтов для ключа {api_key}.")
 
             except ImportError:
                  logger.error("Не удалось импортировать get_active_accounts из user_manager. Ротация аккаунтов невозможна.")
-                 active_accounts = [] # Используем стандартный путь
+                 active_accounts = []
             except Exception as e_acc:
                 logger.error(f"Ошибка при получении активных аккаунтов: {e_acc}", exc_info=True)
-                active_accounts = [] # Используем стандартный путь
+                active_accounts = []
 
-        # Если есть несколько активных аккаунтов для ротации
-        if active_accounts: # Если есть несколько активных аккаунтов для ротации
+        # --- НАЧАЛО ОБРАБОТКИ 0, 1 или >1 аккаунтов ---
+        if not active_accounts:
+            logger.warning("Не найдено активных аккаунтов для обработки каналов. Возвращаем пустой результат.")
+            # all_posts останется пустым
+        elif len(active_accounts) == 1:
+            logger.info("Найден 1 активный аккаунт. Обработка без ротации...")
+            account_info = active_accounts[0]
+            account_id_single = account_info.get('id')
+            if not account_id_single:
+                 logger.error("Не удалось получить ID единственного активного аккаунта.")
+            else:
+                 client_single = telegram_pool.get_client(account_id_single)
+                 if not client_single or not isinstance(client_single, TelegramClient):
+                      logger.error(f"Клиент не найден/некорректен для единственного аккаунта {account_id_single}. Попытка создания...")
+                      # --- ДОБАВЛЕНО: Попытка создать клиент, если его нет --- 
+                      try:
+                           client_single = await telegram_pool.create_client(account_info)
+                           if client_single:
+                                telegram_pool.add_client(account_id_single, client_single)
+                                logger.info(f"Клиент для аккаунта {account_id_single} успешно создан и добавлен в пул.")
+                           else:
+                                logger.error(f"Не удалось создать клиент для аккаунта {account_id_single} при обработке одного аккаунта.")
+                      except Exception as create_err:
+                           logger.error(f"Ошибка при попытке создать клиент для {account_id_single}: {create_err}")
+                           client_single = None # Убедимся, что клиент None если создание не удалось
+                      # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+                 
+                 # --- Проверяем client_single еще раз после возможного создания --- 
+                 if not client_single:
+                      logger.error(f"Пропускаем обработку, так как клиент для {account_id_single} не доступен.")
+                 else:
+                     # --- Проверка подключения/авторизации для одного аккаунта ---
+                     is_ready_single = False
+                     try:
+                         if not client_single.is_connected():
+                             logger.info(f"[Single Acc] Клиент {account_id_single} не подключен. Попытка подключения...")
+                             await client_single.connect()
+                             if not client_single.is_connected(): logger.error(f"[Single Acc] Не удалось подключить клиент {account_id_single}.")
+                         if client_single.is_connected() and not await client_single.is_user_authorized():
+                             logger.warning(f"[Single Acc] Клиент {account_id_single} НЕ авторизован.")
+
+                         # Проверяем, готов ли клиент
+                         if client_single.is_connected() and await client_single.is_user_authorized():
+                             is_ready_single = True
+                             logger.info(f"[Single Acc] Клиент {account_id_single} готов к работе.")
+                         else:
+                             logger.error(f"[Single Acc] Клиент {account_id_single} не готов к работе после проверки.")
+
+                     except (FloodWaitError, AuthKeyError, ConnectionError, Exception) as e_check:
+                         logger.error(f"[Single Acc] Ошибка при проверке/подключении клиента {account_id_single}: {e_check}.")
+                     # --- Конец проверки ---
+
+                     # Если клиент готов, вызываем обработку
+                     if is_ready_single:
+                         logger.info(f"[Single Acc] Вызов _process_channels_for_trending для {len(flat_channel_ids_str)} каналов...")
+                         # Вызываем напрямую, без task
+                         processed_posts = await _process_channels_for_trending(
+                             client_single,
+                             account_id_single,
+                             flat_channel_ids_str, # Все каналы идут одному аккаунту
+                             cutoff_date.replace(tzinfo=None),
+                             posts_per_channel,
+                             min_views, min_reactions, min_comments, min_forwards,
+                             background_tasks_to_run, # Передаем список для задач
+                             api_key
+                         )
+                         all_posts.extend(processed_posts)
+                         logger.info(f"[Single Acc] Обработка завершена. Найдено постов: {len(processed_posts)}")
+        elif len(active_accounts) > 1: # Ротация для >1 аккаунта (старый блок if)
             # Проверяем, передан ли пул
             if not telegram_pool:
-                logger.error("Экземпляр telegram_pool не был передан в get_trending_posts. Ротация невозможна.")
-                active_accounts = [] # Отключаем ротацию
+                logger.error("Экземпляр telegram_pool не был передан в get_trending_posts, но найдено >1 активных аккаунтов. Ротация невозможна.")
+            else:
+                num_accounts = len(active_accounts)
+                channels_per_account = (len(flat_channel_ids_str) + num_accounts - 1) // num_accounts # Округление вверх
+                tasks = []
+                start_index = 0
+                logger.info(f"Распределяем {len(flat_channel_ids_str)} каналов по {num_accounts} аккаунтам (примерно по {channels_per_account})")
 
-        # Повторная проверка, так как пул мог не быть передан
-        if active_accounts and telegram_pool: 
-            num_accounts = len(active_accounts)
-            channels_per_account = (len(flat_channel_ids_str) + num_accounts - 1) // num_accounts # Округление вверх
-            tasks = []
-            start_index = 0
-            logger.info(f"Распределяем {len(flat_channel_ids_str)} каналов по {num_accounts} аккаунтам (примерно по {channels_per_account})")
+                for i, account_info in enumerate(active_accounts):
+                     account_id_rot = None
+                     if isinstance(account_info, dict):
+                         account_id_rot = account_info.get('id')
+                     else:
+                         logger.warning(f"Неожиданный формат данных для аккаунта на позиции {i}. Пропуск.")
+                         continue
 
-            for i, account_info in enumerate(active_accounts):
-                 account_id_rot = None
-                 # --- Получаем ID аккаунта --- 
-                 if isinstance(account_info, dict):
-                     account_id_rot = account_info.get('id')
-                 else:
-                     logger.warning(f"Неожиданный формат данных для аккаунта на позиции {i}. Пропуск.")
-                     continue
+                     if not account_id_rot:
+                         logger.warning(f"Не удалось получить ID для аккаунта на позиции {i}. Пропуск.")
+                         continue
 
-                 if not account_id_rot:
-                     logger.warning(f"Не удалось получить ID для аккаунта на позиции {i}. Пропуск.")
-                     continue
-                 
-                 # --- Используем ПЕРЕДАННЫЙ telegram_pool --- 
-                 account_client = telegram_pool.get_client(account_id_rot)
+                     account_client = telegram_pool.get_client(account_id_rot)
 
-                 # --- Используем account_id_rot для логирования --- 
-                 if not account_client or not isinstance(account_client, TelegramClient):
-                     logger.warning(f"Клиент Telegram не найден/некорректен для аккаунта ID: {account_id_rot} в переданном пуле. Пропуск.")
-                     continue
+                     if not account_client or not isinstance(account_client, TelegramClient):
+                         logger.warning(f"Клиент Telegram не найден/некорректен для аккаунта ID: {account_id_rot} в переданном пуле. Пропуск.")
+                         continue
 
-                 # Определяем каналы для этого аккаунта
-                 end_index = min(start_index + channels_per_account, len(flat_channel_ids_str))
-                 channels_for_this_account = flat_channel_ids_str[start_index:end_index]
-                 start_index = end_index
+                     # --- Проверка подключения/авторизации перед созданием задачи ---
+                     is_ready_rot = False
+                     try:
+                         if not account_client.is_connected():
+                             logger.info(f"[Rotation] Клиент {account_id_rot} не подключен. Попытка подключения...")
+                             await account_client.connect()
+                             if not account_client.is_connected(): logger.error(f"[Rotation] Не удалось подключить клиент {account_id_rot}. Пропуск."); continue
+                             logger.info(f"[Rotation] Клиент {account_id_rot} успешно подключен.")
+                         if not await account_client.is_user_authorized():
+                             logger.warning(f"[Rotation] Клиент {account_id_rot} НЕ авторизован. Пропуск.")
+                             continue
+                         logger.info(f"[Rotation] Клиент {account_id_rot} готов к работе.")
+                         is_ready_rot = True
+                     except (FloodWaitError, AuthKeyError, ConnectionError, Exception) as e_check:
+                         logger.error(f"[Rotation] Ошибка при проверке/подключении клиента {account_id_rot}: {e_check}. Пропуск.")
+                         continue
+                     # --- КОНЕЦ ПРОВЕРКИ ---
 
-                 if not channels_for_this_account: continue # Пропускаем, если каналов не осталось
+                     if not is_ready_rot: continue # Пропускаем, если клиент не готов
 
-                 # --- Используем account_id_rot для логирования --- 
-                 logger.info(f"Аккаунт ID: {account_id_rot} будет обрабатывать {len(channels_for_this_account)} каналов: {channels_for_this_account[:3]}...")
+                     # Определяем каналы для этого аккаунта
+                     end_index = min(start_index + channels_per_account, len(flat_channel_ids_str))
+                     channels_for_this_account = flat_channel_ids_str[start_index:end_index]
+                     start_index = end_index
 
-                 # Создаем задачу для аккаунта
-                 task = asyncio.create_task(
-                    _process_channels_for_trending(
-                        account_client, # Корректный клиент
-                        account_id_rot, # Корректный ID
-                        channels_for_this_account,
-                        cutoff_date.replace(tzinfo=None),
-                        posts_per_channel,
-                        min_views, min_reactions, min_comments, min_forwards,
-                        background_tasks_to_run
-                    )
-                 )
-                 tasks.append(task)
+                     if not channels_for_this_account: continue # Пропускаем, если каналов не осталось
 
-            # Ждем завершения всех задач обработки каналов
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for i, result in enumerate(results):
-                    # --- Используем ID аккаунта для логирования ошибок --- 
-                    acc_id_log = f"index_{i}" # ID по умолчанию
-                    if i < len(active_accounts):
-                         info = active_accounts[i]
-                         if isinstance(info, dict): acc_id_log = info.get('id', acc_id_log)
-                    # -----------------------------------------------------
+                     logger.info(f"Аккаунт ID: {account_id_rot} будет обрабатывать {len(channels_for_this_account)} каналов: {channels_for_this_account[:3]}...")
 
-                    if isinstance(result, Exception):
-                        logger.error(f"Ошибка при обработке каналов аккаунтом ID: {acc_id_log}: {result}", exc_info=result)
-                    elif isinstance(result, list):
-                        logger.info(f"Аккаунт ID: {acc_id_log} успешно обработал каналы, найдено постов: {len(result)}")
-                        all_posts.extend(result)
-                    else:
-                         logger.warning(f"Неожиданный результат от аккаунта ID: {acc_id_log}: {type(result)}")
+                     # Создаем задачу для аккаунта
+                     task = asyncio.create_task(
+                        _process_channels_for_trending(
+                            account_client,
+                            account_id_rot,
+                            channels_for_this_account,
+                            cutoff_date.replace(tzinfo=None),
+                            posts_per_channel,
+                            min_views, min_reactions, min_comments, min_forwards,
+                            background_tasks_to_run,
+                            api_key
+                        )
+                     )
+                     tasks.append(task)
 
-        else:
-            # Если ротация не используется (или невозможна)
-            logger.info(f"Ротация не используется или невозможна. Обработка всех каналов основным клиентом {account_id_main}.")
-            processed_posts = await _process_channels_for_trending(
-                client, # Используем основной клиент
-                account_id_main, # ID основного клиента
-                flat_channel_ids_str,
-                cutoff_date.replace(tzinfo=None),
-                posts_per_channel,
-                min_views, min_reactions, min_comments, min_forwards,
-                background_tasks_to_run
-            )
-            all_posts.extend(processed_posts)
+                # Ждем завершения всех задач обработки каналов
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for i, result in enumerate(results):
+                        acc_id_log = f"index_{i}"
+                        if i < len(active_accounts):
+                             info = active_accounts[i]
+                             if isinstance(info, dict): acc_id_log = info.get('id', acc_id_log)
+
+                        if isinstance(result, Exception):
+                            logger.error(f"Ошибка при обработке каналов аккаунтом ID: {acc_id_log}: {result}", exc_info=result)
+                        elif isinstance(result, list):
+                            logger.info(f"Аккаунт ID: {acc_id_log} успешно обработал каналы, найдено постов: {len(result)}")
+                            all_posts.extend(result)
+                        else:
+                             logger.warning(f"Неожиданный результат от аккаунта ID: {acc_id_log}: {type(result)}")
+        # --- КОНЕЦ ОБРАБОТКИ 0, 1 или >1 аккаунтов ---
 
         # Запускаем все собранные фоновые задачи на обработку медиа
         if background_tasks_to_run:
@@ -1146,14 +1290,12 @@ async def get_trending_posts(
                   file_id = task_data.get("file_id")
                   # Проверяем, что передали account_id
                   if file_id and task_data.get("account_id") and file_id not in launched_file_ids:
-                       # Запускаем задачу (она пока ожидает client, а не account_id - исправим следующим шагом)
                        asyncio.create_task(process_single_media_background(**task_data))
                        launched_file_ids.add(file_id)
                        tasks_launched_count += 1
                   elif file_id and not task_data.get("account_id"):
                        logger.warning(f"Пропуск фоновой задачи для file_id {file_id} - отсутствует account_id.")
-                  else:
-                       logger.warning(f"Пропуск фоновой задачи без file_id: {task_data}")
+                  # Убрали лишний else, который логировал пропуск без file_id
 
              logger.info(f"Успешно запущено {tasks_launched_count} уникальных фоновых задач.")
         else:
@@ -1428,240 +1570,252 @@ async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str
     return sorted(posts, key=lambda x: x["views"], reverse=True)[:count]
 
 async def get_posts_by_period(
-    client: TelegramClient,
+    telegram_pool: TelegramClientPool, # <<< ДОБАВЛЕНО
     group_ids: List[Union[int, str]],
-    # Убеждаемся, что параметр называется limit_per_channel
     limit_per_channel: int = 100,
     days_back: int = 7,
     min_views: int = 0,
     api_key: Optional[str] = None,
-    non_blocking: bool = False,
-    is_degraded: bool = False
+    non_blocking: bool = False, # Этот параметр больше не используется напрямую здесь
+    is_degraded: bool = False # Глобальный флаг деградации не используется, получаем для каждого аккаунта
     ) -> List[Dict]:
     """
-    Асинхронно получает посты из указанных каналов за заданный период.
-    Использует limit_per_channel для ограничения количества получаемых сообщений.
-    Корректно обрабатывает текст в альбомах, находя сообщение с текстом.
+    Асинхронно получает посты из указанных каналов за заданный период,
+    распределяя каналы между доступными активными аккаунтами.
     """
-    logger.info(f"Запрос постов за период {days_back} дней из {len(group_ids)} каналов. Лимит на канал: {limit_per_channel}. Деградация: {is_degraded}")
+    logger = logging.getLogger(__name__)
+    logger.info(f"Запрос постов за период {days_back} дней из {len(group_ids)} каналов. Лимит на канал: {limit_per_channel}. API Key: {'Есть' if api_key else 'Нет'}")
 
-    if not client:
-        logger.error("Клиент Telegram не был предоставлен для get_posts_by_period")
-        return []
+    # Проверки входных данных
+    if not telegram_pool: logger.error("Пул клиентов telegram_pool не передан."); return []
+    if not api_key: logger.error("API ключ не передан в get_posts_by_period."); return []
+    if not group_ids: logger.warning("Список ID групп пуст."); return []
 
-    # --- Идентификатор аккаунта для логов ---\
-    account_id_for_log = getattr(client.session, 'filename', 'UNKNOWN_ID')
-    logger.info(f"[Acc: {account_id_for_log}] Используется для запроса.")
-
-    # --- Проверка подключения и авторизации клиента ---\
+    # Получаем активные аккаунты
     try:
-        if not client.is_connected():
-            logger.warning(f"[Acc: {account_id_for_log}] Клиент не подключен. Попытка подключения...")
-            await client.connect() # Подключаем, если отключен
-        if not await client.is_user_authorized():
-            logger.error(f"[Acc: {account_id_for_log}] Клиент не авторизован. Невозможно получить посты.")
-            raise ConnectionAbortedError(f"Клиент {account_id_for_log} не авторизован")
-    except (ConnectionAbortedError, AuthKeyError, AuthKeyUnregisteredError, UserDeactivatedBanError) as e:
-        logger.error(f"[Acc: {account_id_for_log}] Критическая ошибка авторизации/сессии: {e}")
-        # При таких ошибках аккаунт, вероятно, неработоспособен, сообщаем об этом
-        raise  # Передаем ошибку выше, чтобы пул мог пометить аккаунт как проблемный
-    except Exception as e:
-        logger.error(f"[Acc: {account_id_for_log}] Ошибка при проверке/подключении клиента: {e}")
-        # При других ошибках (сетевых?) просто возвращаем пустой список
+        active_accounts = await telegram_pool.get_active_clients(api_key)
+        if not active_accounts:
+             logger.warning(f"Не найдено активных Telegram аккаунтов для ключа {api_key}."); return []
+        num_accounts = len(active_accounts)
+        logger.info(f"Найдено {num_accounts} активных аккаунтов. Распределение {len(group_ids)} групп...")
+    except Exception as e_acc:
+        logger.error(f"Ошибка при получении активных аккаунтов: {e_acc}", exc_info=True)
         return []
-    # -----------------------------------------------\
-
+    
+    # Вычисляем дату отсечки один раз
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
-    logger.info(f"[Acc: {account_id_for_log}] Вычислена дата отсечки: {cutoff_date.isoformat()}")
+    cutoff_date_naive = cutoff_date.replace(tzinfo=None) # Для передачи в задачу
+    logger.info(f"Вычислена дата отсечки: {cutoff_date.isoformat()} (naive: {cutoff_date_naive.isoformat()})")
 
-    # --- Проверка и задержка для degraded_mode ---\
-    if is_degraded:
-        logger.info(f"[Acc: {account_id_for_log}] Клиент в режиме деградации. Добавляем задержку {TELEGRAM_DEGRADED_MODE_DELAY} сек.")
-        await asyncio.sleep(TELEGRAM_DEGRADED_MODE_DELAY)
-    # ---------------------------------------------\
-
-    semaphore = asyncio.Semaphore(5) # Ограничиваем до 5 одновременных обработок каналов
     tasks = []
+    groups_distributed = 0
 
-    async def process_single_channel(group_id):
-        logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Запуск process_single_channel.")
-        async with semaphore:
-            channel_posts = []
-            channel_entity = None
-            processed_grouped_ids = set() # Множество для отслеживания ID обработанных альбомов
-            try:
-                # --- Лог перед get_entity ---\
-                logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Попытка получить entity...")
-                # Универсальный поиск entity (username, link, ID)
-                entity_id_to_find = None
-                if isinstance(group_id, str) and group_id.startswith('@'):
-                    entity_id_to_find = group_id
-                elif isinstance(group_id, str) and ('t.me/' in group_id or 'telegram.me/' in group_id):
-                    entity_id_to_find = group_id
-                elif isinstance(group_id, (int, str)):
-                    try:
-                        numeric_id = int(group_id)
-                        # Используем формат -100<ID> для числовых ID публичных каналов
-                        if numeric_id > 0: # Если ID положительный, предполагаем, что это ID без префикса
-                            entity_id_to_find = int(f"-100{numeric_id}")
-                        else: # Если ID уже отрицательный, используем как есть
-                            entity_id_to_find = numeric_id
-                    except ValueError:
-                        logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Некорректный числовой ID. Пропуск.")
-                        return [] # Возвращаем пустой список
-                else:
-                     logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Неподдерживаемый тип идентификатора. Пропуск.")
-                     return []
+    # --- Распределение ID групп и запуск задач --- 
+    for i, account_info in enumerate(active_accounts):
+        account_id_task = account_info.get('id')
+        if not account_id_task: logger.warning(f"Найден аккаунт без ID в списке активных (индекс {i}). Пропуск."); continue
+        
+        client_task = telegram_pool.get_client(account_id_task)
+        if not client_task or not isinstance(client_task, TelegramClient): logger.warning(f"Клиент не найден/некорректен для аккаунта {account_id_task}. Пропуск."); continue
 
-                if entity_id_to_find is None:
-                     logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Не удалось определить entity_id_to_find. Пропуск.")
-                     return []
+        # --- Проверка подключения/авторизации ПЕРЕД созданием задачи ---
+        is_ready = False
+        is_degraded_task = False # Инициализация
+        try:
+            if not client_task.is_connected():
+                logger.info(f"[get_posts_by_period] Клиент {account_id_task} не подключен. Попытка подключения...")
+                await client_task.connect()
+                if not client_task.is_connected(): logger.error(f"[get_posts_by_period] Не удалось подключить клиент {account_id_task}. Пропуск."); continue
+                logger.info(f"[get_posts_by_period] Клиент {account_id_task} успешно подключен.")
+            if not await client_task.is_user_authorized():
+                logger.warning(f"[get_posts_by_period] Клиент {account_id_task} НЕ авторизован. Пропуск.")
+                continue
+            # Получаем статус деградации ИЗ ПУЛА для этого аккаунта
+            is_degraded_task = telegram_pool.degraded_mode_status.get(account_id_task, False)
+            logger.info(f"[get_posts_by_period] Клиент {account_id_task} готов к работе (Деградация: {is_degraded_task}).")
+            is_ready = True
+        except (FloodWaitError, AuthKeyError, ConnectionError, Exception) as e_check:
+            logger.error(f"[get_posts_by_period] Ошибка при проверке/подключении клиента {account_id_task}: {e_check}. Пропуск.")
+            continue
+        # --- Конец проверки --- 
+        
+        if not is_ready: continue # Пропускаем, если клиент не готов
 
-                # Добавляем проверку подключения перед запросом
-                if not client.is_connected():
-                    logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Соединение потеряно перед get_entity. Попытка переподключения...")
-                    await client.connect()
+        # Распределяем ID групп (round-robin)
+        groups_for_account = group_ids[i::num_accounts] # Берем каждый N-ый ID, начиная с i
+        
+        if not groups_for_account:
+             logger.info(f"Для аккаунта {account_id_task} не осталось групп для обработки.")
+             continue
+        
+        groups_distributed += len(groups_for_account)
+        logger.info(f"Аккаунт {account_id_task} будет обрабатывать {len(groups_for_account)} групп: {groups_for_account[:3]}..." )
+        
+        # Создаем задачу, передавая нужные группы и параметры
+        tasks.append(asyncio.create_task(
+            _process_groups_for_period_task(
+                client=client_task, 
+                account_id=account_id_task, 
+                api_key=api_key,
+                group_ids_for_account=groups_for_account, 
+                limit_per_channel=limit_per_channel,
+                cutoff_date=cutoff_date_naive, # Передаем naive дату
+                min_views=min_views,
+                is_degraded=is_degraded_task # Передаем статус деградации из пула
+            )
+        ))
 
-                channel_entity = await client.get_entity(entity_id_to_find)
-                channel_title = getattr(channel_entity, 'title', 'Unknown Title')
-                logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Успешно получена entity: '{channel_title}' (ID: {channel_entity.id})")
+    logger.info(f"Всего распределено групп: {groups_distributed}. Запускаем {len(tasks)} задач обработки...")
 
-                message_count_in_loop = 0 # Счетчик
-
-                # --- Используем limit_per_channel, итерация от новых к старым --- \
-                logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Запуск client.iter_messages с entity={group_id}, limit={limit_per_channel}")
-                async for message in client.iter_messages(group_id, limit=limit_per_channel):
-                    message_count_in_loop += 1
-                    # --- Детальный лог КАЖДОГО сообщения из итератора ---\
-                    msg_date_str = message.date.isoformat() if message.date else "No Date"
-                    logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Итератор -> msg ID={message.id}, Date={msg_date_str}, Views={message.views}, GroupID={message.grouped_id}")
-
-                    # --- ФИЛЬТР ДАТЫ --- \
-                    if not message.date or message.date <= cutoff_date:
-                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение {message.id} ({msg_date_str}) слишком старое. Пропускаем.")
-                        continue # Переходим к следующему сообщению
-                    # ---------------------\
-
-                    is_album = message.grouped_id is not None
-
-                    # --- ПРОВЕРКА НА ДУБЛИКАТ АЛЬБОМА --- 
-                    if is_album and message.grouped_id in processed_grouped_ids:
-                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} часть уже обработанного альбома ({message.grouped_id}). Пропуск.")
-                        continue
-                    # -------------------------------------- 
-
-                    # --- ФИЛЬТР ПРОСМОТРОВ --- \
-                    if message.views is not None and message.views >= min_views:
-                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} ПРОШЛО фильтр просмотров.")
-
-                        # Убираем префикс -100 из ID канала для выходных данных\
-                        channel_id_str = str(channel_entity.id).replace('-100', '')
-
-                        post_text = ""
-                        # --- ОБРАБОТКА ТЕКСТА АЛЬБОМА --- 
-                        if is_album:
-                            processed_grouped_ids.add(message.grouped_id) # Помечаем альбом как обработанный СРАЗУ
-                            logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Обнаружен необработанный альбом {message.grouped_id} (сообщение {message.id}). Получаем все сообщения альбома...")
-                            try:
-                                # Передаем channel_entity, а не group_id строкой
-                                album_messages = await get_album_messages(client, channel_entity, message)
-                                if album_messages:
-                                    # Ищем текст в сообщениях альбома (предпочтительно в первом)
-                                    album_messages.sort(key=lambda m: m.id) # Сортируем по ID (старые -> новые)
-                                    for album_msg in album_messages:
-                                        if album_msg.text:
-                                            post_text = album_msg.text
-                                            logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Найден текст для альбома {message.grouped_id} в сообщении {album_msg.id}.")
-                                            break # Нашли текст, выходим
-                                    if not post_text:
-                                         logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Не удалось найти текст ни в одном из {len(album_messages)} сообщений альбома {message.grouped_id}.")
-                                else:
-                                    logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] get_album_messages вернул пустой список для альбома {message.grouped_id}.")
-                            except Exception as album_err:
-                                logger.error(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Ошибка при вызове get_album_messages для {message.grouped_id}: {album_err}")
-                                post_text = message.text or "" # Запасной вариант - текст текущего сообщения
-                        else:
-                            # Обычный пост (не альбом)
-                            post_text = message.text or ""
-                        # ----------------------------------
-
-                        post_data = {
-                            "id": message.id, # Используем ID текущего сообщения (или первого из альбома, если нужно)
-                            "channel_id": channel_id_str,
-                            "channel_title": channel_title,
-                            "channel_username": getattr(channel_entity, 'username', None),
-                            "text": post_text, # <<<--- Используем найденный текст
-                            "views": message.views,
-                            "reactions": sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0,
-                            "comments": message.replies.replies if message.replies else 0,
-                            "forwards": message.forwards or 0,
-                            "date": message.date.isoformat(), # Дата в ISO формате\
-                            "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{message.id}",
-                            "media": [] # Медиа не нужны по условию
-                        }
-
-                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Добавляем пост ID={message.id} (Альбом: {is_album}). Текущее кол-во: {len(channel_posts)+1}")
-                        channel_posts.append(post_data)
-                    else:
-                         # Логируем причину, почему не прошло (только по просмотрам)\
-                         reason = []
-                         if message.views is None: reason.append("нет просмотров")
-                         elif message.views < min_views: reason.append(f"просмотры ({message.views}) < минимума ({min_views})")
-                         logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} НЕ прошло фильтр просмотров. Причины: {', '.join(reason)}")
-                    # --- КОНЕЦ ФИЛЬТРОВ --- \
-
-                # --- Лог после завершения цикла iter_messages --- \
-                logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Завершен цикл iter_messages. Обработано: {message_count_in_loop}. Найдено подходящих: {len(channel_posts)}")
-
-            except FloodWaitError as e:
-                 logger.error(f"[Acc: {account_id_for_log}] [Chan: {group_id}] FloodWaitError при обработке: {e.seconds} сек. Пропуск канала.")
-                 channel_posts = [] # Очищаем, если была ошибка
-            except (ChannelPrivateError, ChatForbiddenError, UsernameNotOccupiedError, ValueError) as e:
-                 # ValueError может быть от get_entity, если ID некорректен или не найден\
-                 logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Канал недоступен или не найден: {e}. Пропуск.")
-            except SessionPasswordNeededError as e:
-                logger.error(f"[Acc: {account_id_for_log}] Аккаунт требует пароль 2FA! {e}")
-                # Передаем ошибку выше, чтобы обработать в /api/telegram/accounts/{account_id}/auth\
-                raise
-            except AuthKeyError as e: # Обработка AuthKeyError
-                 logger.error(f"[{account_id_for_log}] [Chan: {group_id}] Ошибка ключа авторизации: {e}")
-                 raise # Передаем критическую ошибку выше
-            except UserDeactivatedBanError as e: # Обработка UserDeactivatedBanError
-                 logger.error(f"[{account_id_for_log}] [Chan: {group_id}] Пользователь забанен/деактивирован: {e}")
-                 raise # Передаем критическую ошибку выше
-            except Exception as e:
-                logger.error(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Непредвиденная Ошибка при обработке канала: {e.__class__.__name__}: {e}")
-                logger.error(traceback.format_exc())
-                channel_posts = [] # Очищаем, если была ошибка
-            finally:
-                # --- Убираем сортировку и срез, так как лимит применен в iter_messages --- \
-                logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Завершение process_single_channel. Возвращаем {len(channel_posts)} постов.")
-                return channel_posts
-
-    # Запускаем обработку каналов\
-    tasks = [process_single_channel(gid) for gid in group_ids]
-    try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    except (ConnectionAbortedError, AuthKeyError, AuthKeyUnregisteredError, UserDeactivatedBanError, SessionPasswordNeededError) as critical_e:
-        logger.error(f"[Acc: {account_id_for_log}] Критическая ошибка во время gather: {critical_e}. Прерываем выполнение.")
-        # Если возникла критическая ошибка аккаунта, нет смысла продолжать\
-        raise critical_e # Передаем выше\
-
-    # Собираем все посты из результатов\
+    # Собираем результаты
     final_posts = []
-    for result in results:
-        if isinstance(result, list):
-            final_posts.extend(result) # Используем extend для добавления списка постов\
-        elif isinstance(result, Exception):
-            # Логируем некритические ошибки из gather (уже залогированы внутри process_single_channel)\
-            logger.warning(f"[Acc: {account_id_for_log}] Зафиксирована ошибка при обработке одного из каналов: {result}")
-        else:
-            logger.warning(f"[Acc: {account_id_for_log}] Неожиданный тип результата от process_single_channel: {type(result)}")
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            # Получаем ID для лога, даже если результат - ошибка
+            acc_id_log = "unknown_id"
+            # Проверяем границы перед доступом к active_accounts[i]
+            if i < len(active_accounts):
+                account_info = active_accounts[i]
+                if isinstance(account_info, dict):
+                    acc_id_log = account_info.get('id', f"index_{i}")
+            else:
+                acc_id_log = f"task_index_{i}" # Если индекс выходит за пределы
 
-    # --- Финальная сортировка всех постов по дате ---\
-    final_posts.sort(key=lambda p: p.get('date', datetime.min.replace(tzinfo=timezone.utc).isoformat()), reverse=True)
-    # ----------------------------------------------\
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка при обработке групп аккаунтом {acc_id_log}: {result}", exc_info=result)
+            elif isinstance(result, list):
+                logger.info(f"Аккаунт {acc_id_log} успешно обработал группы, найдено постов: {len(result)}")
+                final_posts.extend(result)
+            else:
+                logger.warning(f"Неожиданный результат обработки групп от аккаунта {acc_id_log}: {type(result)}")
 
-    logger.info(f"[Acc: {account_id_for_log}] Завершено получение постов за период. Всего найдено: {len(final_posts)}")
+    # --- Финальная сортировка всех постов по дате --- 
+    final_posts.sort(key=lambda p: p.get('date', datetime.min.isoformat()), reverse=True)
+    # ----------------------------------------------
+
+    logger.info(f"Завершено получение постов за период. Всего найдено: {len(final_posts)}")
     return final_posts
+
+# --- НОВАЯ Вспомогательная функция для параллельной обработки --- 
+async def _process_groups_for_period_task(
+    client: TelegramClient,
+    account_id: str,
+    api_key: Optional[str],
+    group_ids_for_account: List[Union[int, str]],
+    limit_per_channel: int,
+    cutoff_date: datetime,
+    min_views: int,
+    is_degraded: bool
+) -> List[Dict]:
+    """Обрабатывает список ID групп, назначенных одному аккаунту."""
+    logger = logging.getLogger(__name__)
+    all_posts_for_account = []
+    
+    # Создаем wrapper внутри задачи для этого аккаунта
+    wrapper = TelegramClientWrapper(client, account_id, api_key)
+    wrapper.set_degraded_mode(is_degraded)
+    logger.info(f"[Task Acc: {account_id}] Запуск задачи для обработки {len(group_ids_for_account)} групп.")
+
+    # --- Цикл по группам, назначенным этому аккаунту ---
+    for group_id in group_ids_for_account:
+        logger.info(f"[Task Acc: {account_id}] [Chan: {group_id}] Начало обработки группы.")
+        channel_posts = []
+        channel_entity = None
+        processed_grouped_ids = set() # Отслеживаем обработанные альбомы для ЭТОЙ группы
+        try:
+            # --- Получение Entity (аналогично старой process_single_channel) ---
+            entity_id_to_find = None
+            if isinstance(group_id, str) and group_id.startswith('@'): entity_id_to_find = group_id
+            elif isinstance(group_id, str) and ('t.me/' in group_id or 'telegram.me/' in group_id): entity_id_to_find = group_id
+            elif isinstance(group_id, (int, str)):
+                try:
+                    numeric_id = int(group_id)
+                    entity_id_to_find = int(f"-100{numeric_id}") if numeric_id > 0 else numeric_id
+                except ValueError: logger.warning(f"[Task Acc: {account_id}] [Chan: {group_id}] Некорректный ID. Пропуск группы."); continue
+            else: logger.warning(f"[Task Acc: {account_id}] [Chan: {group_id}] Неподдерживаемый тип ID. Пропуск группы."); continue
+            
+            if entity_id_to_find is None: logger.warning(f"[Task Acc: {account_id}] [Chan: {group_id}] Не удалось определить entity_id_to_find. Пропуск группы."); continue
+
+            channel_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, entity_id_to_find)
+            if not channel_entity: logger.warning(f"[Task Acc: {account_id}] [Chan: {group_id}] get_entity вернул None. Пропуск группы."); continue
+            channel_title = getattr(channel_entity, 'title', 'Unknown Title')
+            logger.info(f"[Task Acc: {account_id}] [Chan: {group_id}] Успешно получена entity: '{channel_title}' (ID: {channel_entity.id})")
+            # -------------------------------------------------------
+
+            # --- Обновление статистики перед iter_messages --- 
+            if api_key: # Обновляем статистику один раз на группу
+                try:
+                    from redis_utils import update_account_usage_redis; await update_account_usage_redis(api_key, account_id, "telegram")
+                    logger.info(f"[Task Acc: {account_id}] [Chan: {group_id}] Статистика обновлена (Redis) перед iter_messages.")
+                except ImportError: 
+                    from user_manager import update_account_usage; await update_account_usage(api_key, account_id, "telegram")
+                    logger.info(f"[Task Acc: {account_id}] [Chan: {group_id}] Статистика обновлена (user_manager) перед iter_messages.")
+                except Exception as stats_err: logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка обновления статистики: {stats_err}")
+            # -------------------------------------------------
+            
+            message_count_in_loop = 0
+            # Используем channel_entity вместо group_id в iter_messages для большей надежности
+            async for message in client.iter_messages(channel_entity, limit=limit_per_channel): 
+                message_count_in_loop += 1
+                # --- Логика обработки message (из старой process_single_channel) ---
+                if not message or not message.date: continue # Добавим проверку на None
+                
+                msg_date_naive = message.date.replace(tzinfo=None)
+                if msg_date_naive <= cutoff_date: # Сравниваем с cutoff_date без tzinfo
+                    logger.debug(f"[Task Acc: {account_id}] [Chan: {group_id}] Сообщение {message.id} ({msg_date_naive}) слишком старое ({cutoff_date}). Прерываем.")
+                    break # Прерываем, так как сообщения идут от новых к старым
+                
+                is_album = message.grouped_id is not None
+                if is_album and message.grouped_id in processed_grouped_ids: continue
+                
+                views = getattr(message, 'views', 0) # Безопасно получаем просмотры
+                if views is not None and views >= min_views:
+                    post_text = ""
+                    if is_album:
+                        processed_grouped_ids.add(message.grouped_id)
+                        try:
+                            # Передаем wrapper в get_album_messages
+                            album_messages = await get_album_messages(wrapper, channel_entity, message)
+                            if album_messages:
+                                album_messages.sort(key=lambda m: m.id)
+                                for album_msg in album_messages:
+                                    if album_msg.text: post_text = album_msg.text; break
+                        except Exception as album_err: logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка get_album_messages: {album_err}")
+                        if not post_text: post_text = message.text or ""
+                    else:
+                        post_text = message.text or ""
+
+                    channel_id_str = str(channel_entity.id).replace('-100', '')
+                    post_data = {
+                        "id": message.id,
+                        "channel_id": channel_id_str,
+                        "channel_title": channel_title,
+                        "channel_username": getattr(channel_entity, 'username', None),
+                        "text": post_text,
+                        "views": message.views,
+                        "reactions": sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0,
+                        "comments": message.replies.replies if message.replies else 0,
+                        "forwards": message.forwards or 0,
+                        "date": message.date.isoformat(),
+                        "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{message.id}",
+                        "media": [] # Медиа здесь не обрабатываем
+                    }
+                    channel_posts.append(post_data)
+                # --- Конец логики обработки message ---
+                
+            logger.info(f"[Task Acc: {account_id}] [Chan: {group_id}] Завершен цикл iter_messages. Найдено: {len(channel_posts)}")
+
+        except FloodWaitError as e: logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] FloodWaitError: {e.seconds} сек. Пропуск группы."); channel_posts = []
+        except (ChannelInvalidError, ChannelPrivateError, ChatForbiddenError, UsernameNotOccupiedError, UsernameInvalidError) as e_perm: logger.warning(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка доступа/не найдено: {e_perm}. Пропуск группы."); channel_posts = []
+        except Exception as e:
+            logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Непредвиденная Ошибка: {e.__class__.__name__}: {e}", exc_info=True)
+            channel_posts = []
+        finally:
+            all_posts_for_account.extend(channel_posts)
+            logger.info(f"[Task Acc: {account_id}] [Chan: {group_id}] Завершение обработки группы. Добавлено: {len(channel_posts)}.")
+            
+    logger.info(f"[Task Acc: {account_id}] ЗАВЕРШЕНА ЗАДАЧА. Возвращаем {len(all_posts_for_account)} постов.")
+    return all_posts_for_account
+# --- Конец новой вспомогательной функции ---
 

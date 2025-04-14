@@ -161,7 +161,7 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
     redis_client = await get_redis()
     if not redis_client:
         logger.warning(f"Redis недоступен, синхронизация статистики ({platform}:{account_id}) невозможна")
-        return False
+        return False # <<< Redis недоступен
 
     # conn = None # Больше не нужно инициализировать соединение здесь
     pool = None # Будем использовать пул
@@ -204,7 +204,7 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
         pool = await get_db_connection() # Получаем пул asyncpg
         if not pool:
             logger.error(f"Не удалось получить пул PostgreSQL для синхронизации ({platform}:{account_id})")
-            return False
+            return False # <<< Пул БД недоступен
         
         async with pool.acquire() as conn: # Получаем соединение из пула
             # Используем last_used_dt (datetime или None), count (int)
@@ -227,8 +227,7 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
                 logger.debug(f"Синхронизирована статистика для аккаунта {platform}:{account_id} (Count: {count}, LastUsed: {last_used_dt})")
                 return True # Успешная синхронизация
             else:
-                # Аккаунт не найден в PostgreSQL, но статистика есть в Redis
-                # Логируем это и удаляем "осиротевшие" ключи из Redis
+                # Аккаунт не найден в PostgreSQL
                 logger.warning(f"Аккаунт {platform}:{account_id} не найден в БД для синхронизации. "
                                f"Удаляем статистику из Redis (Count: {count}, LastUsed: {last_used_str}).")
                 try:
@@ -243,22 +242,22 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
                 except Exception as del_exc: # Ловим ЛЮБУЮ другую ошибку при удалении
                      logger.error(f"Неожиданная ошибка при удалении статистики Redis для {platform}:{account_id}", exc_info=True)
                 # Возвращаем False, так как синхронизация с БД не удалась
-                return False
+                return False # <<< Аккаунт не найден в БД
 
     except aredis.RedisError as e:
          logger.error(f"Ошибка Redis при синхронизации с БД ({platform}:{account_id}): {e}")
-         return False
+         return False # <<< Ошибка Redis
     except asyncpg.PostgresError as e: # Ловим ошибки PostgreSQL
          logger.error(f"Ошибка PostgreSQL при синхронизации с БД ({platform}:{account_id}): {e}")
-         return False
+         return False # <<< Ошибка PostgreSQL
     except ConnectionError as e: # Ошибка получения пула
          logger.error(f"Ошибка соединения PostgreSQL при синхронизации ({platform}:{account_id}): {e}")
-         return False
+         return False # <<< Ошибка соединения с БД
     except Exception as e:
         logger.error(f"Ошибка синхронизации с БД ({platform}:{account_id}): {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return False
+        return False # <<< Другая ошибка
     # finally:
         # Соединение возвращается в пул автоматически
         # if conn:

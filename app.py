@@ -1031,9 +1031,6 @@ async def trending_posts(request: Request, data: dict):
             api_key = auth_header.split(' ')[1]
 
     if platform == 'telegram':
-        client = None
-        account_id = None
-
         # ---> Используем ГЛОБАЛЬНЫЙ экземпляр пула <---
         telegram_pool_instance = telegram_pool # Обращаемся к глобальной переменной
         # -------------------------------------------
@@ -1046,35 +1043,26 @@ async def trending_posts(request: Request, data: dict):
             logger.error("API ключ не предоставлен")
             raise HTTPException(status_code=401, detail="API ключ не предоставлен")
         try:
-            # Получаем *основного* КЛИЕНТА и ID АККАУНТА из пула для начала
-            client, account_id = await telegram_pool_instance.select_next_client(api_key)
-            if not client or not account_id:
-                 logger.error(f"Не удалось получить Telegram клиент или account_id для API ключа {api_key}")
-                 raise HTTPException(400, "Не удалось получить Telegram клиент")
-
-            logger.info(f"Получен основной клиент Telegram {account_id} для trending-posts. Подключение...")
-            await client.connect() # Подключаем основного клиента
-            logger.info(f"Клиент Telegram {account_id} подключен.")
-
-            # ---> Передаем ГЛОБАЛЬНЫЙ экземпляр пула в get_trending_posts <--
+            # ---> Прямой вызов get_trending_posts с пулом <---
             result = await get_trending_posts(
-                client=client,                  # Основной клиент
-                account_id_main=account_id,     # ID основного клиента
-                telegram_pool=telegram_pool_instance, # <--- ПЕРЕДАЕМ ПУЛ
+                # client и account_id_main больше не нужны
+                telegram_pool=telegram_pool_instance, # <--- Передаем ПУЛ
                 channel_ids=group_ids,
                 days_back=days_back,
                 posts_per_channel=posts_per_group,
                 min_views=min_views,
+                min_reactions=data.get('min_reactions'), # Передаем остальные параметры, если они есть
+                min_comments=data.get('min_comments'),
+                min_forwards=data.get('min_forwards'),
                 api_key=api_key
             )
             return result
 
         except Exception as e:
             logger.error(f"Ошибка в trending_posts для Telegram: {e}", exc_info=True)
+            # Включаем исходную ошибку в detail для отладки
             raise HTTPException(status_code=500, detail=f"Ошибка при получении трендовых постов: {str(e)}")
-        finally:
-            # Не отключаем клиента здесь, пускай пул управляет
-            pass
+        # finally блок больше не нужен
     elif platform == 'vk':
         # ---> Используем ГЛОБАЛЬНЫЙ экземпляр пула VK <--
         vk_pool_instance = vk_pool # Обращаемся к глобальной переменной
@@ -1244,46 +1232,29 @@ async def get_posts_by_period(request: Request, data: dict):
         raise HTTPException(status_code=401, detail="Неверный API ключ")
 
     if platform == 'telegram':
-        # --- Начало существующего кода для Telegram (не трогаем) ---
-        client = None
-        account_id = None
-        is_degraded = False # Флаг для передачи в функцию
-
+        # +++ НАЧАЛО: ДОБАВИТЬ ИСПОЛЬЗОВАНИЕ ПУЛА НАПРЯМУЮ +++
         try:
-            # Получаем клиента и его статус
-            client, account_id = await telegram_pool.select_next_client(api_key)
-            if not client or not account_id:
-                # Проверяем, есть ли вообще активные аккаунты у пользователя
-                active_accounts = await get_active_accounts(api_key, "telegram")
-                if not active_accounts:
-                    raise HTTPException(400, "Нет активных Telegram аккаунтов для выполнения запроса")
-                else:
-                    raise HTTPException(400, "Не удалось выбрать активный Telegram клиент. Возможно, все аккаунты временно недоступны.")
+            # Используем глобальный пул telegram_pool
+            if not telegram_pool or not isinstance(telegram_pool, TelegramClientPool):
+                 logger.error("Глобальный экземпляр telegram_pool не найден или имеет неверный тип.")
+                 raise HTTPException(500, "Внутренняя ошибка сервера: Пул клиентов Telegram недоступен.")
+            
+            # Проверяем API ключ (перенесено сюда для Telegram)
+            if not api_key:
+                 raise HTTPException(401, "API ключ обязателен для Telegram")
+            if not await verify_api_key(api_key):
+                 raise HTTPException(status_code=401, detail="Неверный API ключ")
+            # +++ КОНЕЦ: ДОБАВИТЬ ИСПОЛЬЗОВАНИЕ ПУЛА НАПРЯМУЮ +++
 
-            # Проверяем, находится ли клиент в режиме деградации
-            is_degraded = telegram_pool.degraded_mode_status.get(account_id, False)
-
-            # Подключаемся (если еще не подключен)
-            if not client.is_connected():
-                logger.info(f"Подключаем Telegram клиент {account_id} для posts-by-period...")
-                try:
-                    await client.connect()
-                    if not await client.is_user_authorized():
-                         logger.warning(f"Клиент Telegram {account_id} подключен, но не авторизован.")
-                         raise HTTPException(status_code=403, detail=f"Аккаунт {account_id} требует авторизации.")
-                    logger.info(f"Клиент Telegram {account_id} подключен и авторизован.")
-                except Exception as connect_error:
-                    logger.error(f"Ошибка подключения клиента Telegram {account_id}: {connect_error}")
-                    raise HTTPException(status_code=503, detail=f"Ошибка подключения к Telegram для аккаунта {account_id}")
-
-            # Вызываем get_posts_by_period
+            # Вызываем get_posts_by_period напрямую с пулом
             result = await get_posts_by_period(
-                client,
-                group_ids,
-                limit_per_channel=max_posts, # Используем limit_per_channel=max_posts
+                telegram_pool=telegram_pool, # <<< Передаем глобальный пул
+                group_ids=group_ids,
+                limit_per_channel=max_posts,
                 days_back=days_back,
                 min_views=min_views,
-                is_degraded=is_degraded # Передаем статус деградации
+                api_key=api_key
+                # non_blocking и is_degraded больше не передаются
             )
             return result
         except HTTPException as http_exc:
@@ -1291,7 +1262,8 @@ async def get_posts_by_period(request: Request, data: dict):
              raise http_exc
         except Exception as e:
             logger.error(f"Ошибка в posts-by-period для Telegram: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера при обработке запроса Telegram.")
+            raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при обработке запроса Telegram: {str(e)}")
+        # finally блок больше не нужен
         # --- Конец существующего кода для Telegram ---
 
     elif platform == 'vk':
@@ -3222,7 +3194,7 @@ async def get_accounts_statistics_detailed(request: Request):
                     auth_status_tg = 'unknown'
                     degraded_mode_tg = False
                     if telegram_pool:
-                        pool_stats_tg = telegram_pool.get_client_usage_stats(acc_id_tg)
+                        pool_stats_tg = await telegram_pool.get_client_usage_stats(acc_id_tg)
                         if pool_stats_tg:
                             connected_tg = pool_stats_tg.get('connected', False)
                             auth_status_tg = pool_stats_tg.get('auth_status', 'unknown')
@@ -3390,8 +3362,8 @@ async def api_trending_posts_extended(request: Request, data: dict):
             logger.info(f"Вызов get_trending_posts для аккаунта {account_id_str}")
             # Получаем трендовые посты с расширенными параметрами
             posts = await get_trending_posts(
-                client, 
-                account_id_str, # Добавляем account_id как второй аргумент
+                # client, 
+                # account_id_str, # Добавляем account_id как второй аргумент
                 telegram_pool,
                 channel_ids, 
                 days_back=days_back, 
