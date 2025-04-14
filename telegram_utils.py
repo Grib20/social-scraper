@@ -1431,16 +1431,17 @@ async def get_posts_by_period(
     client: TelegramClient,
     group_ids: List[Union[int, str]],
     # Убеждаемся, что параметр называется limit_per_channel
-    limit_per_channel: int = 100, 
+    limit_per_channel: int = 100,
     days_back: int = 7,
     min_views: int = 0,
-    api_key: Optional[str] = None, 
-    non_blocking: bool = False,   
-    is_degraded: bool = False 
+    api_key: Optional[str] = None,
+    non_blocking: bool = False,
+    is_degraded: bool = False
     ) -> List[Dict]:
     """
     Асинхронно получает посты из указанных каналов за заданный период.
     Использует limit_per_channel для ограничения количества получаемых сообщений.
+    Корректно обрабатывает текст в альбомах.
     """
     logger.info(f"Запрос постов за период {days_back} дней из {len(group_ids)} каналов. Лимит на канал: {limit_per_channel}. Деградация: {is_degraded}")
 
@@ -1448,11 +1449,11 @@ async def get_posts_by_period(
         logger.error("Клиент Telegram не был предоставлен для get_posts_by_period")
         return []
 
-    # --- Идентификатор аккаунта для логов ---
+    # --- Идентификатор аккаунта для логов ---\
     account_id_for_log = getattr(client.session, 'filename', 'UNKNOWN_ID')
     logger.info(f"[Acc: {account_id_for_log}] Используется для запроса.")
 
-    # --- Проверка подключения и авторизации клиента ---
+    # --- Проверка подключения и авторизации клиента ---\
     try:
         if not client.is_connected():
             logger.warning(f"[Acc: {account_id_for_log}] Клиент не подключен. Попытка подключения...")
@@ -1468,16 +1469,16 @@ async def get_posts_by_period(
         logger.error(f"[Acc: {account_id_for_log}] Ошибка при проверке/подключении клиента: {e}")
         # При других ошибках (сетевых?) просто возвращаем пустой список
         return []
-    # -----------------------------------------------
+    # -----------------------------------------------\
 
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
     logger.info(f"[Acc: {account_id_for_log}] Вычислена дата отсечки: {cutoff_date.isoformat()}")
 
-    # --- Проверка и задержка для degraded_mode ---
+    # --- Проверка и задержка для degraded_mode ---\
     if is_degraded:
         logger.info(f"[Acc: {account_id_for_log}] Клиент в режиме деградации. Добавляем задержку {TELEGRAM_DEGRADED_MODE_DELAY} сек.")
         await asyncio.sleep(TELEGRAM_DEGRADED_MODE_DELAY)
-    # ---------------------------------------------
+    # ---------------------------------------------\
 
     semaphore = asyncio.Semaphore(5) # Ограничиваем до 5 одновременных обработок каналов
     tasks = []
@@ -1487,8 +1488,9 @@ async def get_posts_by_period(
         async with semaphore:
             channel_posts = []
             channel_entity = None
+            processed_grouped_ids = set() # <<<--- Множество для отслеживания ID обработанных альбомов
             try:
-                # --- Лог перед get_entity ---
+                # --- Лог перед get_entity ---\
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Попытка получить entity...")
                 # Универсальный поиск entity (username, link, ID)
                 entity_id_to_find = None
@@ -1524,33 +1526,35 @@ async def get_posts_by_period(
                 channel_title = getattr(channel_entity, 'title', 'Unknown Title')
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Успешно получена entity: '{channel_title}' (ID: {channel_entity.id})")
 
-                # --- Лог перед iter_messages --- 
-                # Убираем offset_date из лога
-                logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Запуск client.iter_messages с limit=0, reverse=True")
-
                 message_count_in_loop = 0 # Счетчик
-                # Собираем ВСЕ посты, которые вернет итератор (от старых к новым)
-                temp_posts = [] 
+                # Собираем ВСЕ посты, которые вернет итератор (от старых к новым)\
+                temp_posts = []
 
-                # --- Используем limit_per_channel, итерация от новых к старым --- 
+                # --- Используем limit_per_channel, итерация от новых к старым --- \
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Запуск client.iter_messages с entity={group_id}, limit={limit_per_channel}")
                 async for message in client.iter_messages(group_id, limit=limit_per_channel):
                     message_count_in_loop += 1
-                    # --- Детальный лог КАЖДОГО сообщения из итератора ---
+                    # --- Детальный лог КАЖДОГО сообщения из итератора ---\
                     msg_date_str = message.date.isoformat() if message.date else "No Date"
-                    logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Итератор -> msg ID={message.id}, Date={msg_date_str}, Views={message.views}")
+                    logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Итератор -> msg ID={message.id}, Date={msg_date_str}, Views={message.views}, GroupID={message.grouped_id}")
 
-                    # --- ВОЗВРАЩАЕМ ФИЛЬТР ДАТЫ с continue --- 
+                    # --- ФИЛЬТР ДАТЫ --- \
                     if not message.date or message.date <= cutoff_date:
                         logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение {message.id} ({msg_date_str}) слишком старое. Пропускаем.")
                         continue # Переходим к следующему сообщению
-                    # ---------------------------------
+                    # ---------------------\
 
-                    # --- ВОЗВРАЩАЕМ ФИЛЬТР ПРОСМОТРОВ --- 
+                    # <<<--- ПРОВЕРКА НА ДУБЛИКАТ АЛЬБОМА ---<<<
+                    if message.grouped_id and message.grouped_id in processed_grouped_ids:
+                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} часть уже обработанного альбома ({message.grouped_id}). Пропуск.")
+                        continue
+                    # <<<--------------------------------------<<<
+
+                    # --- ФИЛЬТР ПРОСМОТРОВ --- \
                     if message.views is not None and message.views >= min_views:
                         logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} ПРОШЛО фильтр просмотров.")
 
-                        # Убираем префикс -100 из ID канала для выходных данных
+                        # Убираем префикс -100 из ID канала для выходных данных\
                         channel_id_str = str(channel_entity.id).replace('-100', '')
 
                         post_data = {
@@ -1558,70 +1562,83 @@ async def get_posts_by_period(
                             "channel_id": channel_id_str,
                             "channel_title": channel_title,
                             "channel_username": getattr(channel_entity, 'username', None),
-                            "text": message.text or "",
+                            "text": message.text or "", # Используем текст из ПЕРВОГО обработанного сообщения альбома
                             "views": message.views,
                             "reactions": sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0,
                             "comments": message.replies.replies if message.replies else 0,
                             "forwards": message.forwards or 0,
-                            "date": message.date.isoformat(), # Дата в ISO формате
+                            "date": message.date.isoformat(), # Дата в ISO формате\
                             "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{message.id}",
-                            "media": []
+                            "media": [] # Медиа не нужны по условию
                         }
+
+                        # <<<--- ПОМЕЧАЕМ АЛЬБОМ КАК ОБРАБОТАННЫЙ ---<<<
+                        if message.grouped_id:
+                            processed_grouped_ids.add(message.grouped_id)
+                            logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Альбом {message.grouped_id} помечен как обработанный (на основе сообщения {message.id}).")
+                        # <<<----------------------------------------<<<
+
                         logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Добавляем пост ID={message.id}. Текущее кол-во: {len(channel_posts)+1}")
                         channel_posts.append(post_data)
                     else:
-                         # Логируем причину, почему не прошло (только по просмотрам)
+                         # Логируем причину, почему не прошло (только по просмотрам)\
                          reason = []
                          if message.views is None: reason.append("нет просмотров")
                          elif message.views < min_views: reason.append(f"просмотры ({message.views}) < минимума ({min_views})")
                          logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} НЕ прошло фильтр просмотров. Причины: {', '.join(reason)}")
-                    # --- КОНЕЦ ФИЛЬТРОВ --- 
+                    # --- КОНЕЦ ФИЛЬТРОВ --- \
 
-                # --- Лог после завершения цикла iter_messages --- 
+                # --- Лог после завершения цикла iter_messages --- \
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Завершен цикл iter_messages. Обработано: {message_count_in_loop}. Найдено подходящих: {len(channel_posts)}")
 
             except FloodWaitError as e:
                  logger.error(f"[Acc: {account_id_for_log}] [Chan: {group_id}] FloodWaitError при обработке: {e.seconds} сек. Пропуск канала.")
-                 temp_posts = [] # Очищаем, если была ошибка
+                 channel_posts = [] # Очищаем, если была ошибка
             except (ChannelPrivateError, ChatForbiddenError, UsernameNotOccupiedError, ValueError) as e:
-                 # ValueError может быть от get_entity, если ID некорректен или не найден
+                 # ValueError может быть от get_entity, если ID некорректен или не найден\
                  logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Канал недоступен или не найден: {e}. Пропуск.")
             except SessionPasswordNeededError as e:
                 logger.error(f"[Acc: {account_id_for_log}] Аккаунт требует пароль 2FA! {e}")
-                # Передаем ошибку выше, чтобы обработать в /api/telegram/accounts/{account_id}/auth
+                # Передаем ошибку выше, чтобы обработать в /api/telegram/accounts/{account_id}/auth\
                 raise
+            except AuthKeyError as e: # Обработка AuthKeyError
+                 logger.error(f"[{account_id_for_log}] [Chan: {group_id}] Ошибка ключа авторизации: {e}")
+                 raise # Передаем критическую ошибку выше
+            except UserDeactivatedBanError as e: # Обработка UserDeactivatedBanError
+                 logger.error(f"[{account_id_for_log}] [Chan: {group_id}] Пользователь забанен/деактивирован: {e}")
+                 raise # Передаем критическую ошибку выше
             except Exception as e:
                 logger.error(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Непредвиденная Ошибка при обработке канала: {e.__class__.__name__}: {e}")
                 logger.error(traceback.format_exc())
-                temp_posts = [] # Очищаем, если была ошибка
+                channel_posts = [] # Очищаем, если была ошибка
             finally:
-                # --- Убираем сортировку и срез, так как лимит применен в iter_messages --- 
+                # --- Убираем сортировку и срез, так как лимит применен в iter_messages --- \
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Завершение process_single_channel. Возвращаем {len(channel_posts)} постов.")
                 return channel_posts
 
-    # Запускаем обработку каналов
+    # Запускаем обработку каналов\
     tasks = [process_single_channel(gid) for gid in group_ids]
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     except (ConnectionAbortedError, AuthKeyError, AuthKeyUnregisteredError, UserDeactivatedBanError, SessionPasswordNeededError) as critical_e:
         logger.error(f"[Acc: {account_id_for_log}] Критическая ошибка во время gather: {critical_e}. Прерываем выполнение.")
-        # Если возникла критическая ошибка аккаунта, нет смысла продолжать
-        raise critical_e # Передаем выше
+        # Если возникла критическая ошибка аккаунта, нет смысла продолжать\
+        raise critical_e # Передаем выше\
 
-    # Собираем все посты из результатов
+    # Собираем все посты из результатов\
     final_posts = []
     for result in results:
         if isinstance(result, list):
-            final_posts.extend(result) # Используем extend для добавления списка постов
+            final_posts.extend(result) # Используем extend для добавления списка постов\
         elif isinstance(result, Exception):
-            # Логируем некритические ошибки из gather (уже залогированы внутри process_single_channel)
+            # Логируем некритические ошибки из gather (уже залогированы внутри process_single_channel)\
             logger.warning(f"[Acc: {account_id_for_log}] Зафиксирована ошибка при обработке одного из каналов: {result}")
         else:
             logger.warning(f"[Acc: {account_id_for_log}] Неожиданный тип результата от process_single_channel: {type(result)}")
 
-    # --- Финальная сортировка всех постов по дате ---
+    # --- Финальная сортировка всех постов по дате ---\
     final_posts.sort(key=lambda p: p.get('date', datetime.min.replace(tzinfo=timezone.utc).isoformat()), reverse=True)
-    # ----------------------------------------------
+    # ----------------------------------------------\
 
     logger.info(f"[Acc: {account_id_for_log}] Завершено получение постов за период. Всего найдено: {len(final_posts)}")
     return final_posts
