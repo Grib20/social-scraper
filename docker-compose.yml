@@ -31,10 +31,10 @@ services:
       - LOG_DIR=/app/logs # Путь к логам внутри контейнера
       # Удаляем DB_PATH, т.к. используем PostgreSQL (данные в .env)
       # - DB_PATH=/app/database/users.db
-    depends_on:
-      # Зависимость от сервиса redis: приложение запустится после того, как redis будет готов
-      # redis:  # <-- Закомментировано
-      #   condition: service_healthy # <-- Закомментировано
+    # depends_on: # <-- Закомментировано целиком
+    #   # Зависимость от сервиса redis: приложение запустится после того, как redis будет готов
+    #   # redis:  # <-- Закомментировано
+    #   #   condition: service_healthy # <-- Закомментировано
     networks:
       # Подключение к пользовательской сети
       - app-network
