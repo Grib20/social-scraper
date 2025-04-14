@@ -27,7 +27,7 @@ services:
       # Дополнительные переменные окружения (некоторые могут дублировать .env, но это ОК)
       - PYTHONUNBUFFERED=1 # Отключает буферизацию вывода Python (для логов)
       - PORT=3030 # Порт внутри контейнера
-      - REDIS_URL={REDIS_URL} # Адрес Redis для подключения
+      - REDIS_URL=${REDIS_URL} # Адрес Redis для подключения (Используем синтаксис ${...})
       - LOG_DIR=/app/logs # Путь к логам внутри контейнера
       # Удаляем DB_PATH, т.к. используем PostgreSQL (данные в .env)
       # - DB_PATH=/app/database/users.db
