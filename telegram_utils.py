@@ -1441,7 +1441,7 @@ async def get_posts_by_period(
     """
     Асинхронно получает посты из указанных каналов за заданный период.
     Использует limit_per_channel для ограничения количества получаемых сообщений.
-    Корректно обрабатывает текст в альбомах.
+    Корректно обрабатывает текст в альбомах, находя сообщение с текстом.
     """
     logger.info(f"Запрос постов за период {days_back} дней из {len(group_ids)} каналов. Лимит на канал: {limit_per_channel}. Деградация: {is_degraded}")
 
@@ -1488,7 +1488,7 @@ async def get_posts_by_period(
         async with semaphore:
             channel_posts = []
             channel_entity = None
-            processed_grouped_ids = set() # <<<--- Множество для отслеживания ID обработанных альбомов
+            processed_grouped_ids = set() # Множество для отслеживания ID обработанных альбомов
             try:
                 # --- Лог перед get_entity ---\
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Попытка получить entity...")
@@ -1527,8 +1527,6 @@ async def get_posts_by_period(
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Успешно получена entity: '{channel_title}' (ID: {channel_entity.id})")
 
                 message_count_in_loop = 0 # Счетчик
-                # Собираем ВСЕ посты, которые вернет итератор (от старых к новым)\
-                temp_posts = []
 
                 # --- Используем limit_per_channel, итерация от новых к старым --- \
                 logger.info(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Запуск client.iter_messages с entity={group_id}, limit={limit_per_channel}")
@@ -1544,11 +1542,13 @@ async def get_posts_by_period(
                         continue # Переходим к следующему сообщению
                     # ---------------------\
 
-                    # <<<--- ПРОВЕРКА НА ДУБЛИКАТ АЛЬБОМА ---<<<
-                    if message.grouped_id and message.grouped_id in processed_grouped_ids:
+                    is_album = message.grouped_id is not None
+
+                    # --- ПРОВЕРКА НА ДУБЛИКАТ АЛЬБОМА --- 
+                    if is_album and message.grouped_id in processed_grouped_ids:
                         logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Сообщение ID={message.id} часть уже обработанного альбома ({message.grouped_id}). Пропуск.")
                         continue
-                    # <<<--------------------------------------<<<
+                    # -------------------------------------- 
 
                     # --- ФИЛЬТР ПРОСМОТРОВ --- \
                     if message.views is not None and message.views >= min_views:
@@ -1557,12 +1557,40 @@ async def get_posts_by_period(
                         # Убираем префикс -100 из ID канала для выходных данных\
                         channel_id_str = str(channel_entity.id).replace('-100', '')
 
+                        post_text = ""
+                        # --- ОБРАБОТКА ТЕКСТА АЛЬБОМА --- 
+                        if is_album:
+                            processed_grouped_ids.add(message.grouped_id) # Помечаем альбом как обработанный СРАЗУ
+                            logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Обнаружен необработанный альбом {message.grouped_id} (сообщение {message.id}). Получаем все сообщения альбома...")
+                            try:
+                                # Передаем channel_entity, а не group_id строкой
+                                album_messages = await get_album_messages(client, channel_entity, message)
+                                if album_messages:
+                                    # Ищем текст в сообщениях альбома (предпочтительно в первом)
+                                    album_messages.sort(key=lambda m: m.id) # Сортируем по ID (старые -> новые)
+                                    for album_msg in album_messages:
+                                        if album_msg.text:
+                                            post_text = album_msg.text
+                                            logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Найден текст для альбома {message.grouped_id} в сообщении {album_msg.id}.")
+                                            break # Нашли текст, выходим
+                                    if not post_text:
+                                         logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Не удалось найти текст ни в одном из {len(album_messages)} сообщений альбома {message.grouped_id}.")
+                                else:
+                                    logger.warning(f"[Acc: {account_id_for_log}] [Chan: {group_id}] get_album_messages вернул пустой список для альбома {message.grouped_id}.")
+                            except Exception as album_err:
+                                logger.error(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Ошибка при вызове get_album_messages для {message.grouped_id}: {album_err}")
+                                post_text = message.text or "" # Запасной вариант - текст текущего сообщения
+                        else:
+                            # Обычный пост (не альбом)
+                            post_text = message.text or ""
+                        # ----------------------------------
+
                         post_data = {
-                            "id": message.id,
+                            "id": message.id, # Используем ID текущего сообщения (или первого из альбома, если нужно)
                             "channel_id": channel_id_str,
                             "channel_title": channel_title,
                             "channel_username": getattr(channel_entity, 'username', None),
-                            "text": message.text or "", # Используем текст из ПЕРВОГО обработанного сообщения альбома
+                            "text": post_text, # <<<--- Используем найденный текст
                             "views": message.views,
                             "reactions": sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0,
                             "comments": message.replies.replies if message.replies else 0,
@@ -1572,13 +1600,7 @@ async def get_posts_by_period(
                             "media": [] # Медиа не нужны по условию
                         }
 
-                        # <<<--- ПОМЕЧАЕМ АЛЬБОМ КАК ОБРАБОТАННЫЙ ---<<<
-                        if message.grouped_id:
-                            processed_grouped_ids.add(message.grouped_id)
-                            logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Альбом {message.grouped_id} помечен как обработанный (на основе сообщения {message.id}).")
-                        # <<<----------------------------------------<<<
-
-                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Добавляем пост ID={message.id}. Текущее кол-во: {len(channel_posts)+1}")
+                        logger.debug(f"[Acc: {account_id_for_log}] [Chan: {group_id}] Добавляем пост ID={message.id} (Альбом: {is_album}). Текущее кол-во: {len(channel_posts)+1}")
                         channel_posts.append(post_data)
                     else:
                          # Логируем причину, почему не прошло (только по просмотрам)\
