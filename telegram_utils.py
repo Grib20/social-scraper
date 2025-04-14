@@ -99,17 +99,35 @@ class TelegramClientWrapper:
         logger.info(f"TelegramClientWrapper инициализирован с account_id: {self.account_id}")
 
         # --- Убираем сложную логику извлечения ID, оставляем только получение инфо о прокси ---
-        proxy_dict = getattr(client.session, 'proxy', None)
+        # --- ИЗМЕНЕНИЕ: Проверяем client._proxy вместо client.session.proxy ---
+        # proxy_dict = getattr(client.session, 'proxy', None)
+        proxy_dict = getattr(client, '_proxy', None) # Атрибут, куда записывается прокси при инициализации
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         self.has_proxy = proxy_dict is not None
         if self.has_proxy:
-            self.proxy_type = proxy_dict.get('proxy_type', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
-            host = proxy_dict.get('addr', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
-            port = proxy_dict.get('port', 'unknown') if isinstance(proxy_dict, dict) else 'unknown'
-            self.proxy_str = f"{self.proxy_type}://{host}:{port}"
-            logger.info(f"Клиент {self.account_id} использует прокси.")
+            # --- ИЗМЕНЕНИЕ: Пытаемся извлечь данные из proxy_dict, если это кортеж/список --- 
+            try:
+                # Telethon хранит прокси как кортеж/список: (type, host, port, enable_udp, user, pass)
+                # или как словарь (старый вариант?). Будем готовы к кортежу.
+                if isinstance(proxy_dict, (tuple, list)) and len(proxy_dict) >= 3:
+                    self.proxy_type = proxy_dict[0] if proxy_dict[0] else 'unknown'
+                    host = proxy_dict[1] if proxy_dict[1] else 'unknown'
+                    port = proxy_dict[2] if proxy_dict[2] else 'unknown'
+                elif isinstance(proxy_dict, dict): # Обработка старого варианта (словарь)
+                    self.proxy_type = proxy_dict.get('proxy_type', 'unknown')
+                    host = proxy_dict.get('addr', 'unknown')
+                    port = proxy_dict.get('port', 'unknown')
+                else:
+                    raise TypeError("Неожиданный формат proxy_dict")
+                # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
+                self.proxy_str = f"{self.proxy_type}://{host}:{port}"
+                logger.info(f"Клиент {self.account_id} использует прокси (обнаружен в _proxy).")
+            except (IndexError, TypeError, Exception) as e_parse:
+                logger.warning(f"Не удалось разобрать данные прокси из client._proxy ({type(proxy_dict)}): {e_parse}. Считаем, что прокси нет.")
+                self.has_proxy = False # Сбрасываем флаг, если не смогли разобрать
+                logger.info(f"Клиент {self.account_id} работает без прокси (ошибка разбора _proxy).")
         else:
-            logger.info(f"Клиент {self.account_id} работает без прокси")
-        # --- Конец упрощения ---
+            logger.info(f"Клиент {self.account_id} работает без прокси (атрибут _proxy не найден).")
 
         self.last_request_time = 0
         self.last_group_request_time = 0
