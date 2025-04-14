@@ -27,14 +27,14 @@ services:
       # Дополнительные переменные окружения (некоторые могут дублировать .env, но это ОК)
       - PYTHONUNBUFFERED=1 # Отключает буферизацию вывода Python (для логов)
       - PORT=3030 # Порт внутри контейнера
-      - REDIS_URL=redis://redis:6379/0 # Адрес Redis для подключения
+      - REDIS_URL={REDIS_URL} # Адрес Redis для подключения
       - LOG_DIR=/app/logs # Путь к логам внутри контейнера
       # Удаляем DB_PATH, т.к. используем PostgreSQL (данные в .env)
       # - DB_PATH=/app/database/users.db
     depends_on:
       # Зависимость от сервиса redis: приложение запустится после того, как redis будет готов
-      redis:
-        condition: service_healthy # Условие: сервис redis должен пройти healthcheck
+      # redis:  # <-- Закомментировано
+      #   condition: service_healthy # <-- Закомментировано
     networks:
       # Подключение к пользовательской сети
       - app-network
@@ -57,37 +57,37 @@ services:
           cpus: '0.5' # Гарантированно 0.5 CPU
           memory: 1G # Гарантированно 1ГБ ОЗУ
 
-  # Сервис Redis (кэш и брокер сообщений)
-  redis:
-    image: redis:7-alpine # Используемый образ
-    container_name: social-scraper-redis # Имя контейнера
-    restart: unless-stopped # Политика перезапуска
-    ports:
-      # Проброс порта Redis только на localhost хоста для безопасности
-      - "127.0.0.1:6379:6379"
-    volumes:
-      # Том для сохранения данных Redis
-      - redis_data:/data
-    command: redis-server --appendonly yes # Команда запуска Redis с включенным AOF
-    networks:
-      # Подключение к пользовательской сети
-      - app-network
-    healthcheck:
-      # Проверка работоспособности Redis
-      test: ["CMD", "redis-cli", "ping"] # Команда проверки
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
+# Сервис Redis (кэш и брокер сообщений)
+# redis: # <-- Закомментировано
+#   image: redis:7-alpine # Используемый образ
+#   container_name: social-scraper-redis # Имя контейнера
+#   restart: unless-stopped # Политика перезапуска
+#   ports:
+#     # Проброс порта Redis только на localhost хоста для безопасности
+#     - "127.0.0.1:6379:6379"
+#   volumes:
+#     # Том для сохранения данных Redis
+#     - redis_data:/data
+#   command: redis-server --appendonly yes # Команда запуска Redis с включенным AOF
+#   networks:
+#     # Подключение к пользовательской сети
+#     - app-network
+#   healthcheck:
+#     # Проверка работоспособности Redis
+#     test: ["CMD", "redis-cli", "ping"] # Команда проверки
+#     interval: 30s
+#     timeout: 10s
+#     retries: 3
+#   deploy:
+#     resources:
+#       limits:
+#         cpus: '0.5'
+#         memory: 512M
 
 # Определение именованных томов (volumes)
 volumes:
-  redis_data:
-    driver: local # Используем локальный драйвер для хранения данных Redis
+#  redis_data: # <-- Закомментировано
+#    driver: local # Используем локальный драйвер для хранения данных Redis
   telegram_sessions:
     driver: local # Для сессий Telegram
   media_downloads:
