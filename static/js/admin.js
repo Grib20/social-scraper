@@ -2116,7 +2116,7 @@ async function resetAccountsStats() {
     }
     
     try {
-        const response = await fetch('/api/admin/accounts/stats/reset', {
+        const response = await fetch('/admin/accounts/reset-stats', { // <-- ИЗМЕНЕН URL
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${adminKey}`,

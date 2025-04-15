@@ -1805,6 +1805,23 @@ async def _process_groups_for_period_task(
                         post_text = message.text or ""
 
                     channel_id_str = str(channel_entity.id).replace('-100', '')
+                    # Получаем число подписчиков для расчета trend_score
+                    subscribers = getattr(channel_entity, 'participants_count', None)
+                    if subscribers is None:
+                        subscribers = 10
+                    else:
+                        try:
+                            subscribers = int(subscribers)
+                        except Exception:
+                            subscribers = 10
+                    subscribers_for_calc = max(subscribers, 10)
+                    # Считаем trend_score по формуле из trending
+                    raw_engagement_score = (message.views or 0) + ((sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0) * 10) + ((message.replies.replies if message.replies else 0) * 20) + ((message.forwards or 0) * 50)
+                    if subscribers_for_calc > 1 and raw_engagement_score > 0:
+                        import math
+                        trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc))
+                    else:
+                        trend_score = 0
                     post_data = {
                         "id": message.id,
                         "channel_id": channel_id_str,
@@ -1817,7 +1834,8 @@ async def _process_groups_for_period_task(
                         "forwards": message.forwards or 0,
                         "date": message.date.isoformat(),
                         "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{message.id}",
-                        "media": [] # Медиа здесь не обрабатываем
+                        "media": [], # Медиа здесь не обрабатываем
+                        "trend_score": trend_score
                     }
                     channel_posts.append(post_data)
                 # --- Конец логики обработки message ---

@@ -2191,4 +2191,12 @@ button i {
 .accounts-header h4 i {
     margin-right: 10px;
     color: var(--accent-color);
+}
+
+.actions {
+    display: flex;
+    flex-direction: row;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 20px;
 } 

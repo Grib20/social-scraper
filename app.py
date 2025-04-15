@@ -1207,6 +1207,7 @@ async def get_posts_by_period(request: Request, data: dict):
     # Инициализируем планировщик медиа
     from media_utils import init_scheduler
     from telegram_utils import get_posts_by_period
+    from user_manager import verify_api_key
     await init_scheduler()
     
     platform = data.get('platform', 'telegram')
@@ -1267,69 +1268,127 @@ async def get_posts_by_period(request: Request, data: dict):
         # --- Конец существующего кода для Telegram ---
 
     elif platform == 'vk':
-        # +++ Начало добавленного кода для VK +++
+        # +++ НАЧАЛО: Новая логика ротации для VK +++
         try:
-            # Используем get_next_available_account для VK
-            account = await get_next_available_account(api_key, "vk")
-            if not account:
-                 # Проверяем, есть ли вообще активные аккаунты VK у пользователя
-                active_vk_accounts = await get_active_accounts(api_key, "vk")
-                if not active_vk_accounts:
-                    raise HTTPException(status_code=400, detail="Нет активных VK аккаунтов для выполнения запроса.")
-                else:
-                    # Используем 429 Too Many Requests, как было в оригинальном эндпоинте
-                    raise HTTPException(status_code=429, detail="Нет доступных VK аккаунтов в данный момент, попробуйте позже.")
+            # 1. Получаем все активные аккаунты VK
+            # Импортируем необходимые функции здесь, чтобы избежать циклических зависимостей
+            from user_manager import get_active_accounts, verify_api_key
+            from vk_utils import VKClient
+            import asyncio
+            from datetime import datetime, timedelta, timezone
 
-            # Создаем VKClient с данными аккаунта
-            # Передаем account_id и api_key для учета использования
-            async with VKClient(
-                access_token=account["token"], # Используем ключ "token"
-                proxy=account.get("proxy"),
-                account_id=account["id"],
-                api_key=api_key # Передаем api_key
-            ) as vk:
-                # Вызываем метод клиента VK для получения постов
-                # Убедимся, что group_ids - это список чисел или строк, как ожидает vk_utils
-                processed_group_ids = []
-                for gid in group_ids:
-                    try:
-                        # Пытаемся преобразовать в int, если это строка с числом
-                        if isinstance(gid, str) and gid.lstrip('-').isdigit(): # Проверяем, что строка (возможно с минусом) содержит только цифры
-                            processed_group_ids.append(int(gid))
-                        elif isinstance(gid, int):
-                             processed_group_ids.append(gid)
-                        else:
-                            logger.warning(f"Не удалось обработать group_id: {gid} (тип: {type(gid)}), пропускаем.")
-                    except ValueError:
-                        logger.warning(f"Неверный формат group_id: {gid}, пропускаем.")
+            active_accounts = await get_active_accounts(api_key, "vk")
+            if not active_accounts:
+                logger.warning(f"VK: Нет активных аккаунтов для api_key={api_key}")
+                raise HTTPException(status_code=400, detail="Нет активных VK аккаунтов для выполнения запроса.")
 
-                if not processed_group_ids:
-                     raise HTTPException(status_code=400, detail="Не найдено валидных ID групп VK.")
+            num_accounts = len(active_accounts)
+            logger.info(f"VK: Найдено {num_accounts} активных аккаунтов. Распределение {len(group_ids)} групп.")
 
-                # Проверяем работоспособность клиента перед вызовом основного метода
-                if not await vk.test_connection():
-                     logger.error(f"Не удалось установить соединение с VK API для аккаунта {account['id']}")
-                     # Возможно, стоит пометить аккаунт как неактивный или вернуть другую ошибку
-                     raise HTTPException(status_code=503, detail="Не удалось подключиться к VK API.")
+            # 2. Обрабатываем group_ids (убеждаемся, что это числа)
+            processed_group_ids = []
+            for gid in group_ids:
+                try:
+                    # Убираем возможный минус и проверяем, что строка - число
+                    if isinstance(gid, str) and gid.lstrip('-').isdigit():
+                        processed_group_ids.append(int(gid))
+                    elif isinstance(gid, int):
+                        processed_group_ids.append(gid)
+                    else:
+                        logger.warning(f"VK: Не удалось обработать group_id: {gid} (тип: {type(gid)}), пропускаем.")
+                except ValueError:
+                    logger.warning(f"VK: Неверный формат group_id: {gid}, пропускаем.")
 
-                posts = await vk.get_posts_by_period(
-                    group_ids=processed_group_ids, # Используем обработанные ID
-                    max_posts=max_posts,
-                    days_back=days_back,
-                    min_views=min_views
-                )
-                # Формат ответа как в оригинальном эндпоинте /api/vk/posts-by-period
-                return {"posts": posts}
+            if not processed_group_ids:
+                 raise HTTPException(status_code=400, detail="Не найдено валидных ID групп VK.")
+
+            # 3. Распределяем группы и создаем задачи
+            tasks = []
+            all_posts = []
+            # Используем UTC для cutoff_date, так как VK API возвращает Unix timestamp (UTC)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
+
+            # --- Вспомогательная корутина для обработки порции групп ---
+            async def process_vk_groups_task(account_info, groups_subset):
+                account_id = account_info.get("id")
+                token = account_info.get("token")
+                proxy = account_info.get("proxy")
+
+                if not token:
+                    logger.error(f"VK: Отсутствует токен для аккаунта {account_id}, пропускаем.")
+                    return [] # Возвращаем пустой список, если нет токена
+
+                try:
+                    # Создаем отдельный клиент для этой задачи
+                    async with VKClient(
+                        access_token=token,
+                        proxy=proxy,
+                        account_id=account_id, # Передаем ID для статистики
+                        api_key=api_key      # Передаем API ключ для статистики
+                    ) as vk_task_client:
+                        # Вызываем process_groups для этого клиента и его порции групп
+                        # Делим max_posts между аккаунтами, но не менее 1
+                        posts_limit_for_account = max(1, max_posts // num_accounts) if num_accounts > 0 else max_posts
+                        logger.info(f"VK: Аккаунт {account_id} обрабатывает {len(groups_subset)} групп (лимит постов: {posts_limit_for_account})...")
+
+                        # Передаем cutoff_date как datetime объект (process_groups ожидает datetime)
+                        return await vk_task_client.process_groups(
+                            group_ids=groups_subset,
+                            max_posts=posts_limit_for_account,
+                            cutoff_date=cutoff_date, # Передаем datetime
+                            min_views=min_views
+                        )
+                except Exception as task_e:
+                    logger.error(f"VK: Ошибка в задаче обработки для аккаунта {account_id}: {task_e}", exc_info=True)
+                    return [] # Возвращаем пустой список в случае ошибки задачи
+            # --- Конец вспомогательной корутины ---
+
+            # Распределяем группы и создаем задачи
+            groups_per_account = (len(processed_group_ids) + num_accounts - 1) // num_accounts
+            start_index = 0
+            for i, account in enumerate(active_accounts):
+                 end_index = min(start_index + groups_per_account, len(processed_group_ids))
+                 groups_for_this_account = processed_group_ids[start_index:end_index]
+                 start_index = end_index
+
+                 if not groups_for_this_account: continue # Пропускаем, если группы не достались
+
+                 tasks.append(asyncio.create_task(process_vk_groups_task(account, groups_for_this_account)))
+
+            # 4. Собираем результаты
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, result in enumerate(results):
+                    # Безопасное получение ID для логов
+                    acc_id_log = "unknown_id"
+                    if i < len(active_accounts) and isinstance(active_accounts[i], dict):
+                        acc_id_log = active_accounts[i].get("id", f"task_{i}")
+                    else:
+                        acc_id_log = f"task_{i}"
+
+                    if isinstance(result, Exception):
+                        logger.error(f"VK: Ошибка выполнения задачи для аккаунта {acc_id_log}: {result}", exc_info=result)
+                    elif isinstance(result, list):
+                        all_posts.extend(result)
+                    else:
+                        logger.warning(f"VK: Неожиданный результат от задачи {acc_id_log}: {type(result)}")
+
+            # 5. Сортируем финальный результат по дате (desc)
+            # Убедимся, что date - это строка ISO формата для сортировки
+            all_posts.sort(key=lambda x: x.get("date", "1970-01-01T00:00:00"), reverse=True)
+
+            # Ограничиваем количество постов до исходного max_posts
+            final_posts = all_posts[:max_posts]
+
+            logger.info(f"VK: Завершена обработка постов за период. Найдено {len(final_posts)} постов.")
+            return {"posts": final_posts} # Формат ответа {"posts": [...]}
+
         except HTTPException as http_exc:
-            # Перебрасываем HTTP исключения дальше
-            raise http_exc
+            raise http_exc # Перебрасываем HTTP исключения
         except Exception as e:
-            logger.error(f"Ошибка в posts-by-period для VK: {e}", exc_info=True)
-            # Возвращаем более общую ошибку
-            raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера при обработке запроса VK.")
-        # +++ Конец добавленного кода для VK +++
-    else:
-        raise HTTPException(status_code=400, detail="Платформа не поддерживается")
+            logger.error(f"Ошибка в /posts-by-period (VK): {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при обработке запроса VK: {str(e)}")
+        # +++ КОНЕЦ: Новая логика ротации для VK +++
 
 @app.get("/api/accounts/status")
 async def get_accounts_status(api_key: str = Header(...)):
@@ -3879,65 +3938,129 @@ async def reset_accounts_stats(request: Request):
     Ручной сброс статистики в Redis и режима пониженной производительности
     для ВСЕХ аккаунтов, находящихся в данный момент в пулах.
     """
-    # Проверяем админ-ключ
     admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key:
+        admin_key = request.cookies.get("admin_key")
+    
     if not admin_key or not await verify_admin_key(admin_key):
-        raise HTTPException(status_code=401, detail="Неверный admin ключ")
+        raise HTTPException(status_code=401, detail="Invalid admin key")
 
-    reset_counts = {"telegram": 0, "vk": 0}
-    reset_degraded = {"telegram": 0, "vk": 0}
+    all_account_ids_to_reset = [] # Список кортежей (platform, account_id)
     errors = []
+    redis_reset_success_count = 0
+    db_reset_success_count = 0
+    pool_degraded_reset_count = 0
 
-    # --- Сброс для VK ---
-    if vk_pool:
-        vk_account_ids = list(vk_pool.clients.keys())
-        logger.info(f"Сброс статистики и degraded_mode для {len(vk_account_ids)} VK клиентов в пуле...")
-        tasks_reset = [reset_account_stats_redis(acc_id, 'vk') for acc_id in vk_account_ids]
-        results_reset = await asyncio.gather(*tasks_reset, return_exceptions=True)
+    pool = await get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=500, detail="Ошибка сервера: Не удалось подключиться к БД")
 
-        for i, result in enumerate(results_reset):
-            acc_id = vk_account_ids[i]
-            if isinstance(result, Exception):
-                error_msg = f"Ошибка сброса Redis стат. для VK {acc_id}: {result}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-            elif result is True:
-                reset_counts["vk"] += 1
-                # Сбрасываем degraded_mode для клиента в пуле
-                client = vk_pool.get_client(acc_id)
-                if client and hasattr(client, 'set_degraded_mode'):
-                    # Проверяем, был ли он вообще включен, чтобы точно посчитать сброшенные
-                    if client.degraded_mode:
-                        reset_degraded["vk"] += 1
-                    client.set_degraded_mode(False)
-            # else: result is False - ошибка логируется внутри reset_account_stats_redis
+    try:
+        async with pool.acquire() as conn:
+            # --- 1. Получаем ВСЕ ID из базы данных ---
+            logger.info("Получение всех ID аккаунтов из БД для сброса статистики...")
+            vk_ids_records = await conn.fetch("SELECT id FROM vk_accounts")
+            tg_ids_records = await conn.fetch("SELECT id FROM telegram_accounts")
 
-    # --- Сброс для Telegram ---
-    if telegram_pool:
-        tg_account_ids = list(telegram_pool.clients.keys())
-        logger.info(f"Сброс статистики и degraded_mode для {len(tg_account_ids)} Telegram клиентов в пуле...")
-        tasks_reset_tg = [reset_account_stats_redis(acc_id, 'telegram') for acc_id in tg_account_ids]
-        results_reset_tg = await asyncio.gather(*tasks_reset_tg, return_exceptions=True)
+            for record in vk_ids_records:
+                all_account_ids_to_reset.append(('vk', record['id']))
+            for record in tg_ids_records:
+                all_account_ids_to_reset.append(('telegram', record['id']))
 
-        for i, result in enumerate(results_reset_tg):
-            acc_id = tg_account_ids[i]
-            if isinstance(result, Exception):
-                error_msg = f"Ошибка сброса Redis стат. для Telegram {acc_id}: {result}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-            elif result is True:
-                reset_counts["telegram"] += 1
-                # Сбрасываем degraded_mode через метод пула
-                # Проверяем, был ли он включен
-                if telegram_pool.degraded_mode_status.get(str(acc_id), False):
-                    reset_degraded["telegram"] += 1
-                telegram_pool.set_degraded_mode(acc_id, False)
-            # else: result is False
+            logger.info(f"Найдено {len(all_account_ids_to_reset)} аккаунтов ({len(vk_ids_records)} VK, {len(tg_ids_records)} TG) в БД.")
 
-    # Формируем ответ
-    total_reset_count = reset_counts["vk"] + reset_counts["telegram"]
-    total_reset_degraded = reset_degraded["vk"] + reset_degraded["telegram"]
-    message = f"Статистика в Redis сброшена для {total_reset_count} аккаунтов ({reset_counts['vk']} VK, {reset_counts['telegram']} TG). Режим деградации отключен для {total_reset_degraded} аккаунтов ({reset_degraded['vk']} VK, {reset_degraded['telegram']} TG)."
+            if not all_account_ids_to_reset:
+                return {"message": "В базе данных нет аккаунтов для сброса статистики."}
+
+            # --- 2. Запускаем сброс статистики в Redis для ВСЕХ аккаунтов ---
+            logger.info("Запуск сброса статистики в Redis...")
+            from redis_utils import reset_account_stats_redis # Импорт здесь
+            redis_reset_tasks = []
+            for platform, acc_id in all_account_ids_to_reset:
+                redis_reset_tasks.append(reset_account_stats_redis(acc_id, platform))
+
+            redis_results = await asyncio.gather(*redis_reset_tasks, return_exceptions=True)
+
+            successful_redis_resets = [] # Собираем те, что успешно сброшены в Redis
+            for i, result in enumerate(redis_results):
+                platform, acc_id = all_account_ids_to_reset[i]
+                if isinstance(result, Exception):
+                    error_msg = f"Ошибка сброса Redis стат. для {platform}:{acc_id}: {result}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+                elif result is True:
+                    redis_reset_success_count += 1
+                    successful_redis_resets.append((platform, acc_id))
+                # else: result is False (ошибка внутри reset_account_stats_redis)
+
+            logger.info(f"Сброс статистики в Redis завершен. Успешно: {redis_reset_success_count}, Ошибок: {len(errors)}")
+
+            # --- 3. Запускаем ЯВНЫЙ сброс статистики в БД для ВСЕХ аккаунтов ---
+            #    (Даже если Redis сброс не удался, БД все равно обнуляем)
+            logger.info("Запуск явного сброса статистики в БД...")
+            async with conn.transaction(): # Одна транзакция для всех UPDATE
+                 # Сначала для VK
+                 vk_ids_to_update = [acc_id for platform, acc_id in all_account_ids_to_reset if platform == 'vk']
+                 if vk_ids_to_update:
+                     try:
+                         # Используем ANY для обновления всех сразу
+                         res_vk = await conn.execute(
+                             "UPDATE vk_accounts SET requests_count = 0, last_used = NULL WHERE id = ANY($1)",
+                             vk_ids_to_update
+                         )
+                         updated_vk_count = int(res_vk.split()[1])
+                         db_reset_success_count += updated_vk_count
+                         logger.info(f"Успешно сброшена статистика в БД для {updated_vk_count} VK аккаунтов.")
+                     except Exception as db_err_vk:
+                         error_msg = f"Ошибка массового сброса БД для VK: {db_err_vk}"
+                         logger.error(error_msg)
+                         errors.append(error_msg)
+
+                 # Затем для Telegram
+                 tg_ids_to_update = [acc_id for platform, acc_id in all_account_ids_to_reset if platform == 'telegram']
+                 if tg_ids_to_update:
+                     try:
+                         res_tg = await conn.execute(
+                             "UPDATE telegram_accounts SET requests_count = 0, last_used = NULL WHERE id = ANY($1)",
+                              tg_ids_to_update
+                         )
+                         updated_tg_count = int(res_tg.split()[1])
+                         db_reset_success_count += updated_tg_count
+                         logger.info(f"Успешно сброшена статистика в БД для {updated_tg_count} Telegram аккаунтов.")
+                     except Exception as db_err_tg:
+                         error_msg = f"Ошибка массового сброса БД для Telegram: {db_err_tg}"
+                         logger.error(error_msg)
+                         errors.append(error_msg)
+
+            logger.info(f"Явный сброс статистики в БД завершен. Успешно: {db_reset_success_count}.")
+
+        # --- 4. Пытаемся сбросить degraded_mode для клиентов В ПУЛЕ (отдельно) ---
+        logger.info("Попытка сброса degraded_mode для клиентов в пулах...")
+        # VK
+        if vk_pool and hasattr(vk_pool, 'clients') and isinstance(vk_pool.clients, dict):
+            for acc_id, client in vk_pool.clients.items():
+                 if client and hasattr(client, 'set_degraded_mode'):
+                     if hasattr(client, 'degraded_mode') and client.degraded_mode:
+                         client.set_degraded_mode(False)
+                         pool_degraded_reset_count += 1
+        # Telegram
+        if telegram_pool and hasattr(telegram_pool, 'clients') and isinstance(telegram_pool.clients, dict):
+             for acc_id_str, client in telegram_pool.clients.items():
+                 # Используем acc_id_str как ключ для degraded_mode_status
+                 if telegram_pool.degraded_mode_status.get(acc_id_str, False):
+                     telegram_pool.set_degraded_mode(acc_id_str, False)
+                     pool_degraded_reset_count += 1
+        logger.info(f"Сброс degraded_mode в пулах завершен. Сброшено: {pool_degraded_reset_count}.")
+
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Ошибка PostgreSQL на этапе получения ID или сброса БД: {db_err}", exc_info=True)
+        errors.append(f"Ошибка базы данных: {str(db_err)}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при сбросе статистики: {e}", exc_info=True)
+        errors.append(f"Внутренняя ошибка сервера: {str(e)}")
+
+    # --- Формируем финальный ответ ---
+    message = f"Сброс завершен. Redis: {redis_reset_success_count} успешно. БД: {db_reset_success_count} успешно. Degraded в пуле: {pool_degraded_reset_count} сброшено."
 
     if errors:
         logger.warning(f"Запрос на сброс статистики завершен с ошибками: {errors}")
@@ -3945,9 +4068,10 @@ async def reset_accounts_stats(request: Request):
             status_code=207, # Multi-Status
             content={
                 "status": "partial_success",
-                "message": message + " Возникли ошибки.",
-                "reset_counts": reset_counts,
-                "reset_degraded": reset_degraded,
+                "message": message + " Возникли ошибки при сбросе.",
+                "redis_reset_success": redis_reset_success_count,
+                "db_reset_success": db_reset_success_count,
+                "pool_degraded_reset": pool_degraded_reset_count,
                 "errors": errors
             }
         )
@@ -3955,8 +4079,9 @@ async def reset_accounts_stats(request: Request):
     logger.info(message)
     return {
         "status": "success",
-        "reset_counts": reset_counts,
-        "reset_degraded": reset_degraded,
+        "redis_reset_success": redis_reset_success_count,
+        "db_reset_success": db_reset_success_count,
+        "pool_degraded_reset": pool_degraded_reset_count,
         "message": message
     }
 

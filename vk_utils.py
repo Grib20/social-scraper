@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import os
 import aiohttp
 from typing import List, Dict, Optional, Union, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from user_manager import get_active_accounts, update_account_usage
 import math
 import redis
@@ -474,7 +474,8 @@ class VKClient:
                 
                 if "response" in result and "items" in result["response"]:
                     for post in result["response"]["items"]:
-                        post_date = datetime.fromtimestamp(post["date"])
+                        # Создаем aware datetime в UTC
+                        post_date = datetime.fromtimestamp(post["date"], tz=timezone.utc) 
                         if post_date < cutoff_date:
                             continue
                             
@@ -485,7 +486,7 @@ class VKClient:
                         if not keywords or any(keyword.lower() in post["text"].lower() for keyword in keywords):
                             post_data = {
                                 "id": post["id"],
-                                "date": post_date.isoformat(),
+                                "date": post_date.isoformat(), # Дата теперь в UTC
                                 "views": views,
                                 "text": post["text"],
                                 "group_id": group_id,
@@ -607,7 +608,8 @@ class VKClient:
                 
                 if "response" in result and "items" in result["response"]:
                     for post in result["response"]["items"]:
-                        post_date = datetime.fromtimestamp(post["date"])
+                        # Создаем aware datetime в UTC
+                        post_date = datetime.fromtimestamp(post["date"], tz=timezone.utc) 
                         if post_date < cutoff_date:
                             continue
                             
@@ -617,7 +619,7 @@ class VKClient:
                         
                         post_data = {
                             "id": post["id"],
-                            "date": post_date.isoformat(),
+                            "date": post_date.isoformat(), # Дата теперь в UTC
                             "views": views,
                             "text": post["text"],
                             "group_id": group_id,
