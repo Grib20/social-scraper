@@ -136,9 +136,8 @@ async def update_account_usage_redis(api_key, account_id, platform) -> Optional[
         # Обновляем время последнего использования и устанавливаем TTL
         async with redis_client.pipeline(transaction=False) as pipe: # Можно без транзакции
             pipe.set(last_used_key, current_time)
-            # Обновляем TTL для обоих ключей при каждом запросе на 1 час
-            pipe.expire(count_key, 3600) # 1 час TTL для счетчика
-            pipe.expire(last_used_key, 3600) # 1 час TTL для времени
+            # pipe.expire(count_key, 3600) # 1 час TTL для счетчика (УДАЛЕНО)
+            # pipe.expire(last_used_key, 3600) # 1 час TTL для времени (УДАЛЕНО)
             await pipe.execute()
 
         logger.debug(f"Статистика Redis обновлена для {platform}:{account_id}. Новый счетчик: {new_count}")

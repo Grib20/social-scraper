@@ -14,7 +14,7 @@ services:
       - "${PORT:-3030}:3030"
     volumes:
       # Привязка именованных томов для сохранения данных между перезапусками
-      - telegram_sessions:/app/telegram_sessions # Сессии Telegram
+      - telegram_sessions:/app/sessions # Сессии Telegram (теперь путь совпадает с реальным)
       - media_downloads:/app/media_downloads # Скачанные медиафайлы
       - logs:/app/logs # Логи приложения
       - data:/app/data # Другие данные приложения
