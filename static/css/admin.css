@@ -2149,54 +2149,43 @@ button i {
     color: #F44336;
 }
 
-/* Стили для кнопки исправления токенов */
-.fix-token-btn {
-    background-color: #4a76a8 !important; /* Цвет VK */
-    color: white !important;
-}
-
-.fix-token-btn:hover {
-    background-color: #3a5c88 !important;
-}
-
-/* Style for the new button container */
-.account-header-actions {
-    display: flex;
-    flex-direction: row; /* Ensure horizontal layout */
+/* Стили для кнопок статистики */
+.actions button {
+    min-width: 200px;
+    font-size: 1rem;
+    padding: 10px 24px;
+    border-radius: 6px;
+    margin-right: 12px;
+    margin-bottom: 8px;
+    font-weight: 600;
+    transition: background 0.2s, color 0.2s, box-shadow 0.2s;
+    box-shadow: 0 2px 8px rgba(74, 108, 247, 0.08);
+    border: none;
+    outline: none;
+    display: inline-flex;
     align-items: center;
-    gap: 8px; /* Add gap between buttons */
+    justify-content: center;
 }
 
-.accounts-header h4 {
-    margin: 0;
-    border-bottom: none;
-    padding-bottom: 0;
-    font-size: 1.1rem;
-    color: var(--text-color);
+.refresh-stats-btn, .clean-orphan-keys-btn {
+    background: var(--accent-color);
+    color: #fff;
+}
+.refresh-stats-btn:hover, .clean-orphan-keys-btn:hover {
+    background: var(--accent-hover-color);
+    color: #fff;
 }
 
-.accounts-header h4 i {
-    margin-right: 10px;
-    color: var(--accent-color);
+.reset-stats-btn {
+    background: var(--warning-color);
+    color: #fff;
+}
+.reset-stats-btn:hover {
+    background: var(--error-color);
+    color: #fff;
 }
 
-.accounts-header h4 {
-    margin: 0;
-    border-bottom: none;
-    padding-bottom: 0;
-    font-size: 1.1rem;
-    color: var(--text-color);
-}
-
-.accounts-header h4 i {
-    margin-right: 10px;
-    color: var(--accent-color);
-}
-
-.actions {
-    display: flex;
-    flex-direction: row;
-    gap: 12px;
-    align-items: center;
-    margin-bottom: 20px;
+/* Убираем последний margin у последней кнопки */
+.actions button:last-child {
+    margin-right: 0;
 } 

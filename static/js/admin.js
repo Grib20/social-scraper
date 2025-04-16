@@ -3076,3 +3076,35 @@ async function handleAddVkSubmit(event) {
 
 
 // ... остальной код admin.js ...
+
+// Функция для ручной очистки висячих ключей Redis
+async function cleanOrphanRedisKeys() {
+    if (!confirm('Вы уверены, что хотите очистить висячие ключи статистики в Redis?')) {
+        return;
+    }
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        showNotification('Админ-ключ не найден', 'error', 20000);
+        window.location.href = '/login';
+        return;
+    }
+    try {
+        const response = await fetch('/admin/accounts/clean-orphan-redis-keys', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${adminKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({})
+        });
+        if (!response.ok) {
+            throw new Error(`Ошибка HTTP: ${response.status}`);
+        }
+        const result = await response.json();
+        showNotification(result.message || 'Очистка висячих ключей завершена', 'success', 20000);
+        await displayAccountsStats();
+    } catch (error) {
+        console.error('Ошибка при очистке висячих ключей:', error);
+        showNotification(`Ошибка при очистке висячих ключей: ${error.message}`, 'error', 20000);
+    }
+}

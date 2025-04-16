@@ -10,6 +10,7 @@ import redis.asyncio as aredis
 import asyncio
 import asyncpg # Добавляем для обработки ошибок
 from typing import Optional, Union, Dict, Any, List # Add Optional here if not present, or modify existing import
+import pytz
 
 # Импортируем нужные async функции из user_manager
 # get_db_connection теперь возвращает пул
@@ -126,7 +127,8 @@ async def update_account_usage_redis(api_key, account_id, platform) -> Optional[
     try:
         count_key = f"account:{platform}:{account_id}:requests_count"
         last_used_key = f"account:{platform}:{account_id}:last_used"
-        current_time = datetime.now().isoformat()
+        moscow_tz = pytz.timezone("Europe/Moscow")
+        current_time = datetime.now(moscow_tz).isoformat()
         
         # Увеличиваем счетчик и получаем новое значение за одну операцию INCR
         new_count = await redis_client.incr(count_key)
@@ -193,10 +195,11 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
              except ValueError:
                  logger.warning(f"Не удалось преобразовать last_used '{last_used_str}' из Redis в datetime.")
 
-        if count == 0 and last_used_dt is None and not force:
-            # logger.debug(f"Нет данных в Redis для аккаунта {platform}:{account_id}, синхронизация не требуется")
-            return False # Нет смысла синхронизировать нулевые значения, если не force
-        
+        if count == 0 and last_used_dt is None:
+            if not force:
+                return False
+            # force=True: продолжаем и обнуляем статистику в БД
+
         # Определяем таблицу в зависимости от платформы
         table = 'telegram_accounts' if platform == 'telegram' else 'vk_accounts'
         
@@ -264,88 +267,89 @@ async def sync_account_stats_to_db(account_id, platform, force=False):
         #     await conn.close() 
 
 async def sync_all_accounts_stats():
-    """Асинхронно синхронизирует статистику всех аккаунтов из Redis в БД (PostgreSQL)."""
+    """Асинхронно синхронизирует статистику всех аккаунтов из Redis в БД (PostgreSQL),
+    а также обнуляет статистику в БД для аккаунтов, у которых нет ключей в Redis."""
     redis_client = await get_redis()
     if not redis_client:
         logger.warning("Redis недоступен, полная синхронизация статистики невозможна")
         return False
-    
+
     logger.info("Начало полной синхронизации статистики из Redis в БД...")
     success_count = 0
     error_count = 0
     accounts_processed = set()
     cursor = 0  # Для redis scan
 
-    try:
-        # Используем SCAN для итерации по ключам
-        while True:
-            # logger.debug(f"Выполняем SCAN с курсором {cursor}")
-            cursor, keys = await redis_client.scan(cursor, match='account:*:*:*', count=500)
-            # logger.debug(f"SCAN вернул {len(keys)} ключей. Новый курсор: {cursor}")
+    # --- Получаем все id аккаунтов из БД ---
+    pool = await get_db_connection()
+    async with pool.acquire() as conn:
+        tg_ids = set(row['id'] for row in await conn.fetch('SELECT id FROM telegram_accounts'))
+        vk_ids = set(row['id'] for row in await conn.fetch('SELECT id FROM vk_accounts'))
 
-            sync_tasks = []  # Собираем задачи для асинхронного выполнения
-            keys_in_batch = 0  # Счетчик ключей для логирования
+    # --- Получаем все id аккаунтов, для которых есть ключи в Redis ---
+    redis_tg_ids = set()
+    redis_vk_ids = set()
+    cursor = 0
+    while True:
+        cursor, keys = await redis_client.scan(cursor, match='account:*:*:requests_count', count=500)
+        for key in keys:
+            parts = key.split(':')
+            if len(parts) >= 4:
+                platform = parts[1]
+                account_id = parts[2]
+                if platform == 'telegram':
+                    redis_tg_ids.add(account_id)
+                elif platform == 'vk':
+                    redis_vk_ids.add(account_id)
+        if cursor == 0:
+            break
 
-            for key in keys:
-                keys_in_batch += 1
-                try:
-                    parts = key.split(':')
-                    if len(parts) >= 4 and parts[0] == 'account' and parts[3] in ('requests_count', 'last_used'):
-                        platform = parts[1]
-                        account_id = parts[2]
-                        account_tuple = (account_id, platform)
+    # --- Для аккаунтов, которых нет в Redis, но есть в БД — обнуляем статистику в БД ---
+    for account_id in tg_ids - redis_tg_ids:
+        try:
+            res = await sync_account_stats_to_db(account_id, 'telegram', force=True)
+            if res:
+                success_count += 1
+            else:
+                error_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка при обнулении статистики Telegram аккаунта {account_id}: {e}")
+            error_count += 1
+    for account_id in vk_ids - redis_vk_ids:
+        try:
+            res = await sync_account_stats_to_db(account_id, 'vk', force=True)
+            if res:
+                success_count += 1
+            else:
+                error_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка при обнулении статистики VK аккаунта {account_id}: {e}")
+            error_count += 1
 
-                        # Синхронизируем каждый аккаунт только один раз за весь процесс
-                        if account_tuple not in accounts_processed:
-                            # Добавляем кортеж с данными аккаунта и корутиной в список
-                            sync_tasks.append((account_id, platform, sync_account_stats_to_db(account_id, platform)))
-                            accounts_processed.add(account_tuple)  # Отмечаем как запланированный к обработке
-                        # else: # Отладка
-                            # logger.debug(f"Аккаунт {account_tuple} уже обработан, пропуск.")
+    # --- Для аккаунтов, которые есть в Redis — синхронизируем как обычно ---
+    for account_id in redis_tg_ids:
+        try:
+            res = await sync_account_stats_to_db(account_id, 'telegram')
+            if res:
+                success_count += 1
+            else:
+                error_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка при синхронизации Telegram аккаунта {account_id}: {e}")
+            error_count += 1
+    for account_id in redis_vk_ids:
+        try:
+            res = await sync_account_stats_to_db(account_id, 'vk')
+            if res:
+                success_count += 1
+            else:
+                error_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка при синхронизации VK аккаунта {account_id}: {e}")
+            error_count += 1
 
-                except Exception as e:
-                    logger.error(f"Ошибка обработки ключа '{key}' при массовой синхронизации: {e}")
-                    error_count += 1  # Считаем ошибкой обработки ключа
-
-            # Выполняем собранные задачи синхронизации для текущей пачки ключей
-            if sync_tasks:
-                # Получаем только корутины для gather
-                coroutines = [task[2] for task in sync_tasks]
-                # logger.debug(f"Запуск {len(coroutines)} задач синхронизации для пачки ключей...")
-                results = await asyncio.gather(*coroutines, return_exceptions=True)
-
-                # Итерируем по задачам и результатам вместе
-                for task_info, result in zip(sync_tasks, results):
-                    account_id, platform, _ = task_info # Извлекаем ID и платформу
-                    if isinstance(result, Exception):
-                        # Логируем ошибку с указанием аккаунта и полным трейсбеком
-                        logger.error(f"Ошибка синхронизации для аккаунта {platform}:{account_id}", exc_info=result)
-                        error_count += 1
-                    elif result:  # sync_account_stats_to_db вернул True
-                        success_count += 1
-                    else:  # sync_account_stats_to_db вернул False
-                        # Логируем как предупреждение, если sync_account_stats_to_db вернул False
-                        logger.warning(f"Синхронизация для аккаунта {platform}:{account_id} не удалась (вернула False).")
-                        error_count += 1
-                # logger.debug(f"Задачи синхронизации для пачки завершены.")
-
-            if cursor == 0:
-                # logger.debug("SCAN завершен.")
-                break  # Выход из цикла while True
-
-        logger.info(f"Полная синхронизация завершена. Всего уникальных аккаунтов обработано: {len(accounts_processed)}. "
-                    f"Успешно синхронизировано: {success_count}, Ошибок (включая обработку ключей и синхронизацию): {error_count}")
-        return error_count == 0
-
-    except aredis.RedisError as e:
-        logger.error(f"Ошибка Redis при массовой синхронизации статистики: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка при массовой синхронизации статистики: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-
+    logger.info(f"Полная синхронизация завершена. Успешно: {success_count}, Ошибок: {error_count}")
+    return error_count == 0
 
 async def get_account_stats_redis(account_id, platform):
     """Получает статистику использования аккаунта из Redis."""

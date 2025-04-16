@@ -36,7 +36,7 @@ from telethon.tl.types import InputPeerChannel, InputPeerUser, MessageMediaPhoto
 from telethon.errors import ChannelInvalidError, ChannelPrivateError, UserDeactivatedBanError, AuthKeyError, FloodWaitError, UserNotParticipantError, UsernameNotOccupiedError, UsernameInvalidError
 # Импортируем КЛАСС пула, а не экземпляр
 from client_pools import TelegramClientPool, TELEGRAM_DEGRADED_MODE_DELAY 
-
+import redis_utils
 # Определим перечисление для типов прокси, так как ProxyType недоступен в Telethon
 class ProxyType:
     HTTP = 'http'
@@ -396,12 +396,12 @@ async def _find_channels_with_account(
     # Передаем корректный account_id (UUID) в wrapper
     wrapper = TelegramClientWrapper(client, account_id, api_key)
     # --------------------------------------------------
-
+    redis_client = await redis_utils.get_redis()
     try:
         # <<<--- Проверку подключения/авторизации можно убрать, если пул это гарантирует
         # if not client.is_connected(): ...
         # if not await client.is_user_authorized(): ...
-
+        
         # --- Основной цикл поиска ---
         for keyword in keywords:
             if keyword in processed_keywords:
@@ -409,67 +409,84 @@ async def _find_channels_with_account(
             processed_keywords.add(keyword)
 
             try:
-                logger.debug(f"[Acc: {account_id}] Поиск по слову: '{keyword}'")
-                # <<<--- Используем wrapper._make_request для SearchRequest ---
-                result = await wrapper._make_request( # Заменяем client(...) на wrapper._make_request
-                    functions.contacts.SearchRequest,
-                    q=keyword,
-                    limit=max_channels * 2
-                )
-                # ------------------------------------------------------------
-
-                if result is not None and hasattr(result, 'chats'):
-                    for chat in result.chats:
-                        if isinstance(chat, types.Channel) and getattr(chat, 'megagroup', False) is False:
-                            channel_id = chat.id
-                            if channel_id not in found_channels_dict:
-                                try:
-                                    participants_count = None
-                                    if chat.access_hash is not None:
-                                        try:
-                                            input_channel = types.InputChannel(channel_id=chat.id, access_hash=chat.access_hash)
-                                            # <<<--- Используем wrapper._make_request для GetFullChannelRequest ---
-                                            full_channel = await wrapper._make_request( # Заменяем client(...) на wrapper._make_request
-                                                GetFullChannelRequest,
-                                                channel=input_channel
-                                            )
-                                            # ------------------------------------------------------------------
-                                            if full_channel and hasattr(full_channel, 'full_chat') and full_channel.full_chat:
-                                                participants_count = full_channel.full_chat.participants_count
-                                        except Exception as e_gfc:
-                                            logger.error(f"[Acc: {account_id}] Ошибка GetFullChannelRequest для канала {chat.id}: {e_gfc}")
-                                    else:
-                                        logger.warning(f"[Acc: {account_id}] Канал {chat.id} ('{chat.title}') не имеет access_hash. Пропускаем GetFullChannelRequest.")
-
-                                    if participants_count is not None and participants_count >= min_members:
-                                        username = getattr(chat, 'username', None)
-                                        link = f"https://t.me/{username}" if username else None
-                                        found_channels_dict[channel_id] = {
-                                            'id': channel_id,
-                                            'title': chat.title,
-                                            'username': username,
-                                            'link': link,
-                                            'members_count': participants_count
-                                        }
-                                        logger.debug(f"[Acc: {account_id}] Найден подходящий канал: {chat.title} ({participants_count} участников)")
-                                        if len(found_channels_dict) >= max_channels:
-                                            logger.info(f"[Acc: {account_id}] Достигнут лимит ({max_channels}) найденных каналов по слову '{keyword}'.")
-                                            break
-                                except ChannelPrivateError:
-                                    pass
-                                except Exception as e_full:
-                                    logger.error(f"[Acc: {account_id}] Ошибка при получении полной информации о канале {channel_id} ('{chat.title}'): {e_full}")
-                    if len(found_channels_dict) >= max_channels:
-                         logger.info(f"[Acc: {account_id}] Достигнут общий лимит ({max_channels}) найденных каналов.")
-                         break
-                else:
-                     logger.debug(f"[Acc: {account_id}] Результат поиска по '{keyword}' не содержит 'chats'.")
-
+                cache_key = f"tg_group_search:{keyword.lower()}:{min_members}:{max_channels}"
+                channels_data = None
+                if redis_client:
+                    cached = await redis_client.get(cache_key)
+                    if cached:
+                        logger.info(f"[Acc: {account_id}] Используем кэш для слова '{keyword}'")
+                        try:
+                            channels_data = json.loads(cached)
+                        except Exception as e:
+                            logger.warning(f"[Acc: {account_id}] Ошибка при чтении кэша для '{keyword}': {e}")
+                            channels_data = None
+                if channels_data is None:
+                    logger.debug(f"[Acc: {account_id}] Поиск по слову: '{keyword}' (нет кэша)")
+                    result = await wrapper._make_request(
+                        functions.contacts.SearchRequest,
+                        q=keyword,
+                        limit=max_channels * 2
+                    )
+                    if result is not None and isinstance(result.chats, list):
+                        channels_data = []
+                        for chat in result.chats:
+                            if isinstance(chat, types.Channel) and getattr(chat, 'megagroup', False) is False:
+                                channel_id = chat.id
+                                participants_count = None
+                                access_hash = getattr(chat, 'access_hash', None)
+                                if access_hash is not None:
+                                    try:
+                                        input_channel = types.InputChannel(channel_id=chat.id, access_hash=int(access_hash))
+                                        full_channel = await wrapper._make_request(
+                                            GetFullChannelRequest,
+                                            channel=input_channel
+                                        )
+                                        if full_channel and hasattr(full_channel, 'full_chat') and full_channel.full_chat:
+                                            participants_count = full_channel.full_chat.participants_count
+                                    except Exception as e_gfc:
+                                        logger.error(f"[Acc: {account_id}] Ошибка GetFullChannelRequest для канала {chat.id}: {e_gfc}")
+                                else:
+                                    logger.warning(f"[Acc: {account_id}] Канал {chat.id} ('{chat.title}') не имеет access_hash. Пропускаем GetFullChannelRequest.")
+                                channels_data.append({
+                                    'id': chat.id,
+                                    'title': chat.title,
+                                    'username': getattr(chat, 'username', None),
+                                    'members_count': participants_count
+                                })
+                    if redis_client:
+                        try:
+                            await redis_client.set(cache_key, json.dumps(channels_data), ex=86400)
+                        except Exception as e:
+                            logger.warning(f"[Acc: {account_id}] Не удалось сохранить результат поиска в кэш: {e}")
+                # Теперь работаем с channels_data (список словарей)
+                for chat_data in channels_data or []:
+                    channel_id = chat_data['id']
+                    if channel_id not in found_channels_dict:
+                        try:
+                            if chat_data['members_count'] is not None and chat_data['members_count'] >= min_members:
+                                username = chat_data['username']
+                                link = f"https://t.me/{username}" if username else None
+                                found_channels_dict[channel_id] = {
+                                    'id': channel_id,
+                                    'title': chat_data['title'],
+                                    'username': username,
+                                    'link': link,
+                                    'members_count': chat_data['members_count']
+                                }
+                                logger.debug(f"[Acc: {account_id}] Найден подходящий канал: {chat_data['title']} ({chat_data['members_count']} участников)")
+                                if len(found_channels_dict) >= max_channels:
+                                    logger.info(f"[Acc: {account_id}] Достигнут лимит ({max_channels}) найденных каналов по слову '{keyword}'.")
+                                    break
+                        except Exception as e_full:
+                            logger.error(f"[Acc: {account_id}] Ошибка при обработке канала {channel_id} ('{chat_data['title']}'): {e_full}")
+                if len(found_channels_dict) >= max_channels:
+                    logger.info(f"[Acc: {account_id}] Достигнут общий лимит ({max_channels}) найденных каналов.")
+                    break
             except FloodWaitError as e:
                 logger.warning(f"[Acc: {account_id}] FloodWaitError при поиске по слову '{keyword}': ждем {e.seconds} секунд")
                 await asyncio.sleep(e.seconds + 1)
             except (UsernameNotOccupiedError, UsernameInvalidError):
-                 pass
+                pass
             except Exception as e_search:
                 logger.error(f"[Acc: {account_id}] Ошибка при поиске по слову '{keyword}': {e_search}", exc_info=True)
 
@@ -716,6 +733,7 @@ async def _process_channels_for_trending(
         for channel_id_input in channel_ids:
             channel_processed_posts_count = 0
             peer_identifier = channel_id_input # Initialize for logging in except blocks
+            processed_grouped_ids = set()  # <--- добавляем на уровне канала
             try:
                 logger.info(f"--- [Acc: {account_id}] Начало обработки канала Input ID: {channel_id_input} ---")
 
@@ -896,7 +914,87 @@ async def _process_channels_for_trending(
                         if min_forwards is not None and forwards < min_forwards:
                             logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (форварды {forwards} < min_forwards {min_forwards}).")
                             continue
-
+                        
+                        # --- Дедупликация альбомов ---
+                        if hasattr(post, 'grouped_id') and post.grouped_id:
+                            if post.grouped_id in processed_grouped_ids:
+                                continue  # Уже обработан этот альбом
+                            try:
+                                album_messages = await get_album_messages(wrapper, peer_identifier, post)
+                                album_messages.sort(key=lambda m: m.id)
+                                main_album_msg = album_messages[0]
+                                # Берём первый непустой текст
+                                post_text_found = next((m.message for m in album_messages if m.message), main_album_msg.message or "")
+                                # Собираем все медиа из альбома
+                                media_objects_to_process = [m.media for m in album_messages if m.media]
+                                media_tasks_for_post = {}
+                                processed_media_urls = set()
+                                media_list = []
+                                for media_obj_container in media_objects_to_process:
+                                    media_details_tuple = _extract_media_details(media_obj_container)
+                                    if not media_details_tuple: continue
+                                    media_type, file_id, media_object, file_ext, mime_type, file_size = media_details_tuple
+                                    if media_type in ['poll', 'geo', 'contact', 'venue'] or not file_id or not media_object: continue
+                                    is_placeholder = False
+                                    s3_url_to_add = None
+                                    s3_filename = None
+                                    s3_thumb_filename = None
+                                    s3_filename_to_use = None
+                                    if media_type == 'video' and file_size > MAX_FILE_SIZE:
+                                        is_placeholder = True
+                                        s3_thumb_filename = f"mediaTg/{file_id}_thumb.jpg"
+                                        s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_thumb_filename)
+                                        s3_filename_to_use = s3_thumb_filename
+                                    else:
+                                        s3_filename = f"mediaTg/{file_id}{file_ext}"
+                                        s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_filename)
+                                        s3_filename_to_use = s3_filename
+                                    if s3_url_to_add and s3_url_to_add not in processed_media_urls:
+                                        media_entry = {
+                                            'type': media_type,
+                                            'url': s3_url_to_add,
+                                            'is_placeholder': is_placeholder,
+                                            'mime_type': mime_type
+                                        }
+                                        media_list.append(media_entry)
+                                        processed_media_urls.add(s3_url_to_add)
+                                    if file_id not in media_tasks_for_post:
+                                        media_tasks_for_post[file_id] = {
+                                            "account_id": account_id, 
+                                            "media_object": media_object, 
+                                            "file_id": file_id, 
+                                            "s3_filename": s3_filename_to_use
+                                        }
+                                background_tasks_queue.extend(media_tasks_for_post.values())
+                                raw_engagement_score = (main_album_msg.views or 0) + (reactions * 10) + (comments * 20) + (forwards * 50)
+                                subscribers_for_calc = subscribers if subscribers and subscribers > 0 else 1
+                                log_subs = math.log10(subscribers_for_calc) if subscribers_for_calc > 1 else 1
+                                trend_score = raw_engagement_score / log_subs if log_subs != 0 else raw_engagement_score
+                                post_data = {
+                                    'id': main_album_msg.id,
+                                    'channel_id': str(chat_entity_id_for_data),
+                                    'channel_title': channel_title,
+                                    'channel_username': entity_username,
+                                    'subscribers': subscribers,
+                                    'text': post_text_found,
+                                    'views': main_album_msg.views,
+                                    'reactions': reactions,
+                                    'comments': comments,
+                                    'forwards': forwards,
+                                    'date': main_album_msg.date.isoformat(),
+                                    'url': f"https://t.me/{entity_username}/{main_album_msg.id}" if entity_username else f"https://t.me/c/{abs(chat_entity_id_for_data)}/{main_album_msg.id}",
+                                    'media': media_list,
+                                    'trend_score': int(trend_score)
+                                }
+                                processed_posts_for_these_channels.append(post_data)
+                                processed_in_channel_count += 1
+                                processed_grouped_ids.add(post.grouped_id)
+                                if processed_in_channel_count >= posts_per_channel: break
+                                continue  # После альбома всегда continue!
+                            except Exception as e_album:
+                                logger.error(f"[Acc: {account_id}][Chan: {channel_id_input}] Error fetching album for post {post.id}: {e_album}")
+                                continue
+                        # --- Конец блока дедупликации альбомов ---
                         # --- Если пост прошел все проверки, логируем это --- 
                         # logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} ПРОШЕЛ все фильтры. Добавляем.") # Логируем после проверки текста
                         
@@ -958,6 +1056,7 @@ async def _process_channels_for_trending(
                         # --- Модифицированная обработка медиа --- 
                         media_tasks_for_post = {} # Словарь для уникальных задач загрузки
                         processed_media_urls = set() # Чтобы не добавлять одинаковые URL
+                        media_list = []  # <-- добавляю инициализацию
                         # Инициализируем post_data['media'] как пустой список
                         post_data['media'] = []
 
@@ -975,17 +1074,17 @@ async def _process_channels_for_trending(
                             s3_url_to_add = None
                             s3_filename = None # <<< Инициализируем None
                             s3_thumb_filename = None # <<< Инициализируем None
-                            
+                            s3_filename_to_use = None 
                             # Проверяем размер видео
                             if media_type == 'video' and file_size > MAX_FILE_SIZE:
                                 is_placeholder = True
                                 s3_thumb_filename = f"mediaTg/{file_id}_thumb.jpg"
                                 s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_thumb_filename)
-                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Media {file_id} ({media_type}) - Large file ({file_size} > {MAX_FILE_SIZE}), using placeholder URL: {s3_url_to_add}")
-                            else:
+                                s3_filename_to_use = s3_thumb_filename
+                            elif file_id and file_ext:
                                 s3_filename = f"mediaTg/{file_id}{file_ext}"
                                 s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_filename)
-                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Media {file_id} ({media_type}) - Regular file ({file_size}), using main URL: {s3_url_to_add}")
+                                s3_filename_to_use = s3_filename
 
                             # Добавляем информацию о медиа в структурированном виде, если URL еще не добавлен
                             if s3_url_to_add and s3_url_to_add not in processed_media_urls:
@@ -995,7 +1094,7 @@ async def _process_channels_for_trending(
                                     'is_placeholder': is_placeholder,
                                     'mime_type': mime_type # Добавляем mime_type для информации
                                 }
-                                post_data['media'].append(media_entry)
+                                media_list.append(media_entry)
                                 processed_media_urls.add(s3_url_to_add)
                                 logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Added media entry to post_data: {media_entry}")
                             elif not s3_url_to_add:
@@ -1003,17 +1102,16 @@ async def _process_channels_for_trending(
 
                             # Добавляем задачу на скачивание/загрузку в S3 (если еще нет для этого file_id)
                             # Передаем file_size в задачу (хотя media_utils.py его сам получит)
-                            if file_id not in media_tasks_for_post:
+                            if file_id not in media_tasks_for_post and s3_filename_to_use:
                                 media_tasks_for_post[file_id] = {
                                     "account_id": account_id, 
                                     "media_object": media_object, 
                                     "file_id": file_id, 
-                                    "s3_filename": s3_filename # <<< Убираем file_size и s3_thumb_filename
-                                    # "s3_thumb_filename": s3_thumb_filename if is_placeholder else None, 
-                                    # "file_size": file_size
+                                    "s3_filename": s3_filename_to_use
                                 }
-                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Added background task for file_id {file_id}")
-                                
+                            elif not s3_filename_to_use:
+                                logger.warning(f"[Acc: {account_id}] Не удалось определить имя файла для media {file_id} ({media_type}) — задача не будет добавлена.")
+                        post_data['media'] = media_list        
                         # Добавляем все уникальные задачи для этого поста в общую очередь
                         # Важно: убедитесь, что background_tasks_queue ожидает такой формат словаря!
                         # Возможно, нужно будет скорректировать background_tasks.py/media_utils.py
@@ -1785,24 +1883,52 @@ async def _process_groups_for_period_task(
                     break # Прерываем, так как сообщения идут от новых к старым
                 
                 is_album = message.grouped_id is not None
-                if is_album and message.grouped_id in processed_grouped_ids: continue
-                
-                views = getattr(message, 'views', 0) # Безопасно получаем просмотры
-                if views is not None and views >= min_views:
-                    post_text = ""
-                    if is_album:
-                        processed_grouped_ids.add(message.grouped_id)
-                        try:
-                            # Передаем wrapper в get_album_messages
-                            album_messages = await get_album_messages(wrapper, channel_entity, message)
-                            if album_messages:
-                                album_messages.sort(key=lambda m: m.id)
-                                for album_msg in album_messages:
-                                    if album_msg.text: post_text = album_msg.text; break
-                        except Exception as album_err: logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка get_album_messages: {album_err}")
-                        if not post_text: post_text = message.text or ""
-                    else:
-                        post_text = message.text or ""
+                if is_album:
+                    if message.grouped_id in processed_grouped_ids:
+                        continue
+                    processed_grouped_ids.add(message.grouped_id)
+                    try:
+                        album_messages = await get_album_messages(wrapper, channel_entity, message)
+                        album_messages.sort(key=lambda m: m.id)
+                        main_album_msg = album_messages[0]
+                        post_text = next((m.text for m in album_messages if m.text), main_album_msg.text or "")
+                        channel_id_str = str(channel_entity.id).replace('-100', '')
+                        subscribers = getattr(channel_entity, 'participants_count', None)
+                        if subscribers is None:
+                            subscribers = 10
+                        else:
+                            try:
+                                subscribers = int(subscribers)
+                            except Exception:
+                                subscribers = 10
+                        subscribers_for_calc = max(subscribers, 10)
+                        raw_engagement_score = (main_album_msg.views or 0) + ((sum(r.count for r in main_album_msg.reactions.results) if main_album_msg.reactions and main_album_msg.reactions.results else 0) * 10) + ((main_album_msg.replies.replies if main_album_msg.replies else 0) * 20) + ((main_album_msg.forwards or 0) * 50)
+                        if subscribers_for_calc > 1 and raw_engagement_score > 0:
+                            import math
+                            trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc))
+                        else:
+                            trend_score = 0
+                        post_data = {
+                            "id": main_album_msg.id,
+                            "channel_id": channel_id_str,
+                            "channel_title": channel_title,
+                            "channel_username": getattr(channel_entity, 'username', None),
+                            "text": post_text,
+                            "views": main_album_msg.views,
+                            "reactions": sum(r.count for r in main_album_msg.reactions.results) if main_album_msg.reactions and main_album_msg.reactions.results else 0,
+                            "comments": main_album_msg.replies.replies if main_album_msg.replies else 0,
+                            "forwards": main_album_msg.forwards or 0,
+                            "date": main_album_msg.date.isoformat(),
+                            "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{main_album_msg.id}",
+                            "media": [],
+                            "trend_score": trend_score
+                        }
+                        channel_posts.append(post_data)
+                    except Exception as album_err:
+                        logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка get_album_messages: {album_err}")
+                    continue
+                else:
+                    post_text = message.text or ""
 
                     channel_id_str = str(channel_entity.id).replace('-100', '')
                     # Получаем число подписчиков для расчета trend_score

@@ -84,6 +84,9 @@
         
         <div id="statsTab" class="tab-content">
             <div class="actions">
+                <button onclick="cleanOrphanRedisKeys()" class="reset-stats-btn">
+                    <i class="fas fa-broom"></i> Очистить висячие ключи
+                </button>
                 <button onclick="displayAccountsStats()" class="refresh-stats-btn">
                     <i class="fas fa-sync-alt"></i> Обновить статистику
                 </button>

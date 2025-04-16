@@ -46,6 +46,7 @@ from client_pools import TelegramClientPool, VKClientPool # Импортируе
 from starlette.datastructures import UploadFile
 # Импортируем новый роутер
 from telegram_routes import router as telegram_v1_router 
+from utils import auto_reset_unused_accounts, clean_orphan_redis_keys, auto_clean_orphan_redis_keys
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -301,6 +302,12 @@ async def lifespan(app: FastAPI):
     sync_task = asyncio.create_task(_sync_redis_to_db_task(600))
     logger.info("Фоновая задача очистки неактивных клиентов запущена.")
     
+    auto_reset_task = asyncio.create_task(auto_reset_unused_accounts(interval_seconds=600, inactive_minutes=60))
+    logger.info("Фоновая задача авто-сброса статистики неиспользуемых аккаунтов запущена.")
+    
+    auto_clean_orphan_task = asyncio.create_task(auto_clean_orphan_redis_keys())
+    logger.info("Фоновая задача авто-очистки висячих ключей Redis запущена.")
+
     logger.info("Приложение готово к работе.")
     
     # --- Работа приложения ---
@@ -356,9 +363,28 @@ async def lifespan(app: FastAPI):
         # Аналогично для VK, если нужно
         # if vk_pool and hasattr(vk_pool, 'disconnect_client'):
         #     ...
-
     except Exception as e:
         logger.error(f"Ошибка при отключении клиентов в пулах: {e}", exc_info=True)
+
+    # 5. Отмена фоновой задачи авто-сброса статистики
+    auto_reset_task.cancel()
+    try:
+        await auto_reset_task
+    except asyncio.CancelledError:
+        logger.info("Фоновая задача авто-сброса статистики успешно отменена.")
+    except Exception as e:
+        logger.error(f"Ошибка при ожидании отмены задачи авто-сброса: {e}", exc_info=True)
+
+    # 5. Отмена фоновой задачи авто-очистки висячих ключей
+    auto_clean_orphan_task.cancel()
+    try:
+        await auto_clean_orphan_task
+    except asyncio.CancelledError:
+        logger.info("Фоновая задача авто-очистки висячих ключей успешно отменена.")
+    except Exception as e:
+        logger.error(f"Ошибка при ожидании отмены задачи авто-очистки: {e}", exc_info=True)
+
+    
 
     logger.info("Приложение успешно остановлено.")
 
@@ -5216,7 +5242,21 @@ async def request_telegram_auth_code(request: Request, account_id: str):
 #             await client.disconnect()
 #             logger.info(f"Клиент для верификации кода аккаунта {account_id} отключен.")
 
-
+@app.post("/admin/accounts/clean-orphan-redis-keys")
+async def admin_clean_orphan_redis_keys(request: Request):
+    """
+    Ручной запуск очистки висячих ключей статистики аккаунтов из Redis (только для админов).
+    """
+    admin_key = request.headers.get("X-Admin-Key")
+    if not admin_key:
+        admin_key = request.cookies.get("admin_key")
+    if not admin_key or not await verify_admin_key(admin_key):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    try:
+        await clean_orphan_redis_keys()
+        return {"status": "success", "message": "Очистка висячих ключей завершена"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 # === Эндпоинт для получения списка аккаунтов ===
 @app.get("/api/accounts")
 async def get_accounts(request: Request):
