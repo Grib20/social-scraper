@@ -266,7 +266,19 @@ async def process_single_media_background(account_id: str, media_object, file_id
 
                 # Обычное скачивание (не большое видео)
                 logger.debug(f"BG Download: Начинаем скачивание медиа {file_id} в {local_path}")
-                downloaded_path = await client.download_media(media_object, local_path)
+                try:
+                    downloaded_path = await client.download_media(media_object, local_path)
+                except ConnectionError as ce:
+                    logger.warning(f"BG Download: Потеряно соединение, пробуем переподключиться для {file_id}: {ce}")
+                    try:
+                        await client.connect()
+                        if not await client.is_user_authorized():
+                            logger.error(f"BG Auth Error: Клиент {account_id} не авторизован после переподключения.")
+                            return
+                        downloaded_path = await client.download_media(media_object, local_path)
+                    except Exception as reconnect_err:
+                        logger.error(f"BG Download Error: Не удалось переподключиться и скачать медиа {file_id}: {reconnect_err}")
+                        return
                 # Проверяем, что download_media вернул путь и файл существует
                 if downloaded_path and os.path.exists(downloaded_path):
                     local_path = downloaded_path # Используем путь, возвращенный download_media
@@ -832,6 +844,23 @@ async def process_upload_queue():
                         wait_time = min(flood_e.seconds, 30)  # Ограничиваем время ожидания 30 секундами
                         logger.warning(f"Воркер: FloodWaitError при скачивании {file_id}, ожидание {wait_time} сек., попытка {retry_count}/{max_retries}")
                         await asyncio.sleep(wait_time)
+                    except ConnectionError as ce:
+                        logger.warning(f"Воркер: Потеряно соединение, пробуем переподключиться для {file_id}: {ce}")
+                        try:
+                            await client.connect()
+                            if not await client.is_user_authorized():
+                                logger.error(f"Воркер: Клиент не авторизован после переподключения для {file_id}")
+                                break
+                            await client.download_media(media, local_path)
+                            if os.path.exists(local_path):
+                                file_size = os.path.getsize(local_path)
+                                logger.info(f"Воркер: УСПЕШНО скачан медиафайл {file_id} после переподключения, размер: {file_size} байт")
+                                download_success = True
+                                break
+                        except Exception as reconnect_err:
+                            logger.error(f"Воркер: Не удалось переподключиться и скачать медиа {file_id}: {reconnect_err}")
+                            retry_count += 1
+                            await asyncio.sleep(1 * retry_count)
                     except Exception as e:
                         logger.error(f"Воркер: Ошибка при скачивании {file_id}: {e}")
                         retry_count += 1

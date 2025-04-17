@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Создаем директории для данных и директорию для базы данных
-RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets /app/database /app/media_downloads
+RUN mkdir -p /app/static /app/templates /app/telegram_sessions /app/logs /app/data /app/secrets /app/database /app/media_downloads /app/sessions
 
 # Создаем непривилегированного пользователя
 RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
@@ -55,7 +55,7 @@ COPY . .
 RUN chown -R appuser:appuser /app
 
 # Добавляем явные права на запись для пользователя в нужные директории
-RUN chmod -R u+w /app/media_downloads /app/telegram_sessions /app/logs /app/data
+RUN chmod -R u+w /app/media_downloads /app/telegram_sessions /app/logs /app/data /app/sessions
 
 # Переключаемся на непривилегированного пользователя
 USER appuser
