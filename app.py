@@ -289,6 +289,39 @@ async def lifespan(app: FastAPI):
         logger.error(f"Критическая ошибка при инициализации базы данных: {e}", exc_info=True)
         # Скорее всего, стоит прервать запуск, если БД не инициализирована
         raise RuntimeError(f"Не удалось инициализировать базу данных: {e}") from e
+    
+    users = await get_all_users()
+    total_accounts = 0
+    for user in users:
+        api_key = user.get('api_key')
+        tg_accounts = user.get('telegram_accounts', [])
+        for acc in tg_accounts:
+            acc_id = acc.get('id')
+            if acc_id and acc_id not in telegram_pool.clients:
+                client = await telegram_pool.create_client(acc)
+                if client:
+                    telegram_pool.add_client(acc_id, client)
+                    logger.info(f"Инициализирован клиент Telegram для аккаунта {acc_id} (user_api_key={api_key})")
+                else:
+                    logger.warning(f"Не удалось инициализировать клиент Telegram для аккаунта {acc_id} (user_api_key={api_key})")
+                total_accounts += 1
+    logger.info(f"Инициализация Telegram: обработано {total_accounts} аккаунтов всех пользователей.")
+            
+    total_vk_accounts = 0
+    for user in users:
+        api_key = user.get('api_key')
+        vk_accounts = user.get('vk_accounts', [])
+        for acc in vk_accounts:
+            acc_id = acc.get('id')
+            if acc_id and acc_id not in vk_pool.clients:
+                client = await vk_pool.create_client(acc)
+                if client:
+                    vk_pool.add_client(acc_id, client)
+                    logger.info(f"Инициализирован VK клиент для аккаунта {acc_id} (user_api_key={api_key})")
+                else:
+                    logger.warning(f"Не удалось инициализировать VK клиент для аккаунта {acc_id} (user_api_key={api_key})")
+                total_vk_accounts += 1
+    logger.info(f"Инициализация VK: обработано {total_vk_accounts} аккаунтов всех пользователей.")
 
     # Инициализация Redis (обычно это просто создание клиента, сам коннект по запросу)
     if redis_client:
