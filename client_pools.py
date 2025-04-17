@@ -135,6 +135,7 @@ class VKClientPool(ClientPool):
         self.max_retries = 3
         self.retry_delay = 5  # секунды
         self.current_index = 0
+        self.current_index_per_user = {}  # Индивидуальный индекс для каждого api_key
         # Убираем usage_counts и last_used из локального состояния, так как используем Redis
         # self.usage_counts: Dict[str, int] = {}
         # self.last_used: Dict[str, datetime] = {}
@@ -286,11 +287,13 @@ class VKClientPool(ClientPool):
         if strategy == "round_robin":
             # Сортируем по времени последнего использования (старые сначала)
             target_list.sort(key=lambda acc: account_stats.get(acc['id'], default_stats)['last_used'])
-            if not target_list: return None, "" 
-            if self.current_index >= len(target_list):
-                self.current_index = 0
-            selected_account = target_list[self.current_index]
-            self.current_index += 1
+            if not target_list: return None, ""
+            # --- Индивидуальный индекс для каждого api_key ---
+            idx = self.current_index_per_user.get(api_key, 0)
+            if idx >= len(target_list):
+                idx = 0
+            selected_account = target_list[idx]
+            self.current_index_per_user[api_key] = idx + 1
         elif strategy == "least_used":
             # Сортируем по количеству запросов (меньше сначала), затем по времени (старые сначала)
             target_list.sort(key=lambda acc: (
