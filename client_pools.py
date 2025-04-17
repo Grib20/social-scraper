@@ -689,77 +689,83 @@ class TelegramClientPool(ClientPool):
     
     async def create_client(self, account):
         """Создает нового клиента Telegram."""
-        # Убираем импорт, так как функция теперь здесь
-        # from telegram_utils import create_telegram_client 
-        
+        import os
         api_id = account.get('api_id')
         api_hash = account.get('api_hash')
         session_file = account.get('session_file')
         proxy = account.get('proxy')
         account_id = account.get('id')
-        
-        # === ИСПРАВЛЕНИЕ: Гарантируем передачу строк ===
-        # Используем `or 'значение'`, чтобы None превратился в строку по умолчанию
-        device_model = account.get('device_model') or 'Social Scraper' 
+        device_model = account.get('device_model') or 'Social Scraper'
         system_version = account.get('system_version') or '1.0'
         app_version = account.get('app_version') or '1.0'
         lang_code = account.get('lang_code') or 'en'
         system_lang_code = account.get('system_lang_code') or 'en'
-        # ================================================
-        
         # Проверяем наличие необходимых данных
         if not all([api_id, api_hash, session_file, account_id]):
-            logger.error(f"Невозможно создать клиент Telegram для аккаунта {account_id}: отсутствуют необходимые данные")
+            logger.error(
+                f"Невозможно создать клиент Telegram для аккаунта {account_id}: отсутствуют необходимые данные. "
+                f"api_id={api_id}, api_hash={api_hash}, session_file={session_file}, account_id={account_id}, "
+                f"proxy={proxy}, device_model={device_model}, system_version={system_version}, "
+                f"app_version={app_version}, lang_code={lang_code}, system_lang_code={system_lang_code}"
+            )
+            if session_file and not os.path.exists(session_file):
+                logger.error(f"Файл сессии {session_file} не найден на диске!")
             return None
-            
-        # Преобразуем типы данных для соответствия требуемым параметрам
         try:
-            # Проверяем, что api_id не None перед преобразованием
             if api_id is not None:
-                api_id = int(api_id)  # Преобразуем api_id в int
+                api_id = int(api_id)
             else:
                 logger.error(f"api_id равен None для аккаунта {account_id}")
                 return None
-                
             if not isinstance(api_hash, str):
                 api_hash = str(api_hash)
             if not isinstance(session_file, str):
                 session_file = str(session_file)
         except (ValueError, TypeError) as e:
-            logger.error(f"Ошибка преобразования типов данных для аккаунта {account_id}: {e}")
+            logger.error(
+                f"Ошибка преобразования типов данных для аккаунта {account_id}: {e}. "
+                f"api_id={api_id}, api_hash={api_hash}, session_file={session_file}, account_id={account_id}"
+            )
             return None
-            
         for attempt in range(self.max_retries):
             try:
-                client = await create_telegram_client( # Вызов локальной функции
+                client = await create_telegram_client(
                     session_path=session_file,
                     api_id=api_id,
                     api_hash=api_hash,
                     proxy=proxy,
-                    # === Передача дополнительных полей ===
                     device_model=device_model,
                     system_version=system_version,
                     app_version=app_version,
                     lang_code=lang_code,
                     system_lang_code=system_lang_code
-                    # =======================================
                 )
-                
                 if client:
                     logger.info(f"Успешно создан клиент Telegram для аккаунта {account_id}")
                     return client
-                    
-                logger.warning(f"Попытка {attempt + 1}/{self.max_retries} создания клиента Telegram для аккаунта {account_id} не удалась")
-                
+                logger.warning(
+                    f"Попытка {attempt + 1}/{self.max_retries} создания клиента Telegram для аккаунта {account_id} не удалась (client is None). "
+                    f"session_file={session_file}, proxy={proxy}, api_id={api_id}, api_hash={api_hash}"
+                )
+                if session_file and not os.path.exists(session_file):
+                    logger.error(f"Файл сессии {session_file} не найден на диске!")
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.retry_delay)
-                    
             except Exception as e:
-                logger.error(f"Попытка {attempt + 1}/{self.max_retries} создания клиента Telegram для аккаунта {account_id} не удалась: {e}")
+                logger.error(
+                    f"Попытка {attempt + 1}/{self.max_retries} создания клиента Telegram для аккаунта {account_id} не удалась: {e}. "
+                    f"session_file={session_file}, proxy={proxy}, api_id={api_id}, api_hash={api_hash}"
+                )
+                if session_file and not os.path.exists(session_file):
+                    logger.error(f"Файл сессии {session_file} не найден на диске!")
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.retry_delay)
-                    
-        logger.error(f"Не удалось создать клиент Telegram для аккаунта {account_id} после {self.max_retries} попыток")
+        logger.error(
+            f"Не удалось создать клиент Telegram для аккаунта {account_id} после {self.max_retries} попыток. "
+            f"session_file={session_file}, proxy={proxy}, api_id={api_id}, api_hash={api_hash}"
+        )
+        if session_file and not os.path.exists(session_file):
+            logger.error(f"Файл сессии {session_file} не найден на диске!")
         return None
 
     async def disconnect_client(self, account_id: str):
