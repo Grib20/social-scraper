@@ -812,18 +812,17 @@ async def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
             return [] 
 
         async with pool.acquire() as conn:
-            # Используем $1 для api_key и $2 для is_active=True
             records = await conn.fetch(
                 f"SELECT * FROM {table} WHERE user_api_key = $1 AND is_active = $2",
                 api_key, True 
             )
-            # logger.debug(f"Получено {len(records)} строк из БД.")
             for record in records:
-                accounts.append(dict(record)) # Преобразуем asyncpg.Record в dict
+                accounts.append(dict(record))
+
+        logger.info(f"[get_active_accounts] Получено {len(accounts)} {platform} аккаунтов для {api_key}: {[acc['id'] for acc in accounts]}")
 
         # Расшифровываем токены VK, если нужно
         if platform == 'vk':
-            # logger.debug(f"Расшифровка токенов для {len(accounts)} VK аккаунтов...")
             for acc in accounts:
                 encrypted_token_str = acc.get('token')
                 if encrypted_token_str:
@@ -838,6 +837,12 @@ async def get_active_accounts(api_key: str, platform: str) -> List[Dict]:
                              acc['token'] = None 
                 else:
                     acc['token'] = None
+            # Фильтрация уникальных аккаунтов по id
+            unique_accounts = {}
+            for acc in accounts:
+                unique_accounts[acc['id']] = acc
+            accounts = list(unique_accounts.values())
+            logger.info(f"[get_active_accounts] После фильтрации уникальных VK-аккаунтов: {len(accounts)} ids: {[acc['id'] for acc in accounts]}")
 
         logger.debug(f"Получено {len(accounts)} активных {platform} аккаунтов для {api_key}")
         return accounts 

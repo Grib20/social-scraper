@@ -855,18 +855,14 @@ async def get_vk_posts_in_groups(vk, group_ids, keywords=None, count=10, min_vie
     
     for chunk in group_chunks:
         tasks = []
-        
-        # Создаем задачи для каждой группы в чанке
         for group_id in chunk:
-            async def get_posts_from_group(gid):
+            async def get_posts_from_group(gid=group_id):
                 try:
                     # Приводим ID группы к нужному формату
                     gid_str = str(gid).replace('-', '')
                     owner_id = -int(gid_str)
-                    
                     offset = 0
                     group_posts = []
-                    
                     # Получаем посты порциями
                     while offset < max_posts_per_group:
                         response = await vk._make_request("wall.get", {
@@ -875,48 +871,35 @@ async def get_vk_posts_in_groups(vk, group_ids, keywords=None, count=10, min_vie
                             "offset": offset,
                             "extended": 1
                         })
-                        
                         if not response or "response" not in response:
                             logger.error(f"Ошибка получения постов из группы {gid}")
                             break
-                        
                         posts = response["response"]["items"]
                         logger.info(f"Получено {len(posts)} постов из группы {gid}, offset: {offset}")
-                        
                         if not posts:
                             break
-                        
                         # Фильтруем посты
                         for post in posts:
                             if post["date"] < start_time or post["date"] > now:
                                 continue
-                                
                             views_count = post.get("views", {}).get("count", 0)
                             if views_count < min_views:
                                 continue
-                                
                             if keywords and not any(kw.lower() in post.get("text", "").lower() for kw in keywords):
                                 continue
-                                
                             group_posts.append(post)
-                        
                         offset += 100
                         if len(posts) < 100:
                             break
-                    
                     return group_posts
                 except Exception as e:
                     logger.error(f"Ошибка при получении постов из группы {gid}: {str(e)}")
                     return []
-            
-            tasks.append(get_posts_from_group(group_id))
-        
+            tasks.append(get_posts_from_group())
         # Запускаем задачи параллельно
         results = await asyncio.gather(*tasks)
         for posts in results:
             all_posts.extend(posts)
-        
-        # Делаем паузу между чанками
         await asyncio.sleep(0.333)
     
     # Делаем посты уникальными
