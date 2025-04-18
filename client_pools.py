@@ -189,7 +189,7 @@ class VKClientPool(ClientPool):
         return None
     
     async def get_active_clients(self, api_key):
-        """Получает активные клиенты VK на основе активных аккаунтов."""
+        logger.info(f"[VKClientPool.get_active_clients] Вход для api_key={api_key}. Stacktrace:\n{''.join(traceback.format_stack(limit=5))}")
         from user_manager import get_active_accounts
         active_accounts = await get_active_accounts(api_key, "vk")
         
@@ -204,6 +204,7 @@ class VKClientPool(ClientPool):
         return active_accounts
     
     async def select_next_client(self, api_key: str, strategy: str = "round_robin") -> Tuple[Any, str]:
+        logger.info(f"[VKClientPool.select_next_client] Вход для api_key={api_key}, strategy={strategy}. Stacktrace:\n{''.join(traceback.format_stack(limit=5))}")
         """
         Выбирает следующего клиента VK для использования, учитывая degraded_mode и статистику из Redis.
         """
@@ -676,7 +677,7 @@ class TelegramClientPool(ClientPool):
         self.active_accounts: Dict[str, Dict] = {} # Инициализируем active_accounts (IDs as strings)
 
     async def get_active_clients(self, api_key):
-        """Получает активные клиенты Telegram на основе активных аккаунтов."""
+        logger.info(f"[TelegramClientPool.get_active_clients] Вход для api_key={api_key}. Stacktrace:\n{''.join(traceback.format_stack(limit=5))}")
         from user_manager import get_active_accounts
         active_accounts = await get_active_accounts(api_key, "telegram")
         
