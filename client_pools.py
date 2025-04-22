@@ -1375,6 +1375,56 @@ class TelegramClientPool(ClientPool):
         logger.error(f"Не удалось выбрать РАБОЧИЙ {self.platform} аккаунт для API ключа {api_key} после перебора всех активных.")
         return None, ""
 
+    def start_background_manager(self, interval_seconds: int = 300, keepalive_seconds: int = 600):
+        """
+        Запускает фоновую задачу для управления клиентами Telegram:
+        - Подключает неактивных клиентов
+        - Отключает клиентов, не использовавшихся дольше заданного времени
+        - Делает keepalive для поддержания сессии
+        """
+        if hasattr(self, '_background_manager_task') and self._background_manager_task:
+            # Уже запущено
+            return
+        self._background_manager_task = asyncio.create_task(
+            self.background_client_manager_task(interval_seconds, keepalive_seconds)
+        )
+
+    async def background_client_manager_task(self, interval_seconds: int = 300, keepalive_seconds: int = 600):
+        while True:
+            try:
+                now = datetime.utcnow()
+                for account_id, client in list(self.clients.items()):
+                    # 1. Подключаем неактивных
+                    try:
+                        if not client.is_connected():
+                            await client.connect()
+                            self.connected_clients.add(account_id)
+                            self.last_used[account_id] = now
+                    except Exception as e:
+                        logger.warning(f"[BG Manager] Не удалось подключить клиента {account_id}: {e}")
+                        continue
+                    # 2. Keepalive (ping)
+                    last_used = self.last_used.get(account_id)
+                    if last_used and (now - last_used).total_seconds() > keepalive_seconds:
+                        try:
+                            await client.get_me()
+                            self.last_used[account_id] = now
+                            logger.debug(f"[BG Manager] Keepalive для клиента {account_id}")
+                        except Exception as e:
+                            logger.warning(f"[BG Manager] Ошибка keepalive для клиента {account_id}: {e}")
+                    # 3. Отключаем если не использовался дольше interval_seconds
+                    if last_used and (now - last_used).total_seconds() > interval_seconds:
+                        try:
+                            await client.disconnect()
+                            self.connected_clients.discard(account_id)
+                            logger.info(f"[BG Manager] Отключён клиент {account_id} за неиспользование")
+                        except Exception as e:
+                            logger.warning(f"[BG Manager] Ошибка при отключении клиента {account_id}: {e}")
+                await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+            except Exception as e:
+                logger.error(f"[BG Manager] Критическая ошибка фонового менеджера клиентов: {e}")
+                await asyncio.sleep(60)
+
 async def validate_proxy_connection(proxy: Optional[str]) -> Tuple[bool, str]:
     """
     Валидирует строку прокси и проверяет соединение с сервером Telegram.

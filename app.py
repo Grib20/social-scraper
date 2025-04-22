@@ -341,6 +341,10 @@ async def lifespan(app: FastAPI):
     auto_clean_orphan_task = asyncio.create_task(auto_clean_orphan_redis_keys())
     logger.info("Фоновая задача авто-очистки висячих ключей Redis запущена.")
 
+    # --- Запуск фонового менеджера Telegram-клиентов ---
+    telegram_pool.start_background_manager(interval_seconds=3600, keepalive_seconds=600)
+    logger.info("Фоновый менеджер Telegram-клиентов запущен.")
+
     logger.info("Приложение готово к работе.")
     
     # --- Работа приложения ---
@@ -1201,7 +1205,7 @@ async def get_posts(request: Request, data: dict):
                     if not gid_str.startswith('-'):
                         gid_str = f"-{gid_str}"
                     formatted_group_ids.append(gid_str)
-                
+
                 # Получаем посты напрямую из групп
                 posts = await get_vk_posts_in_groups(
                     vk, 
@@ -2052,6 +2056,7 @@ async def verify_telegram_2fa(request: Request):
                 '''
                 update_result = await conn.execute(update_query, 'active', account_id)
                 
+                # Проверяем, была ли запись обновлена (asyncpg возвращает статус, например 'UPDATE 1')
                 if 'UPDATE 1' not in update_result:
                     # Это маловероятно, так как мы только что нашли запись
                     logger.error(f"Не удалось обновить статус для аккаунта {account_id} после 2FA")
