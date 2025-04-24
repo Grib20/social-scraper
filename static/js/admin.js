@@ -386,6 +386,54 @@ async function displayUsers() {
             
             userCard.appendChild(vkSection);
             
+            // Создаем секцию с аккаунтами Instagram
+            const instagramSection = document.createElement('div');
+            instagramSection.className = 'accounts-section';
+
+            const instagramHeader = document.createElement('div');
+            instagramHeader.className = 'accounts-header';
+
+            const instagramTitle = document.createElement('h4');
+            instagramTitle.innerHTML = `<i class="fab fa-instagram"></i> Instagram аккаунты`;
+
+            const addInstagramButton = document.createElement('button');
+            addInstagramButton.className = 'add-account-btn';
+            addInstagramButton.innerHTML = `<i class="fas fa-plus"></i> Добавить`;
+            addInstagramButton.onclick = () => showInstagramModal(user.id);
+
+            instagramHeader.appendChild(instagramTitle);
+            instagramHeader.appendChild(addInstagramButton);
+
+            const instagramList = document.createElement('div');
+            instagramList.className = 'accounts-list';
+
+            if (user.instagram_accounts && user.instagram_accounts.length > 0) {
+                user.instagram_accounts.forEach(account => {
+                    const instagramItem = createAccountItem(
+                        'instagram',
+                        account.id,
+                        user.id,
+                        account.login,
+                        account.status,
+                        account.is_active,
+                        account.proxy,
+                        account.usage_type,
+                        account.cookies
+                    );
+                    instagramList.appendChild(instagramItem);
+                });
+            } else {
+                instagramList.innerHTML = `
+                    <div class="no-accounts">
+                        <p>Нет добавленных аккаунтов Instagram</p>
+                    </div>
+                `;
+            }
+
+            instagramSection.appendChild(instagramHeader);
+            instagramSection.appendChild(instagramList);
+            userCard.appendChild(instagramSection);
+            
             usersContainer.appendChild(userCard);
         });
     } catch (error) {
@@ -408,8 +456,10 @@ function maskToken(token) {
 }
 
 // Функция создания элемента аккаунта с информацией о прокси
-function createAccountItem(platform, accountId, userId, displayName, status, isActive, proxy = null) {
-    const accountIcon = platform === 'telegram' ? 'fab fa-telegram' : 'fab fa-vk';
+function createAccountItem(platform, accountId, userId, displayName, status, isActive, proxy = null, usageType = null, cookies = null) {
+    let accountIcon = 'fab fa-vk';
+    if (platform === 'telegram') accountIcon = 'fab fa-telegram';
+    else if (platform === 'instagram') accountIcon = 'fab fa-instagram';
     // Используем isActive для определения класса иконки статуса
     const statusClass = isActive ? 'active' : 'inactive'; 
     const statusText = getStatusText(status); // Получаем текст статуса (Активен, Ошибка и т.д.)
@@ -480,36 +530,54 @@ function createAccountItem(platform, accountId, userId, displayName, status, isA
     proxyInfo.appendChild(proxyValue);
     accountDetails.appendChild(proxyInfo);
     
+    // --- Instagram: визуальная метка валидности сессии ---
+    if (platform === 'instagram') {
+        const sessionStatus = document.createElement('span');
+        sessionStatus.className = 'session-status';
+        if (cookies && typeof cookies === 'string' && cookies.endsWith('.json')) {
+            sessionStatus.textContent = `Сессия: ${usageType === 'api' ? 'instagrapi' : (usageType || 'playwright')}`;
+            sessionStatus.style.color = 'green';
+        } else {
+            sessionStatus.textContent = 'Нет валидной сессии';
+            sessionStatus.style.color = 'gray';
+        }
+        accountDetails.appendChild(sessionStatus);
+    }
+    
     accountInfo.appendChild(accountDetails);
     accountItem.appendChild(accountInfo);
     
     // Добавляем кнопки действий
     const accountActions = document.createElement('div');
     accountActions.className = 'account-actions';
+    // Определяем иконку
     
-    // Кнопка Включить/Выключить
+    if (platform === 'telegram') accountIcon = 'fab fa-telegram';
+    else if (platform === 'instagram') accountIcon = 'fab fa-instagram';
+    icon.className = accountIcon;
+
+    // Кнопка Включить/Выключить (toggle) - разрешаем для всех платформ
     const toggleButton = document.createElement('button');
     toggleButton.className = `action-btn toggle-btn ${isActive ? 'active' : 'inactive'}`;
     toggleButton.innerHTML = isActive ? '<i class="fas fa-toggle-on"></i>' : '<i class="fas fa-toggle-off"></i>';
     toggleButton.title = isActive ? 'Выключить' : 'Включить';
     toggleButton.onclick = (event) => {
-        event.stopPropagation(); // Предотвращаем всплытие события
-        // Вызываем toggleAccountStatus БЕЗ третьего аргумента
+        event.stopPropagation();
         toggleAccountStatus(platform, accountId);
     };
     accountActions.appendChild(toggleButton);
 
-    // Кнопка проверки статуса
+    // Кнопка проверки статуса (для всех платформ)
     const checkButton = document.createElement('button');
     checkButton.className = 'action-btn check-btn';
     checkButton.innerHTML = '<i class="fas fa-sync-alt"></i>';
     checkButton.title = 'Проверить статус';
     checkButton.onclick = (event) => {
-        event.stopPropagation(); // Предотвращаем всплытие события
+        event.stopPropagation();
         checkAccountStatus(platform, accountId);
     };
     accountActions.appendChild(checkButton);
-    
+
     // Кнопка проверки прокси (если прокси установлен)
     if (proxy) {
         const checkProxyButton = document.createElement('button');
@@ -517,7 +585,7 @@ function createAccountItem(platform, accountId, userId, displayName, status, isA
         checkProxyButton.innerHTML = '<i class="fas fa-network-wired"></i>';
         checkProxyButton.title = 'Проверить прокси';
         checkProxyButton.onclick = (event) => {
-            event.stopPropagation(); // Предотвращаем всплытие события
+            event.stopPropagation();
             checkProxyValidity(platform, accountId);
         };
         accountActions.appendChild(checkProxyButton);
@@ -543,12 +611,12 @@ function createAccountItem(platform, accountId, userId, displayName, status, isA
     editButton.innerHTML = `<i class="fas fa-edit"></i>`;
     editButton.setAttribute('data-tooltip', 'Редактировать');
     if (platform === 'vk') {
-        editButton.onclick = () => editVkAccount(userId, accountId);
+        editButton.onclick = () => showEditVkForm(accountId, userId);
     } else if (platform === 'telegram') {
-        // Заменяем заглушку на вызов функции редактирования Telegram
-        editButton.onclick = () => openEditTelegramModal(accountId);
+        editButton.onclick = () => showEditTelegramForm(accountId, userId);
+    } else if (platform === 'instagram') {
+        editButton.onclick = () => showEditInstagramForm(accountId);
     } else {
-        // Можно оставить заглушку для других платформ, если они появятся
         editButton.onclick = () => alert(`Редактирование для ${platform} пока недоступно`);
     }
     
@@ -563,6 +631,76 @@ function createAccountItem(platform, accountId, userId, displayName, status, isA
     accountActions.appendChild(deleteButton);
     
     accountItem.appendChild(accountActions);
+    
+    // --- Instagram: Кнопка "Проверить логин" ---
+    if (platform === 'instagram') {
+        // Кнопка через API (instagrapi)
+        const checkApiButton = document.createElement('button');
+        checkApiButton.className = 'action-btn check-login-api-btn';
+        checkApiButton.innerHTML = '<i class="fas fa-key"></i>';
+        checkApiButton.title = 'Проверить логин Instagram через API';
+        checkApiButton.onclick = async (event) => {
+            event.stopPropagation();
+            showNotification('Проверка логина Instagram через API...', 'info');
+            try {
+                const response = await fetch('/api/instagram/accounts/check-login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + getAdminKey()
+                    },
+                    body: JSON.stringify({
+                        account_id: accountId,
+                        method: 'api'
+                    })
+                });
+                const result = await response.json();
+                if (result.success) {
+                    showNotification('API: Логин успешен!', 'success');
+                    displayUsers();
+                } else if (result.need_code) {
+                    showInstagramCodeModal(accountId, result.challenge_context, 'api');
+                } else {
+                    showNotification('API: Ошибка логина: ' + (result.error || result.message || 'Неизвестная ошибка'), 'error');
+                }
+            } catch (error) {
+                showNotification('API: Ошибка при проверке логина: ' + error.message, 'error');
+            }
+        };
+        // Кнопка через Playwright
+        const checkPlaywrightButton = document.createElement('button');
+        checkPlaywrightButton.className = 'action-btn check-login-btn';
+        checkPlaywrightButton.innerHTML = '<i class="fas fa-sign-in-alt"></i>';
+        checkPlaywrightButton.title = 'Проверить логин Instagram через браузер';
+        checkPlaywrightButton.onclick = async (event) => {
+            event.stopPropagation();
+            showNotification('Запуск живого логина Instagram (браузер)...', 'info');
+            try {
+                const response = await fetch('/api/instagram/accounts/login-worker', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + getAdminKey()
+                    },
+                    body: JSON.stringify({
+                        account_id: accountId
+                    })
+                });
+                const result = await response.json();
+                if (!result.success || !result.worker_id) {
+                    showNotification('Ошибка запуска worker: ' + (result.error || 'Неизвестная ошибка'), 'error');
+                    return;
+                }
+                const workerId = result.worker_id;
+                showNotification('Worker запущен, отслеживаем статус...', 'info');
+                showInstagramWorkerProgress(workerId);
+            } catch (error) {
+                showNotification('Ошибка при запуске логина: ' + error.message, 'error');
+            }
+        };
+        accountActions.insertBefore(checkPlaywrightButton, deleteButton);
+        accountActions.insertBefore(checkApiButton, checkPlaywrightButton);
+    }
     
     return accountItem;
 }
@@ -1643,6 +1781,12 @@ function editVkAccount(userId, accountId) {
 
 // Функция для подтверждения удаления аккаунта
 function confirmDeleteAccount(platform, userId, accountId) {
+    if (platform === 'instagram') {
+        if (confirm('Вы уверены, что хотите удалить этот Instagram аккаунт?')) {
+            deleteInstagramAccount(accountId);
+        }
+        return;
+    }
     if (confirm(`Вы уверены, что хотите удалить этот аккаунт ${platform}?`)) {
         deleteAccount(platform, userId, accountId);
     }
@@ -1694,40 +1838,43 @@ async function checkAccountStatus(platform, accountId) {
             window.location.href = '/login';
             return;
         }
-        
         showNotification(`Проверка статуса аккаунта ${platform}...`, 'info', 20000);
-        
-        const response = await fetch(`/api/${platform}/accounts/${accountId}/status`, {
+        let url = '';
+        if (platform === 'telegram') {
+            url = `/api/telegram/accounts/${accountId}/status`;
+        } else if (platform === 'vk') {
+            url = `/api/vk/accounts/${accountId}/status`;
+        } else if (platform === 'instagram') {
+            url = `/api/instagram/accounts/${accountId}/details`;
+        } else {
+            showNotification('Платформа не поддерживается', 'error', 20000);
+            return;
+        }
+        const response = await fetch(url, {
             headers: {
                 'Authorization': `Bearer ${adminKey}`
             }
         });
-        
         const result = await response.json();
-        
         if (response.ok) {
+            let status = result.status || result.is_active;
+            let statusText = getStatusText(status);
             // Обновляем статус на странице
             const accountItem = document.querySelector(`.account-item[data-id="${accountId}"]`);
             if (accountItem) {
                 const statusIndicator = accountItem.querySelector('.status-indicator');
                 if (statusIndicator) {
-                    statusIndicator.className = `status-indicator ${result.status === 'active' ? 'active' : 'inactive'}`;
-                    statusIndicator.setAttribute('data-tooltip', `Статус: ${getStatusText(result.status)}`);
+                    statusIndicator.className = `status-indicator ${result.is_active ? 'active' : 'inactive'}`;
+                    statusIndicator.setAttribute('data-tooltip', `Статус: ${statusText}`);
                 }
-                
-                showNotification(`Статус аккаунта ${platform}: ${getStatusText(result.status)}`, 'success', 20000);
+                showNotification(`Статус аккаунта ${platform}: ${statusText}`, 'success', 20000);
             } else {
-                // Если элемент не найден (маловероятно, но возможно), все равно показываем уведомление
-                showNotification(`Статус аккаунта ${platform} обновлен: ${getStatusText(result.status)}`, 'success', 20000);
+                showNotification(`Статус аккаунта ${platform} обновлен: ${statusText}`, 'success', 20000);
             }
-            
-            // Убираем перезагрузку списка пользователей здесь, чтобы уведомление не пропадало
-            // displayUsers(); 
         } else {
             showNotification(result.detail || `Ошибка при проверке статуса аккаунта ${platform}`, 'error', 20000);
         }
     } catch (error) {
-        console.error(`Ошибка при проверке статуса аккаунта ${platform}:`, error);
         showNotification(`Ошибка при проверке статуса: ${error.message}`, 'error', 20000);
     }
 }
@@ -1758,7 +1905,8 @@ async function displayAccountsStats() {
     try {
         const response = await fetch('/api/admin/accounts/stats/detailed', {
             headers: {
-                'Authorization': `Bearer ${adminKey}` // Используем Bearer токен
+                'Authorization': `Bearer ${adminKey}`, // Используем Bearer токен
+                'Content-Type': 'application/json'
             }
         });
 
@@ -3108,3 +3256,784 @@ async function cleanOrphanRedisKeys() {
         showNotification(`Ошибка при очистке висячих ключей: ${error.message}`, 'error', 20000);
     }
 }
+
+// Обработчик для формы добавления Instagram-аккаунта
+const addInstagramForm = document.getElementById('addInstagramForm');
+if (addInstagramForm) {
+    addInstagramForm.addEventListener('submit', async function(event) {
+        event.preventDefault();
+        const form = event.target;
+        const userId = document.getElementById('instagramUserId').value;
+        const login = document.getElementById('instagram_login').value;
+        const password = document.getElementById('instagram_password').value;
+        const cookies = document.getElementById('instagram_cookies').value;
+        const proxy = document.getElementById('instagram_proxy').value;
+        const adminKey = getAdminKey();
+        if (!adminKey) {
+            showNotification('Админ-ключ не найден', 'error');
+            window.location.href = '/login';
+            return;
+        }
+        if (!userId || !login || !password ) {
+            showNotification('Пожалуйста, заполните все обязательные поля', 'warning');
+            return;
+        }
+        const submitButton = form.querySelector('button[type="submit"]');
+        const originalButtonText = submitButton.innerHTML;
+        submitButton.disabled = true;
+        submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Добавление...';
+        try {
+            const response = await fetch('/api/instagram/accounts', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${adminKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    user_api_key: userId,
+                    login: login,
+                    password: password,
+                    cookies: cookies,
+                    proxy: proxy
+                })
+            });
+            const result = await response.json();
+            if (response.ok) {
+                showNotification(result.message || 'Instagram аккаунт успешно добавлен!', 'success');
+                closeModal('instagramModal');
+                displayUsers();
+            } else {
+                showNotification(result.detail || 'Ошибка при добавлении Instagram аккаунта.', 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка при добавлении Instagram аккаунта:', error);
+            showNotification('Произошла сетевая ошибка при добавлении Instagram аккаунта.', 'error');
+        } finally {
+            submitButton.disabled = false;
+            submitButton.innerHTML = originalButtonText;
+        }
+    });
+}
+
+// --- Добавить функцию для открытия модального окна редактирования Instagram ---
+async function openEditInstagramModal(accountId, userId) {
+    const adminKey = getAdminKey();
+    if (!adminKey) { window.location.href = '/login'; return; }
+    try {
+        const response = await fetch(`/api/instagram/accounts/${accountId}/details`, {
+            headers: { 'Authorization': `Bearer ${adminKey}` }
+        });
+        if (!response.ok) {
+            let errorDetail = `Ошибка HTTP: ${response.status}`;
+            try { const errorData = await response.json(); errorDetail = errorData.detail || errorDetail; } catch (e) {}
+            throw new Error(errorDetail);
+        }
+        const accountData = await response.json();
+        const form = document.getElementById('addInstagramForm');
+        if (!form) return;
+        form.reset();
+        document.getElementById('instagramUserId').value = userId;
+        document.getElementById('instagram_login').value = accountData.login || '';
+        document.getElementById('instagram_password').value = accountData.password || '';
+        document.getElementById('instagram_cookies').value = accountData.cookies || '';
+        document.getElementById('instagram_proxy').value = accountData.proxy || '';
+        // Меняем заголовок и кнопку
+        document.querySelector('#instagramModal h3').innerHTML = '<i class="fab fa-instagram"></i> Редактировать Instagram аккаунт';
+        const submitButton = form.querySelector('button[type="submit"]');
+        submitButton.innerHTML = '<i class="fas fa-save"></i> Сохранить изменения';
+        submitButton.disabled = false;
+        // Сохраняем accountId для режима редактирования
+        form.dataset.editingAccountId = accountId;
+        document.getElementById('instagramModal').style.display = 'block';
+        document.getElementById('instagram_login').focus();
+    } catch (error) {
+        showNotification('Ошибка при загрузке данных Instagram аккаунта: ' + error.message, 'error');
+    }
+}
+// --- Изменить обработчик addInstagramForm для поддержки редактирования ---
+if (addInstagramForm) {
+    addInstagramForm.onsubmit = null;
+    addInstagramForm.addEventListener('submit', async function(event) {
+        event.preventDefault();
+        const userId = document.getElementById('instagramUserId').value;
+        const login = document.getElementById('instagram_login').value;
+        const password = document.getElementById('instagram_password').value;
+        const cookies = document.getElementById('instagram_cookies').value;
+        const proxy = document.getElementById('instagram_proxy').value;
+        const form = event.target;
+        const editingAccountId = form.dataset.editingAccountId;
+        const submitButton = form.querySelector('button[type="submit"]');
+        const originalButtonText = submitButton.innerHTML;
+        submitButton.disabled = true;
+        submitButton.innerHTML = editingAccountId ? '<i class="fas fa-spinner fa-spin"></i> Сохранение...' : '<i class="fas fa-spinner fa-spin"></i> Добавление...';
+        try {
+            let response, result;
+            if (editingAccountId) {
+                response = await fetch(`/api/instagram/accounts/${editingAccountId}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `Bearer ${getAdminKey()}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        login: login,
+                        password: password,
+                        cookies: cookies,
+                        proxy: proxy
+                    })
+                });
+                result = await response.json();
+                if (response.ok) {
+                    showNotification(result.message || 'Изменения успешно сохранены.', 'success');
+                    closeModal('instagramModal');
+                    displayUsers();
+                } else {
+                    showNotification(result.detail || 'Ошибка при сохранении Instagram аккаунта.', 'error');
+                }
+            } else {
+                response = await fetch('/api/instagram/accounts', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${getAdminKey()}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        user_api_key: userId,
+                        login: login,
+                        password: password,
+                        cookies: cookies,
+                        proxy: proxy
+                    })
+                });
+                result = await response.json();
+                if (response.ok) {
+                    showNotification(result.message || 'Instagram аккаунт успешно добавлен!', 'success');
+                    closeModal('instagramModal');
+                    displayUsers();
+                } else {
+                    showNotification(result.detail || 'Ошибка при добавлении Instagram аккаунта.', 'error');
+                }
+            }
+        } catch (error) {
+            showNotification('Произошла сетевая ошибка при сохранении Instagram аккаунта.', 'error');
+        } finally {
+            submitButton.disabled = false;
+            submitButton.innerHTML = editingAccountId ? '<i class="fas fa-save"></i> Сохранить изменения' : '<i class="fas fa-plus-circle"></i> Добавить';
+            // Сбросить режим редактирования только если был editingAccountId
+            if (editingAccountId) {
+                delete form.dataset.editingAccountId;
+                document.querySelector('#instagramModal h3').innerHTML = '<i class="fab fa-instagram"></i> Добавить Instagram аккаунт';
+            }
+        }
+    });
+}
+// --- Изменить confirmDeleteAccount для поддержки Instagram ---
+function confirmDeleteAccount(platform, userId, accountId) {
+    if (platform === 'instagram') {
+        if (confirm('Вы уверены, что хотите удалить этот Instagram аккаунт?')) {
+            deleteInstagramAccount(accountId);
+        }
+        return;
+    }
+    if (confirm(`Вы уверены, что хотите удалить этот аккаунт ${platform}?`)) {
+        deleteAccount(platform, userId, accountId);
+    }
+}
+// --- Добавить функцию удаления Instagram-аккаунта ---
+async function deleteInstagramAccount(accountId) {
+    const adminKey = getAdminKey();
+    if (!adminKey) {
+        showNotification('Админ-ключ не найден', 'error');
+        window.location.href = '/login';
+        return;
+    }
+    try {
+        const response = await fetch(`/api/instagram/accounts/${accountId}`, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${adminKey}`
+            }
+        });
+        const result = await response.json();
+        if (response.ok) {
+            showNotification(result.message || 'Instagram аккаунт успешно удалён', 'success');
+            displayUsers();
+        } else {
+            showNotification(result.detail || 'Ошибка при удалении Instagram аккаунта.', 'error');
+        }
+    } catch (error) {
+        showNotification('Ошибка при удалении Instagram аккаунта: ' + error.message, 'error');
+    }
+}
+
+// --- Модальное окно для ввода challenge/2FA кода Instagram ---
+let instagramChallengeContext = null;
+let instagramChallengeAccountId = null;
+let instagramChallengeMethod = null;
+let instagramPlaywrightRedisKey = null;
+let instagramPlaywrightChallengeType = null;
+
+function showInstagramCodeModal(accountId, challengeContext, method, challengeType = null, redisKey = null) {
+    instagramChallengeContext = challengeContext;
+    instagramChallengeAccountId = accountId;
+    instagramChallengeMethod = method;
+    instagramPlaywrightRedisKey = redisKey;
+    instagramPlaywrightChallengeType = challengeType;
+    let modal = document.getElementById('instagramCodeModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'instagramCodeModal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('instagramCodeModal')">&times;</span>
+                <h3><i class="fab fa-instagram"></i> Введите код подтверждения</h3>
+                <form id="instagramCodeForm">
+                    <div class="form-group">
+                        <label for="instagram_code_input">Код (SMS/email/2FA):</label>
+                        <input type="text" id="instagram_code_input" name="code" required placeholder="Введите код">
+                    </div>
+                    <button type="submit"><i class="fas fa-check"></i> Отправить</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        document.getElementById('instagramCodeForm').addEventListener('submit', handleInstagramCodeSubmit);
+    }
+    modal.style.display = 'block';
+    document.getElementById('instagram_code_input').focus();
+}
+
+async function handleInstagramCodeSubmit(event) {
+    event.preventDefault();
+    const code = document.getElementById('instagram_code_input').value;
+    if (!code) {
+        showNotification('Введите код подтверждения', 'warning');
+        return;
+    }
+    const submitButton = event.target.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Отправка...';
+    try {
+        let response, result;
+        if (instagramChallengeMethod === 'playwright' || instagramPlaywrightRedisKey) {
+            // Playwright challenge
+            response = await fetch('/api/instagram/accounts/submit-playwright-code', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + getAdminKey()
+                },
+                body: JSON.stringify({
+                    account_id: instagramChallengeAccountId,
+                    code: code,
+                    redis_key: instagramPlaywrightRedisKey || (instagramChallengeContext && instagramChallengeContext.redis_key)
+                })
+            });
+            result = await response.json();
+            if (result.success) {
+                showNotification('Логин Instagram завершён (Playwright)!', 'success');
+                closeModal('instagramCodeModal');
+                displayUsers();
+            } else {
+                showNotification('Ошибка логина: ' + (result.error || 'Неизвестная ошибка'), 'error');
+                closeModal('instagramCodeModal');
+            }
+        } else {
+            // instagrapi challenge
+            response = await fetch('/api/instagram/accounts/submit-code', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + getAdminKey()
+                },
+                body: JSON.stringify({
+                    account_id: instagramChallengeAccountId,
+                    code: code,
+                    challenge_context: instagramChallengeContext,
+                    method: instagramChallengeMethod || 'api'
+                })
+            });
+            result = await response.json();
+            if (result.success) {
+                showNotification('Логин Instagram завершён!', 'success');
+                closeModal('instagramCodeModal');
+                displayUsers();
+            } else if (result.need_code) {
+                showNotification('Требуется другой код: ' + (result.message || ''), 'warning');
+                // Оставляем окно открытым для повторного ввода
+            } else {
+                showNotification('Ошибка логина: ' + (result.error || 'Неизвестная ошибка'), 'error');
+                closeModal('instagramCodeModal');
+            }
+        }
+    } catch (error) {
+        showNotification('Ошибка при отправке кода: ' + error.message, 'error');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-check"></i> Отправить';
+    }
+}
+
+// --- Модальное окно для ввода challenge-кода worker'а ---
+function showInstagramWorkerCodeModal(workerId, screenshotUrl = null) {
+    let modal = document.getElementById('instagramCodeModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'instagramCodeModal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('instagramCodeModal')">&times;</span>
+                <h3><i class="fab fa-instagram"></i> Введите код подтверждения</h3>
+                <form id="instagramCodeForm">
+                    <div class="form-group">
+                        <label for="instagram_code_input">Код (SMS/email/2FA):</label>
+                        <input type="text" id="instagram_code_input" name="code" required placeholder="Введите код">
+                    </div>
+                    <div id="igCodeScreenshot"></div>
+                    <button type="submit"><i class="fas fa-check"></i> Отправить</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        document.getElementById('instagramCodeForm').addEventListener('submit', handleInstagramWorkerCodeSubmit);
+    }
+    modal.style.display = 'block';
+    document.getElementById('instagram_code_input').focus();
+    modal.dataset.workerId = workerId;
+    // Показываем скриншот challenge, если есть
+    if (screenshotUrl) {
+        document.getElementById('igCodeScreenshot').innerHTML = `<a href="${screenshotUrl}" target="_blank">Скриншот challenge</a>`;
+    } else {
+        document.getElementById('igCodeScreenshot').innerHTML = '';
+    }
+}
+
+async function handleInstagramWorkerCodeSubmit(event) {
+    event.preventDefault();
+    const code = document.getElementById('instagram_code_input').value;
+    const modal = document.getElementById('instagramCodeModal');
+    const workerId = modal ? modal.dataset.workerId : null;
+    if (!code || !workerId) {
+        showNotification('Введите код и убедитесь, что workerId задан', 'warning');
+        return;
+    }
+    const submitButton = event.target.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Отправка...';
+    try {
+        const response = await fetch('/api/instagram/accounts/submit-worker-code', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + getAdminKey()
+            },
+            body: JSON.stringify({
+                worker_id: workerId,
+                code: code
+            })
+        });
+        const result = await response.json();
+        if (result.success) {
+            showNotification('Код отправлен, продолжаем логин...', 'info');
+            // После отправки кода — polling статуса, блокируем повторную отправку
+            pollInstagramWorkerStatusAfterCode(workerId);
+        } else {
+            showNotification('Ошибка при отправке кода: ' + (result.error || 'Неизвестная ошибка'), 'error');
+            submitButton.disabled = false;
+            submitButton.innerHTML = '<i class="fas fa-check"></i> Отправить';
+        }
+    } catch (error) {
+        showNotification('Ошибка при отправке кода: ' + error.message, 'error');
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-check"></i> Отправить';
+    }
+}
+
+// Новый polling после отправки challenge-кода
+function pollInstagramWorkerStatusAfterCode(workerId) {
+    let polling = true;
+    let pollingInterval = setInterval(async () => {
+        if (!polling) return;
+        try {
+            const statusResp = await fetch(`/api/instagram/accounts/login-status?worker_id=${workerId}`);
+            const status = await statusResp.json();
+            // Если снова ждём код — разрешить повторную отправку
+            if (status.status === 'waiting_code') {
+                polling = false;
+                clearInterval(pollingInterval);
+                // Разблокировать кнопку отправки кода
+                const submitButton = document.querySelector('#instagramCodeModal button[type="submit"]');
+                if (submitButton) {
+                    submitButton.disabled = false;
+                    submitButton.innerHTML = '<i class="fas fa-check"></i> Отправить';
+                }
+                showNotification('Требуется повторный ввод кода', 'warning');
+            }
+            if (status.status === 'success') {
+                showNotification('Логин Instagram успешен!', 'success');
+                polling = false;
+                clearInterval(pollingInterval);
+                closeModal('instagramWorkerProgressModal');
+                closeModal('instagramCodeModal');
+                displayUsers();
+            }
+            if (status.status === 'error' || status.status === 'timeout') {
+                let errorMsg = 'Ошибка логина Instagram: ' + (status.message || 'Неизвестная ошибка');
+                if (status.screenshot) errorMsg += ` <a href="${status.screenshot}" target="_blank">Скриншот</a>`;
+                showNotification(errorMsg, 'error', 20000);
+                polling = false;
+                clearInterval(pollingInterval);
+                closeModal('instagramWorkerProgressModal');
+                closeModal('instagramCodeModal');
+                displayUsers();
+            }
+        } catch (e) {
+            showNotification('Ошибка polling статуса worker: ' + e.message, 'error');
+            polling = false;
+            clearInterval(pollingInterval);
+        }
+    }, 2000);
+}
+
+// --- Показывать прогресс-бар/шаги и статус worker'а ---
+function showInstagramWorkerProgress(workerId) {
+    let progressModal = document.getElementById('instagramWorkerProgressModal');
+    if (!progressModal) {
+        progressModal = document.createElement('div');
+        progressModal.id = 'instagramWorkerProgressModal';
+        progressModal.className = 'modal';
+        progressModal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('instagramWorkerProgressModal')">&times;</span>
+                <h3><i class="fab fa-instagram"></i> Статус авторизации Instagram</h3>
+                <div id="igWorkerProgressSteps"></div>
+                <div id="igWorkerProgressStatus"></div>
+                <div id="igWorkerProgressScreenshot"></div>
+                <div id="igWorkerProgressTime"></div>
+            </div>
+        `;
+        document.body.appendChild(progressModal);
+    }
+    progressModal.style.display = 'block';
+    let lastStatus = null;
+    let polling = true;
+    let pollingInterval = null;
+    function stopPolling() {
+        polling = false;
+        if (pollingInterval) clearInterval(pollingInterval);
+    }
+    pollingInterval = setInterval(async () => {
+        if (!polling) return;
+        try {
+            const statusResp = await fetch(`/api/instagram/accounts/login-status?worker_id=${workerId}`);
+            const status = await statusResp.json();
+            // --- Прогресс-бар/шаги ---
+            const steps = [
+                { key: 'checking_cookies', label: 'Проверка cookies' },
+                { key: 'cookies_invalid', label: 'Cookies невалидны' },
+                { key: 'login_form', label: 'Ожидание формы логина' },
+                { key: 'submitting_login', label: 'Отправка логина/пароля' },
+                { key: 'waiting_code', label: 'Ожидание кода' },
+                { key: 'success', label: 'Успех' },
+                { key: 'error', label: 'Ошибка' },
+                { key: 'timeout', label: 'Таймаут' }
+            ];
+            let currentStepIdx = steps.findIndex(s => s.key === status.status);
+            if (currentStepIdx === -1) currentStepIdx = 0;
+            let stepsHtml = '<div class="ig-steps">';
+            steps.forEach((s, idx) => {
+                stepsHtml += `<span class="ig-step${idx <= currentStepIdx ? ' active' : ''}${idx === currentStepIdx ? ' current' : ''}">${s.label}</span>`;
+                if (idx < steps.length - 1) stepsHtml += '<span class="ig-step-arrow">→</span>';
+            });
+            stepsHtml += '</div>';
+            document.getElementById('igWorkerProgressSteps').innerHTML = stepsHtml;
+            // --- Статус и сообщение ---
+            let statusHtml = `<div class="ig-status"><b>Статус:</b> ${status.status || ''}<br><b>Сообщение:</b> ${status.message || ''}</div>`;
+            document.getElementById('igWorkerProgressStatus').innerHTML = statusHtml;
+            // --- Время ---
+            document.getElementById('igWorkerProgressTime').innerHTML = status.ts ? `<div class="ig-status-time">Обновлено: ${status.ts}</div>` : '';
+            // --- Скриншот ---
+            if (status.screenshot) {
+                document.getElementById('igWorkerProgressScreenshot').innerHTML = `<div class="ig-status-screenshot"><a href="${status.screenshot}" target="_blank">Скриншот</a></div>`;
+            } else {
+                document.getElementById('igWorkerProgressScreenshot').innerHTML = '';
+            }
+            // --- Окно для кода ---
+            if (status.status === 'waiting_code') {
+                stopPolling();
+                showInstagramWorkerCodeModal(workerId, status.screenshot);
+            }
+            if (status.status === 'success') {
+                showNotification('Логин Instagram успешен!', 'success');
+                stopPolling();
+                closeModal('instagramWorkerProgressModal');
+                closeModal('instagramCodeModal');
+                displayUsers();
+            }
+            if (status.status === 'error' || status.status === 'timeout') {
+                let errorMsg = 'Ошибка логина Instagram: ' + (status.message || 'Неизвестная ошибка');
+                if (status.screenshot) errorMsg += ` <a href="${status.screenshot}" target="_blank">Скриншот</a>`;
+                showNotification(errorMsg, 'error', 20000);
+                stopPolling();
+                closeModal('instagramWorkerProgressModal');
+                closeModal('instagramCodeModal');
+                displayUsers();
+            }
+        } catch (e) {
+            showNotification('Ошибка polling статуса worker: ' + e.message, 'error');
+            stopPolling();
+        }
+    }, 2000);
+}
+
+// ... existing code ...
+// --- ОТДЕЛЬНАЯ ФОРМА ДЛЯ РЕДАКТИРОВАНИЯ INSTAGRAM ---
+function showEditInstagramForm(accountId) {
+    // Создаём модальное окно, если его нет
+    let modal = document.getElementById('editInstagramModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'editInstagramModal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('editInstagramModal')">&times;</span>
+                <h3><i class="fab fa-instagram"></i> Редактировать Instagram аккаунт</h3>
+                <form id="editInstagramForm">
+                    <div class="form-group">
+                        <label for="edit_instagram_login">Логин:</label>
+                        <input type="text" id="edit_instagram_login" name="login" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit_instagram_password">Пароль:</label>
+                        <input type="password" id="edit_instagram_password" name="password" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit_instagram_cookies">Cookies:</label>
+                        <input type="text" id="edit_instagram_cookies" name="cookies" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit_instagram_proxy">Прокси:</label>
+                        <input type="text" id="edit_instagram_proxy" name="proxy" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <button type="submit"><i class="fas fa-save"></i> Сохранить изменения</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        document.getElementById('editInstagramForm').addEventListener('submit', handleEditInstagramSubmit);
+    }
+    // Очищаем поля
+    document.getElementById('edit_instagram_login').value = '';
+    document.getElementById('edit_instagram_password').value = '';
+    document.getElementById('edit_instagram_cookies').value = '';
+    document.getElementById('edit_instagram_proxy').value = '';
+    // Сохраняем accountId для отправки
+    document.getElementById('editInstagramForm').dataset.editingAccountId = accountId;
+    modal.style.display = 'block';
+    document.getElementById('edit_instagram_login').focus();
+}
+
+async function handleEditInstagramSubmit(event) {
+    event.preventDefault();
+    const form = event.target;
+    const accountId = form.dataset.editingAccountId;
+    const login = document.getElementById('edit_instagram_login').value;
+    const password = document.getElementById('edit_instagram_password').value;
+    const cookies = document.getElementById('edit_instagram_cookies').value;
+    const proxy = document.getElementById('edit_instagram_proxy').value;
+    const submitButton = form.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Сохранение...';
+    // Формируем только заполненные поля
+    const data = {};
+    if (login) data.login = login;
+    if (password) data.password = password;
+    if (cookies) data.cookies = cookies;
+    if (proxy) data.proxy = proxy;
+    try {
+        const response = await fetch(`/api/instagram/accounts/${accountId}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${getAdminKey()}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        });
+        const result = await response.json();
+        if (response.ok) {
+            showNotification(result.message || 'Изменения успешно сохранены.', 'success');
+            closeModal('editInstagramModal');
+            displayUsers();
+        } else {
+            showNotification(result.detail || 'Ошибка при сохранении Instagram аккаунта.', 'error');
+        }
+    } catch (error) {
+        showNotification('Произошла сетевая ошибка при сохранении Instagram аккаунта.', 'error');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-save"></i> Сохранить изменения';
+    }
+}
+// ... existing code ...
+
+// --- ОТДЕЛЬНАЯ ФОРМА ДЛЯ РЕДАКТИРОВАНИЯ VK ---
+function showEditVkForm(accountId, userId) {
+    let modal = document.getElementById('editVkModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'editVkModal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('editVkModal')">&times;</span>
+                <h3><i class="fab fa-vk"></i> Редактировать VK аккаунт</h3>
+                <form id="editVkForm">
+                    <div class="form-group">
+                        <label for="edit_vk_token">Токен:</label>
+                        <input type="text" id="edit_vk_token" name="token" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit_vk_proxy">Прокси:</label>
+                        <input type="text" id="edit_vk_proxy" name="proxy" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit_vk_status">Статус:</label>
+                        <input type="text" id="edit_vk_status" name="status" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <button type="submit"><i class="fas fa-save"></i> Сохранить изменения</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        document.getElementById('editVkForm').addEventListener('submit', handleEditVkSubmit);
+    }
+    document.getElementById('edit_vk_token').value = '';
+    document.getElementById('edit_vk_proxy').value = '';
+    document.getElementById('edit_vk_status').value = '';
+    document.getElementById('editVkForm').dataset.editingAccountId = accountId;
+    document.getElementById('editVkForm').dataset.userId = userId;
+    modal.style.display = 'block';
+    document.getElementById('edit_vk_token').focus();
+}
+
+async function handleEditVkSubmit(event) {
+    event.preventDefault();
+    const form = event.target;
+    const accountId = form.dataset.editingAccountId;
+    const userId = form.dataset.userId;
+    const token = document.getElementById('edit_vk_token').value;
+    const proxy = document.getElementById('edit_vk_proxy').value;
+    const status = document.getElementById('edit_vk_status').value;
+    const submitButton = form.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Сохранение...';
+    const data = {};
+    if (token) data.token = token;
+    if (proxy) data.proxy = proxy;
+    if (status) data.status = status;
+    try {
+        const response = await fetch(`/api/vk/accounts/${accountId}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${getAdminKey()}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        });
+        const result = await response.json();
+        if (response.ok) {
+            showNotification(result.message || 'Изменения успешно сохранены.', 'success');
+            closeModal('editVkModal');
+            displayUsers();
+        } else {
+            showNotification(result.detail || 'Ошибка при сохранении VK аккаунта.', 'error');
+        }
+    } catch (error) {
+        showNotification('Произошла сетевая ошибка при сохранении VK аккаунта.', 'error');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-save"></i> Сохранить изменения';
+    }
+}
+
+// --- ОТДЕЛЬНАЯ ФОРМА ДЛЯ РЕДАКТИРОВАНИЯ TELEGRAM ---
+function showEditTelegramForm(accountId, userId) {
+    let modal = document.getElementById('editTelegramModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'editTelegramModal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('editTelegramModal')">&times;</span>
+                <h3><i class="fab fa-telegram"></i> Редактировать Telegram аккаунт</h3>
+                <form id="editTelegramForm">
+                    <div class="form-group">
+                        <label for="edit_telegram_proxy">Прокси:</label>
+                        <input type="text" id="edit_telegram_proxy" name="proxy" placeholder="Оставьте пустым, чтобы не менять">
+                    </div>
+                    <button type="submit"><i class="fas fa-save"></i> Сохранить изменения</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        document.getElementById('editTelegramForm').addEventListener('submit', handleEditTelegramSubmit);
+    }
+    document.getElementById('edit_telegram_proxy').value = '';
+    document.getElementById('editTelegramForm').dataset.editingAccountId = accountId;
+    document.getElementById('editTelegramForm').dataset.userId = userId;
+    modal.style.display = 'block';
+    document.getElementById('edit_telegram_proxy').focus();
+}
+
+async function handleEditTelegramSubmit(event) {
+    event.preventDefault();
+    const form = event.target;
+    const accountId = form.dataset.editingAccountId;
+    const userId = form.dataset.userId;
+    const proxy = document.getElementById('edit_telegram_proxy').value;
+    const submitButton = form.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Сохранение...';
+    const data = {};
+    if (proxy) data.proxy = proxy;
+    try {
+        const response = await fetch(`/api/telegram/accounts/${accountId}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${getAdminKey()}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        });
+        const result = await response.json();
+        if (response.ok) {
+            showNotification(result.message || 'Изменения успешно сохранены.', 'success');
+            closeModal('editTelegramModal');
+            displayUsers();
+        } else {
+            showNotification(result.detail || 'Ошибка при сохранении Telegram аккаунта.', 'error');
+        }
+    } catch (error) {
+        showNotification('Произошла сетевая ошибка при сохранении Telegram аккаунта.', 'error');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-save"></i> Сохранить изменения';
+    }
+}
+
+// --- КНОПКИ ---
+// ... existing code ...
+    if (platform === 'vk') {
+        editButton.onclick = () => showEditVkForm(accountId, userId);
+    } else if (platform === 'telegram') {
+        editButton.onclick = () => showEditTelegramForm(accountId, userId);
+    } else if (platform === 'instagram') {
+        editButton.onclick = () => showEditInstagramForm(accountId);
+    } else {
+        editButton.onclick = () => alert(`Редактирование для ${platform} пока недоступно`);
+    }
+// ... existing code ...

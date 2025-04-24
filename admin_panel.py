@@ -220,6 +220,10 @@ async def get_all_users() -> List[Dict]:
                         logger.error(f"Ошибка расшифровки vk_token пользователя {api_key} в get_all_users: {e}")
                         user_dict['vk_token'] = None  # Устанавливаем None при ошибке
                 
+                # Получаем Instagram аккаунты
+                insta_records = await conn.fetch('SELECT * FROM instagram_accounts WHERE user_api_key = $1', api_key)
+                user_dict['instagram_accounts'] = [dict(acc) for acc in insta_records]
+                
                 users.append(user_dict)
         return users
     except PostgresError as e:  # Используем PostgresError

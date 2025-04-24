@@ -235,6 +235,34 @@
         </div>
     </div>
     <!-- === Конец нового модального окна === -->
+
+    <!-- Модальное окно для добавления Instagram аккаунта -->
+    <div id="instagramModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('instagramModal')">&times;</span>
+            <h3><i class="fab fa-instagram"></i> Добавить Instagram аккаунт</h3>
+            <form id="addInstagramForm">
+                <input type="hidden" id="instagramUserId" name="userId">
+                <div class="form-group">
+                    <label for="instagram_login"><i class="fab fa-instagram"></i> Логин:</label>
+                    <input type="text" id="instagram_login" name="login" required placeholder="Логин Instagram">
+                </div>
+                <div class="form-group">
+                    <label for="instagram_password"><i class="fas fa-lock"></i> Пароль:</label>
+                    <input type="password" id="instagram_password" name="password" required placeholder="Пароль Instagram">
+                </div>
+                <div class="form-group">
+                    <label for="instagram_cookies"><i class="fas fa-cookie"></i> Cookies:</label>
+                    <input type="text" id="instagram_cookies" name="cookies" placeholder="Cookies Instagram">
+                </div>
+                <div class="form-group">
+                    <label for="instagram_proxy"><i class="fas fa-network-wired"></i> Прокси (опционально):</label>
+                    <input type="text" id="instagram_proxy" name="proxy" placeholder="socks5://user:pass@host:port">
+                </div>
+                <button type="submit"><i class="fas fa-plus-circle"></i> Добавить</button>
+            </form>
+        </div>
+    </div>
 {% endblock %}
 
 {% block scripts %}
@@ -418,6 +446,17 @@
             if (twoFAPassword) {
                 twoFAPassword.value = '';
             }
+        }
+
+        function showInstagramModal(userId) {
+            currentUser = userId;
+            const form = document.getElementById('addInstagramForm');
+            if (form) {
+                form.reset();
+                document.getElementById('instagramUserId').value = userId;
+            }
+            document.getElementById('instagramModal').style.display = 'block';
+            document.getElementById('instagram_login').focus();
         }
     </script>
 {% endblock %} 

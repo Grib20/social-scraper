@@ -359,4 +359,41 @@ http://localhost:3030/admin
 
 ### Структура проекта
 
+## Node.js tools (Puppeteer + browserless)
+
+В проекте есть папка `js_tools` для вспомогательных Node.js-скриптов, которые позволяют работать с browserless и авторизованными прокси через Puppeteer.
+
+### Быстрый старт:
+
+1. Перейдите в папку js_tools:
+   ```sh
+   cd js_tools
+   ```
+2. Инициализируйте npm и установите зависимости:
+   ```sh
+   npm init -y
+   npm install puppeteer-core
+   ```
+3. Запустите скрипт для проверки прокси:
+   ```sh
+   node puppeteer_proxy_test.js
+   ```
+
+### Интеграция с Python
+
+Вы можете вызывать Node.js-скрипты из Python через subprocess:
+
+```python
+import subprocess
+
+result = subprocess.run(
+    ["node", "js_tools/puppeteer_proxy_test.js"],
+    capture_output=True,
+    text=True
+)
+print(result.stdout)
 ```
+
+### Важно
+- Все зависимости Node.js устанавливаются только в папке js_tools.
+- Не коммитьте папку js_tools/node_modules в git (она уже в .gitignore).

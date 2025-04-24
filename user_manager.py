@@ -160,6 +160,25 @@ async def init_db(conn: asyncpg.Connection):
         last_used TIMESTAMPTZ
     )''')
     logger.info("Таблица 'vk_accounts' проверена/создана.")
+
+    await conn.execute('''
+    CREATE TABLE IF NOT EXISTS instagram_accounts (
+        id VARCHAR(36) PRIMARY KEY,
+        user_api_key VARCHAR(36) REFERENCES users(api_key) ON DELETE CASCADE,
+        login TEXT,
+        password TEXT,
+        cookies TEXT,
+        proxy TEXT,
+        status TEXT,
+        is_active BOOLEAN DEFAULT TRUE,
+        added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        last_checked TIMESTAMPTZ,
+        last_error TEXT,
+        requests_count INTEGER DEFAULT 0,
+        last_request_time DOUBLE PRECISION,
+        request_limit INTEGER DEFAULT 1000
+    )''')
+    logger.info("Таблица 'instagram_accounts' проверена/создана.");
     # --- Конец создания таблиц ---
 
     # --- Добавление столбцов (с использованием PostgreSQL) ---
@@ -183,6 +202,7 @@ async def init_db(conn: asyncpg.Connection):
     await check_and_add_column(conn, "vk_accounts", "is_active", "BOOLEAN DEFAULT TRUE")
     await check_and_add_column(conn, "vk_accounts", "request_limit", "INTEGER DEFAULT 1000")
     await check_and_add_column(conn, "vk_accounts", "last_used", "TIMESTAMPTZ")
+    await check_and_add_column(conn, "instagram_accounts", "usage_type", "TEXT DEFAULT 'api'")
     logger.debug("Проверка столбцов завершена.")
     # --- Конец добавления столбцов ---
 
@@ -190,7 +210,7 @@ async def init_db(conn: asyncpg.Connection):
 
     # --- Проверка структуры таблиц (опционально, для логов) ---
     logger.debug("Проверка структуры таблиц...")
-    for table in ['users', 'telegram_accounts', 'vk_accounts']:
+    for table in ['users', 'telegram_accounts', 'vk_accounts', 'instagram_accounts']:
         try:
             # Запрос к information_schema для PostgreSQL
             columns = await conn.fetch(f"""

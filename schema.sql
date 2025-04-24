@@ -56,6 +56,25 @@ CREATE TABLE IF NOT EXISTS vk_accounts (
     last_used TIMESTAMPTZ
 );
 
+-- Таблица аккаунтов Instagram
+CREATE TABLE IF NOT EXISTS instagram_accounts (
+    id VARCHAR(36) PRIMARY KEY,
+    user_api_key VARCHAR(36) REFERENCES users(api_key) ON DELETE CASCADE,
+    login TEXT,
+    password TEXT,
+    cookies TEXT,
+    proxy TEXT,
+    status TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    last_checked TIMESTAMPTZ,
+    last_error TEXT,
+    requests_count INTEGER DEFAULT 0,
+    last_request_time DOUBLE PRECISION,
+    request_limit INTEGER DEFAULT 1000,
+    usage_type TEXT DEFAULT 'api' -- Новое поле: playwright, api, both
+);
+
 -- Можно добавить индексы для часто используемых полей, например:
 -- CREATE INDEX IF NOT EXISTS idx_telegram_accounts_user_api_key ON telegram_accounts (user_api_key);
 -- CREATE INDEX IF NOT EXISTS idx_vk_accounts_user_api_key ON vk_accounts (user_api_key);

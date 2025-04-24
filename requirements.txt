@@ -20,3 +20,4 @@ apscheduler>=3.10.0
 aiohttp-socks>=0.8.0
 asyncpg
 pytz
+playwright>=1.42.0  # Для работы с Instagram через браузер

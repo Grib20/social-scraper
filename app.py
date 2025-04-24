@@ -47,6 +47,7 @@ from starlette.datastructures import UploadFile
 # Импортируем новый роутер
 from telegram_routes import router as telegram_v1_router 
 from utils import auto_reset_unused_accounts, clean_orphan_redis_keys, auto_clean_orphan_redis_keys
+from instagram_routes import instagram_router
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -457,6 +458,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # === Подключение роутеров ===
 app.include_router(telegram_v1_router) # Подключаем роутер для Telegram V1
 # Добавьте сюда другие роутеры, если они будут
+app.include_router(instagram_router)
 
 # Маршрут для главной страницы
 @app.get("/")
@@ -641,8 +643,12 @@ async def update_vk_account_endpoint(request: Request, account_id: str):
             logger.error("Неверный формат токена VK, должен начинаться с vk1.a.")
             raise HTTPException(400, "Неверный формат токена VK, должен начинаться с vk1.a.")
         
+        # Оставляем только непустые поля
+        filtered_data = {k: v for k, v in account_data.items() if v not in [None, ""]}
+        if not filtered_data:
+            raise HTTPException(400, "Нет данных для обновления")
         # Обновляем аккаунт через admin_panel
-        await admin_update_vk_account(user_id, account_id, account_data)
+        await admin_update_vk_account(user_id, account_id, filtered_data)
         logger.info(f"VK аккаунт {account_id} успешно обновлен")
         
         return {
@@ -691,12 +697,24 @@ class TelegramAccountInfo(BaseModel):
     is_active: bool = False
     added_at: Any | None = None
 
+class InstagramAccountInfo(BaseModel):
+    id: str
+    user_api_key: str
+    login: str | None = None
+    proxy: str | None = None
+    status: str = 'unknown'
+    is_active: bool = False
+    added_at: Any | None = None
+    usage_type: str = "api"
+    cookies: str | None = None
+
 class UserInfo(BaseModel):
     id: str # Это будет api_key пользователя
     username: str
     api_key: str | None = None # Можно дублировать или убрать, если id достаточно
     vk_accounts: List[VKAccountInfo] = []
     telegram_accounts: List[TelegramAccountInfo] = []
+    instagram_accounts: List[InstagramAccountInfo] = []
 
 # Эндпоинт для получения списка пользователей с их аккаунтами
 # Эндпоинт для получения списка пользователей с их аккаунтами
@@ -736,7 +754,8 @@ async def get_users_with_accounts(request: Request):
                     "username": record['username'],
                     "api_key": api_key, # Дублируем для поля api_key в UserInfo
                     "vk_accounts": [],
-                    "telegram_accounts": []
+                    "telegram_accounts": [],
+                    "instagram_accounts": []
                 }
                 
             if not api_keys_list: 
@@ -793,6 +812,30 @@ async def get_users_with_accounts(request: Request):
                         "added_at": record['added_at'],
                         "api_id": None, # Не передаем на фронт
                         "api_hash": None # Не передаем на фронт
+                    })
+                
+            # 4. Получаем все Instagram аккаунты для этих пользователей
+            insta_query = """
+                SELECT id, user_api_key, login, cookies, proxy, status, is_active, added_at, usage_type
+                FROM instagram_accounts
+                WHERE user_api_key = ANY($1::text[])
+                ORDER BY added_at DESC
+            """
+            insta_records = await conn.fetch(insta_query, api_keys_list)
+
+            for record in insta_records:
+                user_api_key = record['user_api_key']
+                if user_api_key in users_data:
+                    users_data[user_api_key].setdefault("instagram_accounts", []).append({
+                        "id": str(record['id']),
+                        "user_api_key": user_api_key,
+                        "login": record['login'],
+                        "proxy": record['proxy'],
+                        "status": record['status'],
+                        "is_active": record['is_active'],
+                        "added_at": record['added_at'],
+                        "usage_type": record['usage_type'],
+                        "cookies": record['cookies']
                     })
 
         # Преобразуем словарь users_data в список объектов UserInfo
@@ -2176,13 +2219,14 @@ async def update_telegram_account(account_id: str, request: Request):
     # 2. Получить данные из тела запроса
     try:
         data = await request.json()
-        new_proxy = data.get('proxy')  # Может быть None или пустой строкой
+        new_proxy = data.get('proxy')
+        if new_proxy in [None, ""]:
+            raise HTTPException(status_code=400, detail="Нет данных для обновления")
         # Валидация прокси, если нужно
-        if new_proxy:
-            from client_pools import validate_proxy
-            is_valid, _ = validate_proxy(new_proxy)
-            if not is_valid:
-                raise HTTPException(status_code=400, detail="Неверный формат прокси")
+        from client_pools import validate_proxy
+        is_valid, _ = validate_proxy(new_proxy)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail="Неверный формат прокси")
                  
     except json.JSONDecodeError:
         logger.error(f"Ошибка декодирования JSON при обновлении прокси TG {account_id}")
@@ -3175,6 +3219,21 @@ async def toggle_account_status(request: Request, data: dict):
                     if count == 0:
                         logger.warning(f"Telegram аккаунт с ID {account_id} не найден")
                         raise HTTPException(status_code=404, detail=f"Telegram аккаунт с ID {account_id} не найден")
+                    
+                elif platform.lower() == 'instagram':
+                    update_query = "UPDATE instagram_accounts SET is_active = $1 WHERE id = $2"
+                    await conn.execute(update_query, bool(active), account_id)
+                 
+                    # Также обновляем статус, чтобы он соответствовал активности
+                    status_query = "UPDATE instagram_accounts SET status = $1 WHERE id = $2"
+                    await conn.execute(status_query, 'active' if active else 'inactive', account_id)
+                 
+                    # Проверяем, была ли запись обновлена
+                    check_query = "SELECT COUNT(*) FROM instagram_accounts WHERE id = $1"
+                    count = await conn.fetchval(check_query, account_id)
+                    if count == 0:
+                        logger.warning(f"Instagram аккаунт с ID {account_id} не найден")
+                        raise HTTPException(status_code=404, detail=f"Instagram аккаунт с ID {account_id} не найден")
                 else:
                     raise HTTPException(status_code=400, detail="Неизвестная платформа")
                 
@@ -4597,6 +4656,9 @@ async def check_proxy_endpoint(request: Request):
 
 @app.post("/api/v2/check-proxy")
 async def check_proxy_endpoint_v2(request: Request):
+    import ssl
+    import logging
+    logger = logging.getLogger("proxy_check")
     """Новая версия проверки валидности и работоспособности прокси для указанной платформы."""
     auth_header = request.headers.get('authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
@@ -4614,33 +4676,44 @@ async def check_proxy_endpoint_v2(request: Request):
     if not proxy:
         raise HTTPException(400, "Прокси не указан")
     
-    if not platform or platform not in ['telegram', 'vk']:
-        raise HTTPException(400, "Неверная платформа. Допустимые значения: 'telegram', 'vk'")
+    if not platform or platform not in ['telegram', 'vk', 'instagram']:
+        raise HTTPException(400, "Неверная платформа. Допустимые значения: 'telegram', 'vk', 'instagram'")
     
     if platform == "telegram":
-        # Проверяем прокси для Telegram
         from client_pools import validate_proxy, validate_proxy_connection
-        
-        # Сначала проверяем формат прокси
         is_valid, proxy_type = validate_proxy(proxy)
         if not is_valid:
             return {"valid": False, "message": "Неверный формат прокси"}
-        
-        # Затем проверяем соединение
         is_valid, message = await validate_proxy_connection(proxy)
         return {"valid": is_valid, "message": message}
     
     elif platform == "vk":
         from vk_utils import validate_proxy, validate_proxy_connection
-        
-        # Сначала проверяем формат
         is_valid = validate_proxy(proxy)
         if not is_valid:
             return {"valid": False, "message": "Неверный формат прокси"}
-        
-        # Затем проверяем соединение
         is_valid, message = await validate_proxy_connection(proxy)
         return {"valid": is_valid, "message": message}
+
+    elif platform == "instagram":
+        import aiohttp
+        logger.info(f"[Instagram ProxyCheck] Проверяем прокси: {proxy}")
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://www.instagram.com/", proxy=proxy, timeout=10, ssl=ssl_context) as response:
+                    logger.info(f"[Instagram ProxyCheck] HTTP статус: {response.status}")
+                    if response.status == 200:
+                        logger.info("[Instagram ProxyCheck] Прокси успешно подключен (Instagram)")
+                        return {"valid": True, "message": "Прокси подключен успешно (Instagram)"}
+                    else:
+                        logger.warning(f"[Instagram ProxyCheck] Ошибка запроса: HTTP {response.status}")
+                        return {"valid": False, "message": f"Ошибка запроса: HTTP {response.status}"}
+        except Exception as e:
+            logger.error(f"[Instagram ProxyCheck] Ошибка подключения: {str(e)}")
+            return {"valid": False, "message": f"Ошибка подключения: {str(e)}"}
 
 @app.get("/api/telegram/accounts/{account_id}/details")
 async def get_telegram_account_details(request: Request, account_id: str):

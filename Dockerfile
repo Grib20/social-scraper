@@ -51,6 +51,9 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
 # Копируем файлы приложения
 COPY . .
 
+# Устанавливаем браузеры для playwright
+RUN python -m playwright install
+
 # Даем права на запись во все необходимые директории и файлы
 RUN chown -R appuser:appuser /app
 
