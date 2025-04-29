@@ -85,3 +85,5 @@ s3_file_cache.pkl
 redis-server.log
 redis-server.log.1
 redis-server.log.2
+
+js_tools/node_modules/
