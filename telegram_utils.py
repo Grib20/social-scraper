@@ -919,12 +919,42 @@ async def _process_channels_for_trending(
                         if hasattr(post, 'grouped_id') and post.grouped_id:
                             if post.grouped_id in processed_grouped_ids:
                                 continue  # Уже обработан этот альбом
+                            
                             try:
                                 album_messages = await get_album_messages(wrapper, peer_identifier, post)
                                 album_messages.sort(key=lambda m: m.id)
                                 main_album_msg = album_messages[0]
-                                # Берём первый непустой текст
-                                post_text_found = next((m.message for m in album_messages if m.message), main_album_msg.message or "")
+                                # Собираем текст/подпись со ВСЕХ сообщений альбома
+                                post_text_found = ""
+                                collected_texts = []
+                                for m in album_messages:
+                                    try:
+                                        # Пытаемся извлечь текст из каждого сообщения
+                                        txt = getattr(m, 'message', None) or getattr(m, 'text', None) or getattr(m, 'caption', None)
+                                        if txt:
+                                            collected_texts.append(str(txt)) # Собираем все непустые тексты
+                                    except Exception as e_text_extract:
+                                        logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] Error extracting text from album message {m.id} (Group: {post.grouped_id}): {e_text_extract}")
+                                post_text_found = "\n".join(collected_texts).strip() # Объединяем найденные тексты
+                                # Если текст не найден, пытаемся получить текст из соседнего сообщения до или после альбома
+                                if not post_text_found:
+                                    for neighbor_id in (main_album_msg.id - 1, album_messages[-1].id + 1):
+                                        try:
+                                            neighbor = await wrapper.make_high_level_request(
+                                                wrapper.client.get_messages,
+                                                peer_identifier,
+                                                ids=neighbor_id
+                                            )
+                                            neighbor_txt = getattr(neighbor, 'message', None) or getattr(neighbor, 'text', None) or getattr(neighbor, 'caption', None)
+                                            # Убедимся, что соседнее сообщение - текстовое (без медиа)
+                                            if neighbor and neighbor_txt and not getattr(neighbor, 'media', None):
+                                                post_text_found = neighbor_txt
+                                                logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Found adjacent text for album {main_album_msg.id} in msg {neighbor_id}")
+                                                break # Нашли текст, выходим из цикла проверки соседей
+                                        except Exception as e_desc:
+                                            # Ошибки получения соседних сообщений ожидаемы (их может не быть)
+                                            logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Error fetching adjacent text for album post {main_album_msg.id} at id {neighbor_id}: {e_desc}")
+                               
                                 # Собираем все медиа из альбома
                                 media_objects_to_process = [m.media for m in album_messages if m.media]
                                 media_tasks_for_post = {}
@@ -1015,26 +1045,34 @@ async def _process_channels_for_trending(
 
                         # --- Обработка медиа и Поиск Текста ---
                         media_objects_to_process = []
-                        post_text_found = post.message or "" # Получаем текст из основного сообщения
+                        # Извлекаем текст из основного сообщения (.message или .text)
+                        post_text_found = getattr(post, 'message', None) or getattr(post, 'text', None) or ""
 
                         if hasattr(post, 'grouped_id') and post.grouped_id: # Проверяем, является ли пост частью альбома
                             logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Post {post.id} is part of album {post.grouped_id}. Fetching album messages...")
                             try:
                                 album_messages = await get_album_messages(wrapper, peer_identifier, post)
-                                found_text_in_album = False
+                                # Собираем текст/подпись со ВСЕХ сообщений альбома
+                                collected_texts_single = []
                                 for album_msg in album_messages:
                                     # Собираем медиа со всех сообщений альбома
-                                    if album_msg and album_msg.media: 
+                                    if album_msg and album_msg.media:
                                         media_objects_to_process.append(album_msg.media)
                                     # Ищем первый непустой текст в альбоме
-                                    if album_msg and album_msg.message and not found_text_in_album:
-                                        post_text_found = album_msg.message # Перезаписываем текст, если нашли в альбоме
-                                        found_text_in_album = True
-                                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Found text for album {post.grouped_id} in message {album_msg.id}")
-                                
-                                if not found_text_in_album:
-                                    logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: No text found in album {post.grouped_id}, using main message text ('{post_text_found[:20]}...')")
-                            except Exception as e_album: 
+                                    try:
+                                        txt_single = getattr(album_msg, 'message', None) or getattr(album_msg, 'text', None) or getattr(album_msg, 'caption', None)
+                                        if txt_single:
+                                            collected_texts_single.append(str(txt_single))
+                                    except Exception as e_text_single:
+                                        logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] Error extracting text from album message {album_msg.id} (during single post handling): {e_text_single}")
+                                # Объединяем текст, если он был найден
+                                if collected_texts_single:
+                                    post_text_found = "\n".join(collected_texts_single).strip()
+                                    logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Combined text for album {post.grouped_id} from {len(collected_texts_single)} message(s).")
+                                # Если текст так и не найден в альбоме, используем основной текст поста (если был)
+                                elif not post_text_found: # Дополнительно проверяем post_text_found
+                                    logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: No text found in album {post.grouped_id}, using main message text ('{post_text_found[:20]}...')")
+                            except Exception as e_album:
                                 logger.error(f"[Acc: {account_id}][Chan: {channel_id_input}] Error fetching album for post {post.id}: {e_album}")
                                 # Используем текст из основного сообщения, если был
 
@@ -1043,12 +1081,12 @@ async def _process_channels_for_trending(
 
                         # --- НОВАЯ ПРОВЕРКА: Пропускаем, если текст так и не найден ---
                         if not post_text_found:
-                            logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (нет текста ни в основном сообщении, ни в альбоме).")
+                            logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} пропущен (нет текста ни в основном сообщении, ни в альбоме).")
                             continue
                         # ----------------------------------------------------------
                         
                         # Логируем успешное прохождение всех фильтров (включая текст)
-                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} ПРОШЕЛ все фильтры (включая текст). Добавляем.")
+                        logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пост {post.id} ПРОШЕЛ все фильтры (включая текст). Добавляем.")
 
                         # Обновляем текст в post_data
                         post_data['text'] = post_text_found
@@ -1096,7 +1134,7 @@ async def _process_channels_for_trending(
                                 }
                                 media_list.append(media_entry)
                                 processed_media_urls.add(s3_url_to_add)
-                                logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Added media entry to post_data: {media_entry}")
+                                logger.info(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Added media entry to post_data: {media_entry}")
                             elif not s3_url_to_add:
                                 logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] Post {post.id}: Could not determine S3 URL for media {file_id} ({media_type})")
 
@@ -1650,40 +1688,61 @@ async def get_posts_in_channels(client: TelegramClient, channel_ids: List[Union[
     return sorted(posts, key=lambda x: x["views"], reverse=True)
 
 async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str], post_keywords: List[str], count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
-    """Получает посты из каналов по ключевым словам для групп и постов."""
+    """Получает посты из каналов по ключевым словам."""
     posts = []
     wrapper = TelegramClientWrapper(client, client.session.filename if client.session else 'unknown')
     
     for group_keyword in group_keywords:
         try:
-            async with REQUEST_SEMAPHORE:
-                # Используем SearchRequest для поиска каналов
-                result = await client(functions.contacts.SearchRequest(
-                    q=group_keyword,
-                    limit=100  # Искать среди 100 первых результатов
-                ))
-                
-                # Обрабатываем найденные чаты
-                for chat in result.chats:
-                    if isinstance(chat, types.Channel) and not chat.megagroup:
-                        try:
-                            channel_posts = await get_posts_in_channels(
-                                client,
-                                [chat.id],
-                                post_keywords,
-                                count // len(group_keywords),
-                                min_views,
-                                days_back
-                            )
-                            posts.extend(channel_posts)
-                        except Exception as e:
-                            logger.error(f"Ошибка при получении постов из канала {chat.id}: {e}")
-                            continue
+            # Не преобразуем group_keyword в str, если это строка с @
+            if isinstance(group_keyword, str) and group_keyword.startswith('@'):
+                group_entity = await client.get_entity(group_keyword)
+            else:
+                # Для целочисленных ID или строк без @, пробуем преобразовать в int
+                try:
+                    group_entity = await client.get_entity(int(group_keyword))
+                except ValueError:
+                    # Если не удалось преобразовать в int, используем как есть
+                    group_entity = await client.get_entity(group_keyword)
+            
+            # Получаем сообщения за указанный период
+            cutoff_date = datetime.now().replace(tzinfo=None) - timedelta(days=days_back)
+            group_posts = []
+            async for message in client.iter_messages(group_entity, limit=100):
+                if message.date.replace(tzinfo=None) < cutoff_date:
+                    break
+                group_posts.append(message)
+            
+            for message in group_posts:
+                views = getattr(message, 'views', 0)  # Обрабатываем случай, когда views = None
+                if views >= min_views:
+                    if not post_keywords or any(keyword.lower() in message.message.lower() for keyword in post_keywords):
+                        post_data = {
+                            "id": message.id,
+                            "group_id": group_keyword,
+                            "group_title": getattr(group_entity, 'title', getattr(group_entity, 'first_name', 'Unknown')),
+                            "text": message.message,
+                            "views": views,
+                            "date": message.date.isoformat(),
+                            "url": f"https://t.me/c/{abs(group_entity.id)}/{message.id}",
+                            "media": []
+                        }
+                        
+                        # Обрабатываем медиа с быстрой генерацией ссылок
+                        if message.media:
+                            from media_utils import generate_media_links_with_album #, process_media_later <-- Комментируем несуществующий импорт
+                            media_urls = await generate_media_links_with_album(client, message)
+                            if media_urls:
+                                post_data['media'] = media_urls
+                                # Запускаем обработку медиа асинхронно
+                                # asyncio.create_task(process_media_later(client, message)) <-- Комментируем использование
+                        
+                        posts.append(post_data)
         except Exception as e:
-            logger.error(f"Ошибка при поиске каналов по ключевому слову {group_keyword}: {e}")
+            logger.error(f"Ошибка при получении постов из группы {group_keyword}: {e}")
             continue
     
-    return sorted(posts, key=lambda x: x["views"], reverse=True)[:count]
+    return sorted(posts, key=lambda x: x["views"], reverse=True)
 
 async def get_posts_by_period(
     telegram_pool: TelegramClientPool, # <<< ДОБАВЛЕНО
@@ -1891,7 +1950,28 @@ async def _process_groups_for_period_task(
                         album_messages = await get_album_messages(wrapper, channel_entity, message)
                         album_messages.sort(key=lambda m: m.id)
                         main_album_msg = album_messages[0]
-                        post_text = next((m.text for m in album_messages if m.text), main_album_msg.text or "")
+                        # Собираем текст из всех сообщений альбома
+                        album_texts = []
+                        for m_album in album_messages:
+                            try:
+                                txt_album = getattr(m_album, 'message', None) or getattr(m_album, 'text', None) or getattr(m_album, 'caption', None)
+                                if txt_album:
+                                    album_texts.append(str(txt_album))
+                            except Exception as e_album_txt:
+                                logger.warning(f"[Task Acc: {account_id}] [Chan: {group_id}] Error extracting text from album message {m_album.id}: {e_album_txt}")
+                        post_text = "\n".join(album_texts).strip()
+                        # Fallback на соседние сообщения, если текст пуст
+                        if not post_text:
+                           for neighbor_id_album in (main_album_msg.id - 1, album_messages[-1].id + 1):
+                               try:
+                                   neighbor_album = await wrapper.make_high_level_request(wrapper.client.get_messages, channel_entity, ids=neighbor_id_album)
+                                   neighbor_text_album = getattr(neighbor_album, 'message', None) or getattr(neighbor_album, 'text', None) or getattr(neighbor_album, 'caption', None)
+                                   if neighbor_album and neighbor_text_album and not getattr(neighbor_album, 'media', None):
+                                       post_text = neighbor_text_album
+                                       break
+                               except Exception:
+                                   pass # Ignore errors fetching neighbors
+
                         channel_id_str = str(channel_entity.id).replace('-100', '')
                         subscribers = getattr(channel_entity, 'participants_count', None)
                         if subscribers is None:
@@ -1902,7 +1982,13 @@ async def _process_groups_for_period_task(
                             except Exception:
                                 subscribers = 10
                         subscribers_for_calc = max(subscribers, 10)
-                        raw_engagement_score = (main_album_msg.views or 0) + ((sum(r.count for r in main_album_msg.reactions.results) if main_album_msg.reactions and main_album_msg.reactions.results else 0) * 10) + ((main_album_msg.replies.replies if main_album_msg.replies else 0) * 20) + ((main_album_msg.forwards or 0) * 50)
+                        # Используем просмотры, реакции и т.д. из основного сообщения альбома (main_album_msg)
+                        views_album = getattr(main_album_msg, 'views', 0)
+                        reactions_album = sum(r.count for r in main_album_msg.reactions.results) if main_album_msg.reactions and main_album_msg.reactions.results else 0
+                        comments_album = main_album_msg.replies.replies if main_album_msg.replies else 0
+                        forwards_album = getattr(main_album_msg, 'forwards', 0)
+
+                        raw_engagement_score = (views_album or 0) + (reactions_album * 10) + (comments_album * 20) + (forwards_album * 50)
                         if subscribers_for_calc > 1 and raw_engagement_score > 0:
                             import math
                             trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc))
@@ -1914,21 +2000,22 @@ async def _process_groups_for_period_task(
                             "channel_title": channel_title,
                             "channel_username": getattr(channel_entity, 'username', None),
                             "text": post_text,
-                            "views": main_album_msg.views,
-                            "reactions": sum(r.count for r in main_album_msg.reactions.results) if main_album_msg.reactions and main_album_msg.reactions.results else 0,
-                            "comments": main_album_msg.replies.replies if main_album_msg.replies else 0,
-                            "forwards": main_album_msg.forwards or 0,
+                            "views": views_album,
+                            "reactions": reactions_album,
+                            "comments": comments_album,
+                            "forwards": forwards_album,
                             "date": main_album_msg.date.isoformat(),
                             "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{main_album_msg.id}",
-                            "media": [],
+                            "media": [], # Медиа здесь не обрабатываем
                             "trend_score": trend_score
                         }
                         channel_posts.append(post_data)
                     except Exception as album_err:
-                        logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка get_album_messages: {album_err}")
-                    continue
-                else:
-                    post_text = message.text or ""
+                        logger.error(f"[Task Acc: {account_id}] [Chan: {group_id}] Ошибка обработки альбома {message.grouped_id}: {album_err}")
+                    continue # Пропускаем дальнейшую обработку отдельных сообщений альбома
+                else: # Если это не альбом
+                    # Извлекаем текст (.message, .text, .caption)
+                    post_text = getattr(message, 'message', None) or getattr(message, 'text', None) or getattr(message, 'caption', None) or ""
 
                     channel_id_str = str(channel_entity.id).replace('-100', '')
                     # Получаем число подписчиков для расчета trend_score
@@ -1942,7 +2029,12 @@ async def _process_groups_for_period_task(
                             subscribers = 10
                     subscribers_for_calc = max(subscribers, 10)
                     # Считаем trend_score по формуле из trending
-                    raw_engagement_score = (message.views or 0) + ((sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0) * 10) + ((message.replies.replies if message.replies else 0) * 20) + ((message.forwards or 0) * 50)
+                    views_msg = getattr(message, 'views', 0)
+                    reactions_msg = sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0
+                    comments_msg = message.replies.replies if message.replies else 0
+                    forwards_msg = getattr(message, 'forwards', 0)
+
+                    raw_engagement_score = (views_msg or 0) + (reactions_msg * 10) + (comments_msg * 20) + (forwards_msg * 50)
                     if subscribers_for_calc > 1 and raw_engagement_score > 0:
                         import math
                         trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc))
@@ -1954,10 +2046,10 @@ async def _process_groups_for_period_task(
                         "channel_title": channel_title,
                         "channel_username": getattr(channel_entity, 'username', None),
                         "text": post_text,
-                        "views": message.views,
-                        "reactions": sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0,
-                        "comments": message.replies.replies if message.replies else 0,
-                        "forwards": message.forwards or 0,
+                        "views": views_msg,
+                        "reactions": reactions_msg,
+                        "comments": comments_msg,
+                        "forwards": forwards_msg,
                         "date": message.date.isoformat(),
                         "url": f"https://t.me/{getattr(channel_entity, 'username', f'c/{channel_id_str}')}/{message.id}",
                         "media": [], # Медиа здесь не обрабатываем
@@ -1979,5 +2071,7 @@ async def _process_groups_for_period_task(
             
     logger.info(f"[Task Acc: {account_id}] ЗАВЕРШЕНА ЗАДАЧА. Возвращаем {len(all_posts_for_account)} постов.")
     return all_posts_for_account
-# --- Конец новой вспомогательной функции ---
+# --- Конец новой вспомогательной функции --- 
 
+
+# ... potentially other functions ...
