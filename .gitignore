@@ -86,4 +86,6 @@ redis-server.log
 redis-server.log.1
 redis-server.log.2
 
-js_tools/node_modules/
+js_tools/
+instagram/workers/instagram_puppeteer/node_modules/
+node_modules/
