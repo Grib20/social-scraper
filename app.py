@@ -47,6 +47,8 @@ from starlette.datastructures import UploadFile
 # Импортируем новый роутер
 from telegram_routes import router as telegram_v1_router 
 from utils import auto_reset_unused_accounts, clean_orphan_redis_keys, auto_clean_orphan_redis_keys
+from telegram_routes import collect_comments_handler, get_collect_comments_status_handler
+from comment_collector import worker as comment_worker
 
 load_dotenv()  # Загружаем .env до импорта модулей
 
@@ -344,6 +346,10 @@ async def lifespan(app: FastAPI):
     # --- Запуск фонового менеджера Telegram-клиентов ---
     telegram_pool.start_background_manager(interval_seconds=3600, keepalive_seconds=600)
     logger.info("Фоновый менеджер Telegram-клиентов запущен.")
+    
+    # --- Запуск воркера сбора комментариев ---
+    comment_worker_task = asyncio.create_task(comment_worker())
+    logger.info("Воркер сбора комментариев Telegram запущен.")
 
     logger.info("Приложение готово к работе.")
     
@@ -421,7 +427,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Ошибка при ожидании отмены задачи авто-очистки: {e}", exc_info=True)
 
-    
+    # 6. Отмена фоновой задачи сбора комментариев
+    logger.info("Остановка воркера сбора комментариев Telegram...")
+    comment_worker_task.cancel()
+    try:
+        await comment_worker_task
+    except asyncio.CancelledError:
+        logger.info("Воркер сбора комментариев Telegram успешно остановлен.")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке воркера сбора комментариев: {e}")
 
     logger.info("Приложение успешно остановлено.")
 
@@ -1452,6 +1466,14 @@ async def get_posts_by_period(request: Request, data: dict):
             logger.error(f"Ошибка в /posts-by-period (VK): {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при обработке запроса VK: {str(e)}")
         # +++ КОНЕЦ: Новая логика ротации для VK +++
+
+@app.post("/collect-comments")
+async def collect_comments(request: Request, data: dict):
+    return await collect_comments_handler(request, data)
+
+@app.get("/collect-comments/status/{task_id}")
+async def collect_comments_status(task_id: str):
+    return await get_collect_comments_status_handler(task_id)
 
 @app.get("/api/accounts/status")
 async def get_accounts_status(api_key: str = Header(...)):
@@ -5295,6 +5317,7 @@ async def admin_clean_orphan_redis_keys(request: Request):
         return {"status": "success", "message": "Очистка висячих ключей завершена"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 # === Эндпоинт для получения списка аккаунтов ===
 @app.get("/api/accounts")
 async def get_accounts(request: Request):

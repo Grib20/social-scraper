@@ -77,7 +77,8 @@ logger = logging.getLogger(__name__)
 
 # Константы для ротации аккаунтов
 REQUEST_SEMAPHORE = asyncio.Semaphore(5)  # Ограничиваем до 5 одновременных запросов к Telegram
-REQUEST_DELAY = 0.1  # 100мс между запросами (10 запросов в секунду)
+REQUEST_DELAY_MIN = 0.2  # минимальная задержка между запросами
+REQUEST_DELAY_MAX = 1.5  # максимальная задержка между запросами
 GROUP_DELAY = 1.0  # 1 секунда между запросами к разным группам
 channel_members_cache = {}  # Кэш для количества участников в каналах
 # Константа для режима пониженной производительности
@@ -141,7 +142,10 @@ class TelegramClientWrapper:
     async def _apply_delays(self):
         """Применяет задержки перед выполнением запроса."""
         current_time = time.time()
-        request_delay = DEGRADED_MODE_DELAY if self.degraded_mode else REQUEST_DELAY
+        if self.degraded_mode:
+            request_delay = random.uniform(REQUEST_DELAY_MIN + 1, REQUEST_DELAY_MAX + 1)
+        else:
+            request_delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
         group_delay = GROUP_DELAY * 2 if self.degraded_mode else GROUP_DELAY
 
         time_since_last_request = current_time - self.last_request_time
@@ -861,11 +865,11 @@ async def _process_channels_for_trending(
                 
                 # --- ДИАГНОСТИКА: Пытаемся получить 1 сообщение напрямую ---
                 try:
-                    latest_messages = await client.get_messages(peer_identifier, limit=1)
-                    if latest_messages:
-                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) successful. Latest post ID: {latest_messages[0].id}, Date: {latest_messages[0].date}")
+                    latest_message = await client.get_messages(peer_identifier, limit=1)
+                    if latest_message:
+                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) successful. Latest post ID: {latest_message.id}, Date: {latest_message.date}")
                     else:
-                        logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) returned an empty list.")
+                        logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) returned an empty result.")
                 except Exception as e_get_msg:
                     logger.error(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: Error calling get_messages(limit=1): {e_get_msg}", exc_info=True)
                 # --------------------------------------------------------
@@ -1471,88 +1475,58 @@ async def _process_groups_for_posts(client, group_ids, max_posts, cutoff_date, m
     
     for group_id in group_ids:
         try:
-            # Получаем информацию о группе
             try:
-                # Не преобразуем group_id в int, если это строка с @
                 if isinstance(group_id, str) and group_id.startswith('@'):
-                    channel_entity = await client.get_entity(group_id)
+                    channel_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, group_id)
                 else:
-                    # Для целочисленных ID или строк без @, пробуем преобразовать в int
                     try:
-                        channel_entity = await client.get_entity(int(group_id))
+                        channel_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, int(group_id))
                     except ValueError:
-                        # Если не удалось преобразовать в int, используем как есть
-                        channel_entity = await client.get_entity(group_id)
-                
+                        channel_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, group_id)
                 channel_title = getattr(channel_entity, 'title', 'Unknown')
                 channel_username = getattr(channel_entity, 'username', None)
-                subscribers = channel_entity.participants_count if hasattr(channel_entity, 'participants_count') else None
-                
-                # Если не удалось получить число подписчиков, запрашиваем полную информацию о канале
+                subscribers = channel_entity.participants_count if channel_entity and hasattr(channel_entity, 'participants_count') else None
                 if subscribers is None:
                     try:
-                        full_chat = await client(functions.channels.GetFullChannelRequest(channel=channel_entity))
-                        subscribers = full_chat.full_chat.participants_count
+                        full_chat = await wrapper._make_request(functions.channels.GetFullChannelRequest, channel=channel_entity)
+                        subscribers = full_chat.full_chat.participants_count if full_chat and hasattr(full_chat, 'full_chat') and full_chat.full_chat else 1000
                     except Exception as e:
                         logger.warning(f"Ошибка при получении полной информации о канале {group_id}: {e}")
-                        subscribers = 1000  # Значение по умолчанию
+                        subscribers = 1000
             except Exception as e:
                 logger.warning(f"Ошибка при получении информации о канале {group_id}: {e}")
-                # Убираем установку значений по умолчанию, так как пропускаем итерацию
-                continue # <-- Добавляем continue здесь
-            
-            # Устанавливаем минимальное значение подписчиков для расчета
-            subscribers_for_calc = max(subscribers, 10) # Минимум 10 участников для логарифма
-            
-            # Получаем историю сообщений
+                continue
+            subscribers_for_calc = max(subscribers, 10)
             channel_posts = []
             try:
-                # Получаем в несколько раз больше постов, чем нужно, чтобы учесть фильтрацию
                 limit = max_posts * 3
-                # Используем group_id как есть, без преобразования в int
-                async for message in client.iter_messages(group_id, limit=limit):
+                async for message in wrapper.client.iter_messages(channel_entity, limit=limit):
                     if message.date.replace(tzinfo=None) < cutoff_date:
                         break
                     channel_posts.append(message)
             except Exception as e:
                 logger.error(f"Ошибка при получении истории сообщений канала {group_id}: {e}")
                 continue
-            
-            # Формируем URL шаблон
             if channel_username:
                 url_template = f"https://t.me/{channel_username}/{{id}}"
             else:
-                assert channel_entity is not None # Добавляем assert здесь
+                assert channel_entity is not None
                 url_template = f"https://t.me/c/{abs(channel_entity.id)}/{{id}}"
-            
-            # Обрабатываем посты
             for post in channel_posts:
                 if not post.message:
                     continue
-                    
-                # Проверяем дату
                 post_date = post.date.replace(tzinfo=None)
                 if post_date < cutoff_date:
                     continue
-                    
-                # Проверяем просмотры
                 views = getattr(post, 'views', 0)
                 if views < min_views:
                     continue
-                    
-                # Получаем дополнительные метрики
                 reactions = len(post.reactions.results) if post.reactions else 0
                 comments = post.replies.replies if post.replies else 0
                 forwards = post.forwards or 0
-                
-                # Рассчитываем показатели вовлеченности
                 raw_engagement_score = views + (reactions * 10) + (comments * 20) + (forwards * 50)
                 trend_score = int(raw_engagement_score / math.log10(subscribers_for_calc)) if raw_engagement_score > 0 else 0
-                
-                # Формируем URL
                 url = url_template.format(id=post.id)
-                
-                # Создаем данные поста
                 post_data = {
                     "id": post.id,
                     "date": post_date.isoformat(),
@@ -1565,18 +1539,14 @@ async def _process_groups_for_posts(client, group_ids, max_posts, cutoff_date, m
                     "group_title": channel_title,
                     "group_username": channel_username,
                     "url": url,
-                    "media": [],  # Просто пустой массив для медиа без загрузки
+                    "media": [],
                     "subscribers": subscribers,
                     "trend_score": trend_score,
                     "raw_engagement_score": raw_engagement_score
                 }
-                
-                # Не обрабатываем медиа, оставляем пустой массив
-                
                 group_posts.append(post_data)
         except Exception as e:
             logger.error(f"Ошибка при обработке группы {group_id}: {e}")
-    
     return group_posts
 
 async def process_media_file(media):
@@ -1637,54 +1607,52 @@ async def get_posts_in_channels(client: TelegramClient, channel_ids: List[Union[
     
     for channel_id in channel_ids:
         try:
-            # Не преобразуем channel_id в int, если это строка с @
             if isinstance(channel_id, str) and channel_id.startswith('@'):
-                channel = await client.get_entity(channel_id)
+                channel = await wrapper.make_high_level_request(wrapper.client.get_entity, channel_id)
             else:
-                # Для целочисленных ID или строк без @, пробуем преобразовать в int
                 try:
-                    channel = await client.get_entity(int(channel_id))
+                    channel = await wrapper.make_high_level_request(wrapper.client.get_entity, int(channel_id))
                 except ValueError:
-                    # Если не удалось преобразовать в int, используем как есть
-                    channel = await client.get_entity(channel_id)
-            
-            # Получаем сообщения за указанный период
+                    channel = await wrapper.make_high_level_request(wrapper.client.get_entity, channel_id)
+            if not channel:
+                logger.warning(f"Не удалось получить entity для канала {channel_id}. Пропуск.")
+                continue
             cutoff_date = datetime.now().replace(tzinfo=None) - timedelta(days=days_back)
             channel_posts = []
-            async for message in client.iter_messages(channel, limit=100):
-                if message.date.replace(tzinfo=None) < cutoff_date:
-                    break
-                channel_posts.append(message)
-            
+            try:
+                async for message in wrapper.client.iter_messages(channel, limit=100):
+                    if not message or not hasattr(message, 'date') or not message.date:
+                        continue
+                    if message.date.replace(tzinfo=None) < cutoff_date:
+                        break
+                    channel_posts.append(message)
+            except Exception as e:
+                logger.error(f"Ошибка при получении истории сообщений канала {channel_id}: {e}")
+                continue
             for message in channel_posts:
-                views = getattr(message, 'views', 0)  # Обрабатываем случай, когда views = None
+                views = getattr(message, 'views', 0)
                 if views >= min_views:
-                    if not keywords or any(keyword.lower() in message.message.lower() for keyword in keywords):
+                    if not keywords or any(keyword.lower() in (message.message or '').lower() for keyword in keywords):
                         post_data = {
                             "id": message.id,
                             "channel_id": channel_id,
-                            "channel_title": getattr(channel, 'title', getattr(channel, 'first_name', 'Unknown')),
+                            "channel_title": getattr(channel, 'title', getattr(channel, 'first_name', 'Unknown')) if channel else 'Unknown',
                             "text": message.message,
                             "views": views,
-                            "date": message.date.isoformat(),
-                            "url": f"https://t.me/c/{abs(channel.id)}/{message.id}",
+                            "date": message.date.isoformat() if hasattr(message, 'date') and message.date else None,
+                            "url": f"https://t.me/c/{abs(channel.id)}/{message.id}" if channel and hasattr(channel, 'id') else None,
                             "media": []
                         }
-                        
                         # Обрабатываем медиа с быстрой генерацией ссылок
                         if message.media:
-                            from media_utils import generate_media_links_with_album #, process_media_later <-- Комментируем несуществующий импорт
+                            from media_utils import generate_media_links_with_album
                             media_urls = await generate_media_links_with_album(client, message)
                             if media_urls:
                                 post_data['media'] = media_urls
-                                # Запускаем обработку медиа асинхронно
-                                # asyncio.create_task(process_media_later(client, message)) <-- Комментируем использование
-                        
                         posts.append(post_data)
         except Exception as e:
             logger.error(f"Ошибка при получении постов из канала {channel_id}: {e}")
             continue
-    
     return sorted(posts, key=lambda x: x["views"], reverse=True)
 
 async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str], post_keywords: List[str], count: int = 10, min_views: int = 1000, days_back: int = 3) -> List[Dict]:
@@ -1694,54 +1662,51 @@ async def get_posts_by_keywords(client: TelegramClient, group_keywords: List[str
     
     for group_keyword in group_keywords:
         try:
-            # Не преобразуем group_keyword в str, если это строка с @
             if isinstance(group_keyword, str) and group_keyword.startswith('@'):
-                group_entity = await client.get_entity(group_keyword)
+                group_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, group_keyword)
             else:
-                # Для целочисленных ID или строк без @, пробуем преобразовать в int
                 try:
-                    group_entity = await client.get_entity(int(group_keyword))
+                    group_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, int(group_keyword))
                 except ValueError:
-                    # Если не удалось преобразовать в int, используем как есть
-                    group_entity = await client.get_entity(group_keyword)
-            
-            # Получаем сообщения за указанный период
+                    group_entity = await wrapper.make_high_level_request(wrapper.client.get_entity, group_keyword)
+            if not group_entity:
+                logger.warning(f"Не удалось получить entity для группы {group_keyword}. Пропуск.")
+                continue
             cutoff_date = datetime.now().replace(tzinfo=None) - timedelta(days=days_back)
             group_posts = []
-            async for message in client.iter_messages(group_entity, limit=100):
-                if message.date.replace(tzinfo=None) < cutoff_date:
-                    break
-                group_posts.append(message)
-            
+            try:
+                async for message in wrapper.client.iter_messages(group_entity, limit=100):
+                    if not message or not hasattr(message, 'date') or not message.date:
+                        continue
+                    if message.date.replace(tzinfo=None) < cutoff_date:
+                        break
+                    group_posts.append(message)
+            except Exception as e:
+                logger.error(f"Ошибка при получении истории сообщений группы {group_keyword}: {e}")
+                continue
             for message in group_posts:
-                views = getattr(message, 'views', 0)  # Обрабатываем случай, когда views = None
+                views = getattr(message, 'views', 0)
                 if views >= min_views:
-                    if not post_keywords or any(keyword.lower() in message.message.lower() for keyword in post_keywords):
+                    if not post_keywords or any(keyword.lower() in (message.message or '').lower() for keyword in post_keywords):
                         post_data = {
                             "id": message.id,
                             "group_id": group_keyword,
-                            "group_title": getattr(group_entity, 'title', getattr(group_entity, 'first_name', 'Unknown')),
+                            "group_title": getattr(group_entity, 'title', getattr(group_entity, 'first_name', 'Unknown')) if group_entity else 'Unknown',
                             "text": message.message,
                             "views": views,
-                            "date": message.date.isoformat(),
-                            "url": f"https://t.me/c/{abs(group_entity.id)}/{message.id}",
+                            "date": message.date.isoformat() if hasattr(message, 'date') and message.date else None,
+                            "url": f"https://t.me/c/{abs(group_entity.id)}/{message.id}" if group_entity and hasattr(group_entity, 'id') else None,
                             "media": []
                         }
-                        
-                        # Обрабатываем медиа с быстрой генерацией ссылок
                         if message.media:
-                            from media_utils import generate_media_links_with_album #, process_media_later <-- Комментируем несуществующий импорт
+                            from media_utils import generate_media_links_with_album
                             media_urls = await generate_media_links_with_album(client, message)
                             if media_urls:
                                 post_data['media'] = media_urls
-                                # Запускаем обработку медиа асинхронно
-                                # asyncio.create_task(process_media_later(client, message)) <-- Комментируем использование
-                        
                         posts.append(post_data)
         except Exception as e:
             logger.error(f"Ошибка при получении постов из группы {group_keyword}: {e}")
             continue
-    
     return sorted(posts, key=lambda x: x["views"], reverse=True)
 
 async def get_posts_by_period(

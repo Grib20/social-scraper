@@ -5,6 +5,9 @@ import os
 import traceback
 import uuid
 from typing import Optional
+import math
+import re
+import redis.asyncio as redis
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -276,3 +279,116 @@ async def add_telegram_account_from_files(
                 logger.error(f"Не удалось удалить файл сессии {session_file_path} после ошибки: {remove_err}")
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {e}")
     # Файлы уже закрыты в блоках finally или через UploadFile 
+
+def parse_telegram_post_link(link):
+    link = link.strip().rstrip('/')
+    print(f"[DEBUG] Парсим ссылку: {repr(link)}")
+    m = re.match(r"https?://t\.me/([a-zA-Z0-9_]+)/(\d+)$", link)
+    if m:
+        return {"type": "public", "username": m.group(1), "post_id": int(m.group(2))}
+    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)$", link)
+    if m:
+        return {"type": "private", "channel_id": int(m.group(1)), "post_id": int(m.group(2))}
+    return None
+
+async def collect_comments_handler(request, data):
+    # 1. Получение api_key из заголовка
+    api_key = request.headers.get('api-key') or request.headers.get('x-api-key')
+    if not api_key:
+        auth_header = request.headers.get('authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            api_key = auth_header.split(' ')[1]
+    if not api_key:
+        raise HTTPException(401, "API ключ обязателен")
+
+    post_links = data.get("post_links")
+    max_comments_per_post = data.get("max_comments_per_post")
+    callback_url = data.get("callback_url")
+    platform = data.get("platform")
+
+    # 2. Валидация post_links
+    if not post_links or not isinstance(post_links, list) or not all(isinstance(x, str) for x in post_links):
+        raise HTTPException(400, "post_links должен быть непустым списком ссылок")
+
+    import math
+    import uuid
+    task_id = str(uuid.uuid4())
+    tasks = []
+
+    if platform == "telegram":
+        from pools import telegram_pool
+        active_accounts = await telegram_pool.get_active_clients(api_key)
+        if not active_accounts:
+            raise HTTPException(500, "Нет активных аккаунтов Telegram для сбора комментариев")
+        account_ids = [acc['id'] for acc in active_accounts]
+        n = len(account_ids)
+        chunk_size = math.ceil(len(post_links) / n)
+        split = [
+            {
+                "account_id": account_ids[i],
+                "post_links": post_links[i*chunk_size:(i+1)*chunk_size]
+            }
+            for i in range(n)
+            if post_links[i*chunk_size:(i+1)*chunk_size]
+        ]
+        for part in split:
+            tasks.append({
+                "task_id": task_id,
+                "platform": "telegram",
+                "account_id": part["account_id"],
+                "api_key": api_key,
+                "post_links": part["post_links"],
+                "max_comments_per_post": max_comments_per_post,
+                "callback_url": callback_url
+            })
+    elif platform == "vk":
+        from pools import vk_pool
+        active_accounts = await vk_pool.get_active_clients(api_key)
+        if not active_accounts:
+            raise HTTPException(500, "Нет активных аккаунтов VK для сбора комментариев")
+        account_ids = [acc['id'] for acc in active_accounts]
+        n = len(account_ids)
+        chunk_size = math.ceil(len(post_links) / n)
+        split = [
+            {
+                "account_id": account_ids[i],
+                "post_links": post_links[i*chunk_size:(i+1)*chunk_size]
+            }
+            for i in range(n)
+            if post_links[i*chunk_size:(i+1)*chunk_size]
+        ]
+        for part in split:
+            tasks.append({
+                "task_id": task_id,
+                "platform": "vk",
+                "account_id": part["account_id"],
+                "api_key": api_key,
+                "post_links": part["post_links"],
+                "max_comments_per_post": max_comments_per_post,
+                "callback_url": callback_url
+            })
+    else:
+        raise HTTPException(400, "Платформа не поддерживается")
+
+    # 6. Постановка задач в очередь (Redis)
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost")
+    redis_conn = redis.from_url(redis_url)
+    for task in tasks:
+        await redis_conn.rpush("comment_tasks", json.dumps(task)) # type: ignore
+    await redis_conn.set(f"comment_task_status:{task_id}", json.dumps({"status": "processing"}))
+
+    # 7. Возврат task_id и статуса
+    return {"status": "processing", "task_id": task_id, "detail": "Задача на сбор комментариев принята"}
+
+async def get_collect_comments_status_handler(task_id):
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost")
+    redis_conn = redis.from_url(redis_url)
+    status_raw = await redis_conn.get(f"comment_task_status:{task_id}")
+    if not status_raw:
+        return {"status": "not_found", "task_id": task_id}
+    status = json.loads(status_raw)
+    if status.get("status") == "done":
+        result_raw = await redis_conn.get(f"comment_task_result:{task_id}")
+        if result_raw:
+            status["result"] = json.loads(result_raw)
+    return status 

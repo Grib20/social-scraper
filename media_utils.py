@@ -54,7 +54,8 @@ UPLOAD_SEMAPHORE = asyncio.Semaphore(5)
 download_counter = 0
 last_download_time = time.time()
 DOWNLOAD_RATE_LIMIT = 20
-MIN_DOWNLOAD_DELAY = 0.5
+MIN_DOWNLOAD_DELAY = 1.5  # минимальная задержка между скачиваниями
+MAX_DOWNLOAD_DELAY = 2.5  # максимальная задержка между скачиваниями
 
 # История FloodWait
 flood_wait_history = []
@@ -584,7 +585,6 @@ async def check_s3_file(s3_filename):
 async def calculate_download_delay():
     global download_counter, last_download_time, flood_wait_history
 
-    # Проверяем, не превышен ли лимит скачиваний в минуту
     current_time = time.time()
     if current_time - last_download_time >= 60:
         download_counter = 0
@@ -592,12 +592,12 @@ async def calculate_download_delay():
     if download_counter >= DOWNLOAD_RATE_LIMIT:
         return 60 - (current_time - last_download_time)
 
-    # Если есть ошибки FloodWait, увеличиваем задержку
     if flood_wait_history:
         max_wait = max(error['wait_time'] for error in flood_wait_history)
         return max(max_wait, MIN_DOWNLOAD_DELAY)
 
-    return MIN_DOWNLOAD_DELAY
+    # Возвращаем случайную задержку
+    return random.uniform(MIN_DOWNLOAD_DELAY, MAX_DOWNLOAD_DELAY)
 
 # --- Новая логика get_media_info и обработчика очереди --- 
 
@@ -838,7 +838,7 @@ async def process_upload_queue():
                         else:
                             logger.error(f"Воркер: Файл {local_path} не был создан при скачивании")
                             retry_count += 1
-                            await asyncio.sleep(1 * retry_count)  # Увеличиваем задержку с каждой попыткой
+                            await asyncio.sleep(random.uniform(MIN_DOWNLOAD_DELAY, MAX_DOWNLOAD_DELAY))  # Увеличиваем задержку с каждой попыткой
                     except FloodWaitError as flood_e:
                         retry_count += 1
                         wait_time = min(flood_e.seconds, 30)  # Ограничиваем время ожидания 30 секундами
@@ -860,11 +860,11 @@ async def process_upload_queue():
                         except Exception as reconnect_err:
                             logger.error(f"Воркер: Не удалось переподключиться и скачать медиа {file_id}: {reconnect_err}")
                             retry_count += 1
-                            await asyncio.sleep(1 * retry_count)
+                            await asyncio.sleep(random.uniform(MIN_DOWNLOAD_DELAY, MAX_DOWNLOAD_DELAY))
                     except Exception as e:
                         logger.error(f"Воркер: Ошибка при скачивании {file_id}: {e}")
                         retry_count += 1
-                        await asyncio.sleep(1 * retry_count)  # Увеличиваем задержку с каждой попыткой
+                        await asyncio.sleep(random.uniform(MIN_DOWNLOAD_DELAY, MAX_DOWNLOAD_DELAY))  # Увеличиваем задержку с каждой попыткой
                 
                 # --- Загрузка в S3 --- 
                 if download_success:

@@ -1217,3 +1217,72 @@ async def find_groups_by_keywords(vk, keywords, min_members=10000, max_count=20,
     if isinstance(result, bool) or result is None:
         return []
     return result
+
+async def fetch_vk_comments(owner_id, post_id, access_token, max_comments=100):
+    """
+    Получить комментарии к посту VK через VK API.
+    owner_id: ID владельца стены (отрицательный для групп)
+    post_id: ID поста
+    access_token: токен пользователя или группы с нужными правами
+    max_comments: максимальное количество комментариев
+    """
+    comments = []
+    url = "https://api.vk.com/method/wall.getComments"
+    params = {
+        "owner_id": owner_id,
+        "post_id": post_id,
+        "access_token": access_token,
+        "v": "5.131",
+        "count": 100,
+        "extended": 1  # Важно: extended=1, чтобы получить profiles/groups
+    }
+    offset = 0
+    author_cache = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            while len(comments) < max_comments:
+                params["offset"] = offset
+                params["count"] = min(100, max_comments - len(comments))
+                async with session.get(url, params=params, timeout=15) as resp:
+                    data = await resp.json()
+                    if "error" in data:
+                        return None, data["error"].get("error_msg", str(data["error"]))
+                    items = data.get("response", {}).get("items", [])
+                    profiles = {p["id"]: p for p in data.get("response", {}).get("profiles", [])}
+                    groups = {-(g["id"]): g for g in data.get("response", {}).get("groups", [])}
+                    for item in items:
+                        from_id = item.get("from_id")
+                        author = None
+                        if from_id:
+                            if from_id > 0 and from_id in profiles:
+                                p = profiles[from_id]
+                                author = {
+                                    "id": p["id"],
+                                    "first_name": p.get("first_name"),
+                                    "last_name": p.get("last_name"),
+                                    "screen_name": p.get("screen_name"),
+                                    "photo": p.get("photo_50")
+                                }
+                            elif from_id < 0 and from_id in groups:
+                                g = groups[from_id]
+                                author = {
+                                    "id": -g["id"],
+                                    "name": g.get("name"),
+                                    "screen_name": g.get("screen_name"),
+                                    "photo": g.get("photo_50")
+                                }
+                        comments.append({
+                            "id": item["id"],
+                            "text": item.get("text", ""),
+                            "date": item.get("date"),
+                            "from_id": from_id,
+                            "author": author
+                        })
+                    if len(items) < params["count"]:
+                        break  # Больше нет комментариев
+                    offset += len(items)
+        if not comments:
+            return [], "no_comments"
+        return comments, None
+    except Exception as e:
+        return None, str(e)

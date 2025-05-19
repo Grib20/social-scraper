@@ -89,3 +89,4 @@ redis-server.log.2
 js_tools/
 instagram/workers/instagram_puppeteer/node_modules/
 node_modules/
+buck/
