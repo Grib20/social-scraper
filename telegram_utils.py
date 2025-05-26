@@ -866,8 +866,9 @@ async def _process_channels_for_trending(
                 # --- ДИАГНОСТИКА: Пытаемся получить 1 сообщение напрямую ---
                 try:
                     latest_message = await client.get_messages(peer_identifier, limit=1)
-                    if latest_message:
-                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) successful. Latest post ID: {latest_message.id}, Date: {latest_message.date}")
+                    if latest_message and hasattr(latest_message, '__len__') and len(latest_message) > 0:
+                        msg = latest_message[0]
+                        logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) successful. Latest post ID: {msg.id}, Date: {msg.date}")
                     else:
                         logger.warning(f"[Acc: {account_id}][Chan: {channel_id_input}] DIAGNOSTIC: get_messages(limit=1) returned an empty result.")
                 except Exception as e_get_msg:
@@ -1994,10 +1995,10 @@ async def _process_groups_for_period_task(
                             subscribers = 10
                     subscribers_for_calc = max(subscribers, 10)
                     # Считаем trend_score по формуле из trending
-                    views_msg = getattr(message, 'views', 0)
+                    views_msg = getattr(message, 'views', 0) or 0
                     reactions_msg = sum(r.count for r in message.reactions.results) if message.reactions and message.reactions.results else 0
-                    comments_msg = message.replies.replies if message.replies else 0
-                    forwards_msg = getattr(message, 'forwards', 0)
+                    comments_msg = message.replies.replies if message.replies and message.replies.replies is not None else 0
+                    forwards_msg = getattr(message, 'forwards', 0) or 0
 
                     raw_engagement_score = (views_msg or 0) + (reactions_msg * 10) + (comments_msg * 20) + (forwards_msg * 50)
                     if subscribers_for_calc > 1 and raw_engagement_score > 0:

@@ -90,3 +90,4 @@ js_tools/
 instagram/workers/instagram_puppeteer/node_modules/
 node_modules/
 buck/
+social-scraper.*
