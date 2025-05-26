@@ -1899,9 +1899,11 @@ async def _process_groups_for_period_task(
             # Используем channel_entity вместо group_id в iter_messages для большей надежности
             async for message in client.iter_messages(channel_entity, limit=limit_per_channel): 
                 message_count_in_loop += 1
-                # --- Логика обработки message (из старой process_single_channel) ---
+                # Пропускаем None и сообщения без даты
                 if not message or not message.date: continue # Добавим проверку на None
-                
+                # Пропускаем системные сообщения (action != None)
+                if getattr(message, 'action', None) is not None:
+                    continue
                 msg_date_naive = message.date.replace(tzinfo=None)
                 if msg_date_naive <= cutoff_date: # Сравниваем с cutoff_date без tzinfo
                     logger.debug(f"[Task Acc: {account_id}] [Chan: {group_id}] Сообщение {message.id} ({msg_date_naive}) слишком старое ({cutoff_date}). Прерываем.")
