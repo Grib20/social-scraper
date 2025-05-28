@@ -374,7 +374,8 @@ async def collect_comments_handler(request, data):
     redis_url = os.environ.get("REDIS_URL", "redis://localhost")
     redis_conn = redis.from_url(redis_url)
     for task in tasks:
-        await redis_conn.rpush("comment_tasks", json.dumps(task)) # type: ignore
+        await redis_conn.rpush("comment_subtasks", json.dumps(task)) # type: ignore
+    await redis_conn.set(f"comments_task:{task_id}:pending", len(tasks))
     await redis_conn.set(f"comment_task_status:{task_id}", json.dumps({"status": "processing"}))
 
     # 7. Возврат task_id и статуса
