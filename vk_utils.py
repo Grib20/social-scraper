@@ -150,7 +150,7 @@ async def validate_proxy_connection(proxy: Optional[str]) -> Tuple[bool, str]:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get("https://api.vk.com/method/users.get", 
-                                        params={"v": "5.131"}, 
+                                        params={"v": "5.199"}, 
                                         proxy=proxy, 
                                         timeout=10) as response:
                         if response.status == 200:
@@ -169,7 +169,7 @@ async def validate_proxy_connection(proxy: Optional[str]) -> Tuple[bool, str]:
             connector = ProxyConnector.from_url(proxy)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get("https://api.vk.com/method/users.get", 
-                                     params={"v": "5.131"}, 
+                                     params={"v": "5.199"}, 
                                      timeout=10) as response:
                     if response.status == 200:
                         return True, "Прокси работает"
@@ -229,7 +229,7 @@ class VKClient:
         self.api_key = api_key
         self.session = None
         self.base_url = "https://api.vk.com/method"
-        self.version = "5.131"
+        self.version = "5.199"
         self.last_request_time = 0
         self.last_group_request_time = 0
         self.requests_count = 0
@@ -1232,7 +1232,7 @@ async def fetch_vk_comments(owner_id, post_id, access_token, max_comments=100):
         "owner_id": owner_id,
         "post_id": post_id,
         "access_token": access_token,
-        "v": "5.131",
+        "v": "5.199",
         "count": 100,
         "extended": 1  # Важно: extended=1, чтобы получить profiles/groups
     }

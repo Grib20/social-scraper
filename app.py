@@ -4607,7 +4607,7 @@ async def check_proxy_endpoint(request: Request):
             import aiohttp
             async with aiohttp.ClientSession() as session:
                 async with session.get("https://api.vk.com/method/users.get", 
-                                       params={"v": "5.131"}, 
+                                       params={"v": "5.199"}, 
                                        proxy=proxy, 
                                        timeout=10) as response:
                     if response.status == 200:
