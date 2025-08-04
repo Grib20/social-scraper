@@ -686,30 +686,87 @@ class VKClient:
             
         try:
             logger.info(f"Запрашиваем количество участников группы {group_id_int}")
+            
+            # Попробуем сначала новый подход - используем версию API 5.199 с правильными параметрами
             result = await self._make_request("groups.getById", {
-                "group_id": group_id_int,
+                "group_ids": str(group_id_int),  # Используем group_ids для совместимости с новой версией API
                 "fields": "members_count"
             })
             
-            if "response" in result and result["response"] and "members_count" in result["response"][0]:
-                members_count = result["response"][0]["members_count"]
-                logger.info(f"Получено количество участников группы {group_id_int}: {members_count}")
+            if "response" in result and result["response"]:
+                # Новый формат ответа VK API - данные находятся в response.groups
+                if "groups" in result["response"] and result["response"]["groups"]:
+                    group_data = result["response"]["groups"][0]
+                    
+                    # Проверяем разные возможные поля для количества участников
+                    members_count = None
+                    if "members_count" in group_data:
+                        members_count = group_data["members_count"]
+                    elif "member_count" in group_data:  # Возможное альтернативное название
+                        members_count = group_data["member_count"]
+                    elif "count" in group_data:  # Еще одно возможное название
+                        members_count = group_data["count"]
+                else:
+                    # Старый формат ответа (для совместимости)
+                    group_data = result["response"][0] if isinstance(result["response"], list) else result["response"]
+                    
+                    # Проверяем разные возможные поля для количества участников
+                    members_count = None
+                    if "members_count" in group_data:
+                        members_count = group_data["members_count"]
+                    elif "member_count" in group_data:  # Возможное альтернативное название
+                        members_count = group_data["member_count"]
+                    elif "count" in group_data:  # Еще одно возможное название
+                        members_count = group_data["count"]
                 
-                # Сохраняем результат во всех кэшах
-                self.group_members_cache[group_id_int] = members_count
-                GROUP_MEMBERS_CACHE[group_id_int] = members_count
-                
-                # Сохраняем в Redis с TTL, если доступен
-                if redis_client:
-                    try:
-                        redis_client.setex(redis_key, GROUP_MEMBERS_CACHE_TTL, members_count)
-                        logger.info(f"Сохранено количество участников группы {group_id_int} в Redis с TTL {GROUP_MEMBERS_CACHE_TTL} сек")
-                    except Exception as e:
-                        logger.error(f"Ошибка при сохранении в Redis: {e}")
-                
-                return members_count
+                if members_count is not None:
+                    logger.info(f"Получено количество участников группы {group_id_int}: {members_count}")
+                    
+                    # Сохраняем результат во всех кэшах
+                    self.group_members_cache[group_id_int] = members_count
+                    GROUP_MEMBERS_CACHE[group_id_int] = members_count
+                    
+                    # Сохраняем в Redis с TTL, если доступен
+                    if redis_client:
+                        try:
+                            redis_client.setex(redis_key, GROUP_MEMBERS_CACHE_TTL, members_count)
+                            logger.info(f"Сохранено количество участников группы {group_id_int} в Redis с TTL {GROUP_MEMBERS_CACHE_TTL} сек")
+                        except Exception as e:
+                            logger.error(f"Ошибка при сохранении в Redis: {e}")
+                    
+                    return members_count
+                else:
+                    logger.warning(f"Поле members_count не найдено в ответе для группы {group_id_int}. Доступные поля: {list(group_data.keys())}")
+                    
+                    # Попробуем альтернативный подход - используем groups.getById без fields
+                    logger.info(f"Пробуем альтернативный метод для группы {group_id_int}")
+                    alt_result = await self._make_request("groups.getById", {
+                        "group_ids": str(group_id_int)
+                    })
+                    
+                    if "response" in alt_result and alt_result["response"]:
+                        if "groups" in alt_result["response"] and alt_result["response"]["groups"]:
+                            alt_group_data = alt_result["response"]["groups"][0]
+                            # Если поле members_count все еще отсутствует, используем значение по умолчанию
+                            if "members_count" in alt_group_data:
+                                members_count = alt_group_data["members_count"]
+                                logger.info(f"Получено количество участников группы {group_id_int} через альтернативный метод: {members_count}")
+                                
+                                # Сохраняем результат во всех кэшах
+                                self.group_members_cache[group_id_int] = members_count
+                                GROUP_MEMBERS_CACHE[group_id_int] = members_count
+                                
+                                if redis_client:
+                                    try:
+                                        redis_client.setex(redis_key, GROUP_MEMBERS_CACHE_TTL, members_count)
+                                    except Exception as e:
+                                        logger.error(f"Ошибка при сохранении в Redis: {e}")
+                                
+                                return members_count
+                    
+                    return 10000  # Возвращаем значение по умолчанию
             else:
-                logger.warning(f"Не удалось получить количество участников группы {group_id_int}")
+                logger.warning(f"Не удалось получить количество участников группы {group_id_int}. Полный ответ: {result}")
                 return 10000  # Возвращаем значение по умолчанию
         except Exception as e:
             logger.error(f"Ошибка при получении количества участников группы {group_id_int}: {e}")
