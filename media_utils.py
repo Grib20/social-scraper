@@ -80,26 +80,39 @@ if not os.path.exists(MEDIA_DOWNLOAD_DIR):
     os.makedirs(MEDIA_DOWNLOAD_DIR)
 
 
+def _pick_font(size: int):
+    """Подбирает системный шрифт с поддержкой кириллицы (Linux/Windows), иначе default."""
+    candidates = [
+        os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts', 'Arial.ttf'),
+        os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts', 'Verdana.ttf'),
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',
+        '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+    ]
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
 def _draw_video_placeholder(img: Image.Image, file_size: int = 0, post_url: Optional[str] = None, post_text: Optional[str] = None):
     draw = ImageDraw.Draw(img)
     width, height = img.size
-    # Шрифты
-    try:
-        font_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
-        font_path_arial = os.path.join(font_dir, 'Arial.ttf')
-        font_path_verdana = os.path.join(font_dir, 'Verdana.ttf')
-        if os.path.exists(font_path_arial):
-            text_font = ImageFont.truetype(font_path_arial, 24)
-            small_font = ImageFont.truetype(font_path_arial, 18)
-        elif os.path.exists(font_path_verdana):
-            text_font = ImageFont.truetype(font_path_verdana, 24)
-            small_font = ImageFont.truetype(font_path_verdana, 18)
-        else:
-            text_font = ImageFont.load_default()
-            small_font = ImageFont.load_default()
-    except Exception:
-        text_font = ImageFont.load_default()
-        small_font = ImageFont.load_default()
+
+    # Шрифты (Linux/Windows-friendly)
+    text_font = _pick_font(24)
+    small_font = _pick_font(18)
+    size_font = _pick_font(26)
+
+    # Размер файла вверху (центр)
+    if file_size and file_size > 0:
+        size_mb = round(file_size / (1024 * 1024), 1)
+        size_text = f"{size_mb} МБ"
+        size_w = draw.textlength(size_text, font=size_font)
+        draw.text(((width - size_w) / 2, 16), size_text, font=size_font, fill=(235, 235, 235))
 
     # Иконка play (по центру)
     tri = [
@@ -112,23 +125,22 @@ def _draw_video_placeholder(img: Image.Image, file_size: int = 0, post_url: Opti
     # Сообщение об источнике
     hint_text = "Просмотр видео доступен в источнике"
     hint_w = draw.textlength(hint_text, font=text_font)
-    hint_y = int(height * 0.68)
+    hint_y = int(height * 0.70)
     draw.text(((width - hint_w) / 2, hint_y), hint_text, font=text_font, fill=(235, 235, 235))
 
     # URL под сообщением (укороченный)
-    url_y = hint_y + 36
+    url_y = hint_y + 34
     if post_url:
         url_disp = post_url if len(post_url) <= 60 else post_url[:57] + "..."
         url_w = draw.textlength(url_disp, font=small_font)
         draw.text(((width - url_w) / 2, url_y), url_disp, font=small_font, fill=(200, 200, 200))
 
-    # Вертикальная стрелка вниз в правом нижнем углу
+    # Вертикальная стрелка вниз в правом нижнем углу (как указал пользователь)
     cx = width - 60
     line_top = height - 90
     line_bottom = height - 30
     if line_bottom > line_top:
         draw.line((cx, line_top, cx, line_bottom), fill=(255, 255, 255), width=3)
-        # Наконечник стрелки (вниз)
         head = [
             (cx, line_bottom + 8),
             (cx - 10, line_bottom - 2),
@@ -162,81 +174,65 @@ async def process_single_media_background(account_id: str, media_object, file_id
         try:
             if client.is_connected():
                 is_connected = True
-                # Дополнительно проверяем авторизацию, если уже подключены
                 if not await client.is_user_authorized():
                     logger.error(f"BG Auth Error: Клиент {account_id} подключен, но НЕ АВТОРИЗОВАН. Задача прервана.")
-                    return # Прерываем, если не авторизован
+                    return
                 logger.debug(f"BG Connect: Клиент {account_id} уже подключен и авторизован.")
             else:
                 logger.info(f"BG Connect: Клиент {account_id} не подключен. Подключаемся...")
                 await client.connect()
                 if not await client.is_user_authorized():
                     logger.error(f"BG Auth Error: Клиент {account_id} НЕ АВТОРИЗОВАН после подключения. Задача прервана.")
-                    await client.disconnect() # Отключаем, если не удалось авторизоваться
+                    await client.disconnect()
                     return
                 is_connected = True
                 logger.info(f"BG Connect: Клиент {account_id} успешно подключен и авторизован.")
         except SessionPasswordNeededError:
              logger.error(f"BG Auth Error: Клиент {account_id} требует 2FA пароль. Невозможно продолжить. Задача прервана.")
-             # Пытаемся отключить, если возможно
              try: await client.disconnect() 
              except: pass
              return
         except Exception as conn_err:
             logger.error(f"BG Connect Error: Ошибка при проверке/установке соединения для клиента {account_id}: {conn_err}", exc_info=True)
-            return # Прерываем задачу, если не удалось подключиться
+            return
 
         if not is_connected:
              logger.error(f"BG Connect Error: Соединение для клиента {account_id} не установлено. Задача прервана.")
              return
-        # --- Конец получения и проверки клиента ---
 
-        # --- Дальнейшая логика скачивания и загрузки (как и была) ---
-        # Проверяем кэш S3 перед скачиванием
+        # Проверяем кэш S3
         cache_hit = False
         if file_id in s3_file_cache:
-            cached_s3_file = s3_file_cache.get(file_id) # Используем get для безопасности
+            cached_s3_file = s3_file_cache.get(file_id)
             if isinstance(cached_s3_file, str) and await check_s3_file(cached_s3_file):
-                 logger.debug(f"BG Cache HIT: Файл {file_id} уже в S3 ({cached_s3_file}), выход.")
-                 # Перемещаем в конец OrderedDict для LRU-подобного поведения
                  s3_file_cache.move_to_end(file_id)
                  cache_hit = True
-            elif isinstance(cached_s3_file, dict) and cached_s3_file.get('is_preview'): # Обработка заглушек
-                 logger.debug(f"BG Cache HIT: Файл {file_id} является заглушкой/превью, выход.")
+            elif isinstance(cached_s3_file, dict) and cached_s3_file.get('is_preview'):
                  s3_file_cache.move_to_end(file_id)
                  cache_hit = True
             else:
-                 logger.debug(f"BG Cache Invalid: Запись для {file_id} в кэше некорректна или файл не найден в S3 ({cached_s3_file}).")
-                 # Удаляем некорректную запись из кэша
                  if file_id in s3_file_cache:
-                     try:
-                         del s3_file_cache[file_id]
-                     except KeyError:
-                         pass # Уже удален
+                     try: del s3_file_cache[file_id]
+                     except KeyError: pass
 
-        # Если в кэше не нашли, проверяем напрямую S3 (на случай рассинхронизации кэша)
         if not cache_hit and await check_s3_file(s3_filename):
-            logger.debug(f"BG S3 Check HIT: Файл {s3_filename} (ID: {file_id}) уже в S3, обновляем кэш.")
             s3_file_cache[file_id] = s3_filename
             s3_file_cache.move_to_end(file_id)
             cache_hit = True
-            # Опционально: обрезать кэш
             while len(s3_file_cache) > MAX_CACHE_SIZE:
                 s3_file_cache.popitem(last=False)
 
         if cache_hit:
-            return # Файл уже обработан или существует
+            return
 
-        # Если файла нет, скачиваем и загружаем
         logger.info(f"BG Start: Начинаем обработку медиа {file_id} -> {s3_filename}")
         temp_dir = None
         local_path = None
         try:
-            async with DOWNLOAD_SEMAPHORE: # Используем семафор для скачивания
-                temp_dir = tempfile.mkdtemp(dir=MEDIA_DOWNLOAD_DIR) # Создаем во временной директории
-                local_path = os.path.join(temp_dir, os.path.basename(s3_filename)) # Используем имя S3 для локального файла
+            async with DOWNLOAD_SEMAPHORE:
+                temp_dir = tempfile.mkdtemp(dir=MEDIA_DOWNLOAD_DIR)
+                local_path = os.path.join(temp_dir, os.path.basename(s3_filename))
 
-                # Обработка видео: по политике всегда плейсхолдер или для больших видео
                 file_size = getattr(media_object, 'size', 0) if hasattr(media_object, 'size') else 0
                 is_video = False
                 if hasattr(media_object, 'mime_type') and media_object.mime_type and media_object.mime_type.startswith('video/'):
@@ -247,17 +243,14 @@ async def process_single_media_background(account_id: str, media_object, file_id
                     placeholder_path = os.path.join(temp_dir, f"placeholder_{file_id}.jpg")
                     thumb_s3_filename = s3_filename if s3_filename.endswith('_thumb.jpg') else s3_filename.replace(os.path.splitext(s3_filename)[1], "_thumb.jpg")
 
-                    # Создаем заглушку
                     try:
                          width, height = 960, 540
                          img = Image.new('RGB', (width, height), color=(40, 40, 40))
                          _draw_video_placeholder(img, file_size=file_size, post_url=post_url, post_text=post_text)
                          img.save(placeholder_path, "JPEG", quality=90)
 
-                         # Загружаем заглушку
                          upload_success, _ = await upload_to_s3(placeholder_path, thumb_s3_filename, check_size=False)
                          if upload_success:
-                             logger.debug(f"BG Placeholder Upload: Заглушка для {file_id} загружена: {thumb_s3_filename}")
                              preview_info = {'is_preview': True, 'thumbnail': thumb_s3_filename, 'size': file_size}
                              s3_file_cache[file_id] = preview_info
                              s3_file_cache.move_to_end(file_id)
@@ -283,14 +276,11 @@ async def process_single_media_background(account_id: str, media_object, file_id
                     except Exception as reconnect_err:
                         logger.error(f"BG Download Error: Не удалось переподключиться и скачать медиа {file_id}: {reconnect_err}")
                         return
-                # Проверяем, что download_media вернул путь и файл существует
                 if downloaded_path and os.path.exists(downloaded_path):
-                    local_path = downloaded_path # Используем путь, возвращенный download_media
+                    local_path = downloaded_path
                     logger.debug(f"BG Download OK: Медиа {file_id} скачано в {local_path}")
 
-                    # Загрузка в S3
                     logger.debug(f"BG Upload: Файл {local_path} существует, начинаем загрузку в S3 как {s3_filename}")
-                    # Определяем, нужно ли оптимизировать (только для фото)
                     optimize_upload = False
                     if hasattr(media_object, 'mime_type') and media_object.mime_type:
                          if media_object.mime_type.lower() in ['image/jpeg', 'image/png']:
@@ -299,15 +289,11 @@ async def process_single_media_background(account_id: str, media_object, file_id
                     upload_success, _ = await upload_to_s3(local_path, s3_filename, optimize=optimize_upload)
 
                     if upload_success:
-                        # Обновляем кэш после успешной загрузки
                         s3_file_cache[file_id] = s3_filename
-                        s3_file_cache.move_to_end(file_id) # Обновляем порядок в кэше
+                        s3_file_cache.move_to_end(file_id)
                         logger.info(f"BG Upload OK: Файл {s3_filename} (ID: {file_id}) успешно загружен и добавлен в кэш.")
-                        # Обрезаем кэш, если он превысил размер
                         while len(s3_file_cache) > MAX_CACHE_SIZE:
                              s3_file_cache.popitem(last=False)
-                             # Возможно, стоит периодически сохранять кэш
-                             # await save_cache()
                     else:
                         logger.error(f"BG Upload Error: Не удалось загрузить файл {local_path} в S3 как {s3_filename}")
                 else:
@@ -315,17 +301,15 @@ async def process_single_media_background(account_id: str, media_object, file_id
 
         except FloodWaitError as flood_e:
             logger.warning(f"BG FloodWait: Flood wait на {flood_e.seconds} секунд при обработке медиа {file_id}. Задача не будет повторена автоматически.")
-            # Здесь можно добавить логику повторного добавления задачи в очередь или другую обработку
         except Exception as e:
             logger.error(f"BG Error: Ошибка при фоновой обработке медиа {file_id} -> {s3_filename}: {e}", exc_info=True)
         finally:
-            # Удаляем временную директорию и ее содержимое
             if temp_dir and os.path.exists(temp_dir):
                 try:
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     logger.debug(f"BG Cleanup: Временная директория {temp_dir} удалена для медиа {file_id}")
                 except Exception as cleanup_err:
-                     logger.error(f"BG Cleanup Error: Ошибка при удалении {temp_dir}: {cleanup_err}")
+                    logger.error(f"BG Cleanup Error: Ошибка при удалении {temp_dir}: {cleanup_err}")
 
     except asyncio.CancelledError:
         logger.info("Процесс обработки очереди загрузки отменен")
