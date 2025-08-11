@@ -18,6 +18,7 @@ from aiojobs import create_scheduler
 from dotenv import load_dotenv
 from typing import Union, Callable, Any, Optional, List, Dict
 import asyncpg
+import textwrap
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -36,6 +37,11 @@ S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'scraper')
 S3_REGION = os.getenv('S3_REGION', 'ru-central1')
 S3_LINK_TEMPLATE = os.getenv('S3_LINK_TEMPLATE', 'https://scraper.website.yandexcloud.net/{filename}')
 MAX_FILE_SIZE = 50 * 1024 * 1024
+# Политика медиа
+TG_MEDIA_POLICY = os.getenv('TG_MEDIA_POLICY', 'all').lower()  # all | thumbnails_only
+TG_VIDEO_PLACEHOLDER_ALWAYS = os.getenv('TG_VIDEO_PLACEHOLDER_ALWAYS', 'false').lower() == 'true'
+THUMBNAIL_MAX_DIM = int(os.getenv('THUMBNAIL_MAX_DIM', '1024'))
+THUMBNAIL_JPEG_QUALITY = int(os.getenv('THUMBNAIL_JPEG_QUALITY', '70'))
 
 # S3 клиент 
 s3_client = None
@@ -74,8 +80,65 @@ if not os.path.exists(MEDIA_DOWNLOAD_DIR):
     os.makedirs(MEDIA_DOWNLOAD_DIR)
 
 
+def _draw_video_placeholder(img: Image.Image, file_size: int = 0, post_url: Optional[str] = None, post_text: Optional[str] = None):
+    draw = ImageDraw.Draw(img)
+    width, height = img.size
+    # Шрифты
+    try:
+        font_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
+        font_path_arial = os.path.join(font_dir, 'Arial.ttf')
+        font_path_verdana = os.path.join(font_dir, 'Verdana.ttf')
+        if os.path.exists(font_path_arial):
+            text_font = ImageFont.truetype(font_path_arial, 24)
+            small_font = ImageFont.truetype(font_path_arial, 18)
+        elif os.path.exists(font_path_verdana):
+            text_font = ImageFont.truetype(font_path_verdana, 24)
+            small_font = ImageFont.truetype(font_path_verdana, 18)
+        else:
+            text_font = ImageFont.load_default()
+            small_font = ImageFont.load_default()
+    except Exception:
+        text_font = ImageFont.load_default()
+        small_font = ImageFont.load_default()
+
+    # Иконка play (по центру)
+    tri = [
+        (width / 2 - 30, height / 2 - 40),
+        (width / 2 + 30, height / 2),
+        (width / 2 - 30, height / 2 + 40),
+    ]
+    draw.polygon(tri, fill=(255, 255, 255))
+
+    # Сообщение об источнике
+    hint_text = "Просмотр видео доступен в источнике"
+    hint_w = draw.textlength(hint_text, font=text_font)
+    hint_y = int(height * 0.68)
+    draw.text(((width - hint_w) / 2, hint_y), hint_text, font=text_font, fill=(235, 235, 235))
+
+    # URL под сообщением (укороченный)
+    url_y = hint_y + 36
+    if post_url:
+        url_disp = post_url if len(post_url) <= 60 else post_url[:57] + "..."
+        url_w = draw.textlength(url_disp, font=small_font)
+        draw.text(((width - url_w) / 2, url_y), url_disp, font=small_font, fill=(200, 200, 200))
+
+    # Вертикальная стрелка вниз в правом нижнем углу
+    cx = width - 60
+    line_top = height - 90
+    line_bottom = height - 30
+    if line_bottom > line_top:
+        draw.line((cx, line_top, cx, line_bottom), fill=(255, 255, 255), width=3)
+        # Наконечник стрелки (вниз)
+        head = [
+            (cx, line_bottom + 8),
+            (cx - 10, line_bottom - 2),
+            (cx + 10, line_bottom - 2)
+        ]
+        draw.polygon(head, fill=(255, 255, 255))
+
+
 # --- Новая функция для фоновой обработки ---
-async def process_single_media_background(account_id: str, media_object, file_id, s3_filename):
+async def process_single_media_background(account_id: str, media_object, file_id, s3_filename, post_url: Optional[str] = None, post_text: Optional[str] = None):
     """Скачивает медиафайл, загружает в S3 и обновляет кэш (Фоновая задача)."""
     logger = logging.getLogger(__name__)
     logger.info(f"BG Start: Начинаем обработку медиа {file_id} -> {s3_filename} с использованием аккаунта {account_id}")
@@ -173,80 +236,22 @@ async def process_single_media_background(account_id: str, media_object, file_id
                 temp_dir = tempfile.mkdtemp(dir=MEDIA_DOWNLOAD_DIR) # Создаем во временной директории
                 local_path = os.path.join(temp_dir, os.path.basename(s3_filename)) # Используем имя S3 для локального файла
 
-                # Обработка больших видео (создание заглушки вместо скачивания)
+                # Обработка видео: по политике всегда плейсхолдер или для больших видео
                 file_size = getattr(media_object, 'size', 0) if hasattr(media_object, 'size') else 0
                 is_video = False
                 if hasattr(media_object, 'mime_type') and media_object.mime_type and media_object.mime_type.startswith('video/'):
                      is_video = True
 
-                if is_video and file_size > MAX_FILE_SIZE:
-                    logger.info(f"BG Large Video: Видео {file_id} ({file_size} байт) превышает лимит, создаем заглушку.")
+                if is_video and (TG_VIDEO_PLACEHOLDER_ALWAYS or file_size > MAX_FILE_SIZE):
+                    logger.info(f"BG Video Placeholder: Для {file_id} создаем заглушку (policy={TG_VIDEO_PLACEHOLDER_ALWAYS}, size={file_size}).")
                     placeholder_path = os.path.join(temp_dir, f"placeholder_{file_id}.jpg")
-                    thumb_s3_filename = s3_filename.replace(os.path.splitext(s3_filename)[1], "_thumb.jpg")
+                    thumb_s3_filename = s3_filename if s3_filename.endswith('_thumb.jpg') else s3_filename.replace(os.path.splitext(s3_filename)[1], "_thumb.jpg")
 
                     # Создаем заглушку
                     try:
-                         width, height = 640, 360
-                         img = Image.new('RGB', (width, height), color=(50, 50, 50))
-                         draw = ImageDraw.Draw(img)
-                         try: # Пытаемся загрузить шрифт
-                             font_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
-                             font_path_arial = os.path.join(font_dir, 'Arial.ttf')
-                             font_path_verdana = os.path.join(font_dir, 'Verdana.ttf') # Запасной вариант
-                             if os.path.exists(font_path_arial):
-                                 title_font = ImageFont.truetype(font_path_arial, 30)
-                                 regular_font = ImageFont.truetype(font_path_arial, 20)
-                             elif os.path.exists(font_path_verdana):
-                                  title_font = ImageFont.truetype(font_path_verdana, 30)
-                                  regular_font = ImageFont.truetype(font_path_verdana, 20)
-                             else:
-                                 logger.warning("Шрифты Arial и Verdana не найдены, используется шрифт по умолчанию.")
-                                 title_font = ImageFont.load_default()
-                                 regular_font = ImageFont.load_default()
-                         except Exception as font_err:
-                             logger.warning(f"Ошибка загрузки шрифта ({font_err}), используется шрифт по умолчанию.")
-                             title_font = ImageFont.load_default()
-                             regular_font = ImageFont.load_default()
-
-                         file_size_mb = round(file_size / (1024 * 1024), 1)
-                         title_text = f"Большой видеофайл ({file_size_mb} МБ)"
-                         subtitle_text = "Просмотр доступен только в оригинальном посте"
-
-                         # Используем textbbox для центрирования (требует Pillow >= 8.0.0)
-                         try:
-                            title_box = draw.textbbox((0, 0), title_text, font=title_font)
-                            subtitle_box = draw.textbbox((0, 0), subtitle_text, font=regular_font)
-                            title_width = title_box[2] - title_box[0]
-                            title_height = title_box[3] - title_box[1]
-                            subtitle_width = subtitle_box[2] - subtitle_box[0]
-                            # subtitle_height = subtitle_box[3] - subtitle_box[1] # не используется
-
-                            title_x = (width - title_width) / 2
-                            title_y = height / 2 - title_height # Сдвигаем выше
-                            subtitle_x = (width - subtitle_width) / 2
-                            subtitle_y = height / 2 + 10 # Оставляем ниже
-
-                         except AttributeError: # Для старых версий Pillow
-                            logger.warning("Метод textbbox недоступен, используется textlength для центрирования.")
-                            title_width = draw.textlength(title_text, font=title_font)
-                            subtitle_width = draw.textlength(subtitle_text, font=regular_font)
-                            title_x = (width - title_width) / 2
-                            title_y = height / 2 - 30
-                            subtitle_x = (width - subtitle_width) / 2
-                            subtitle_y = height / 2 + 10
-
-                         draw.text((title_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
-                         draw.text((subtitle_x, subtitle_y), subtitle_text, font=regular_font, fill=(200, 200, 200))
-
-                         # Рисуем значок "play" для видео
-                         icon_y_center = title_y - 40 # Над заголовком
-                         triangle_points = [
-                            (width / 2 - 15, icon_y_center - 20), # top left
-                            (width / 2 + 15, icon_y_center),     # middle right
-                            (width / 2 - 15, icon_y_center + 20)  # bottom left
-                         ]
-                         draw.polygon(triangle_points, fill=(255, 255, 255))
-
+                         width, height = 960, 540
+                         img = Image.new('RGB', (width, height), color=(40, 40, 40))
+                         _draw_video_placeholder(img, file_size=file_size, post_url=post_url, post_text=post_text)
                          img.save(placeholder_path, "JPEG", quality=90)
 
                          # Загружаем заглушку
@@ -255,17 +260,15 @@ async def process_single_media_background(account_id: str, media_object, file_id
                              logger.debug(f"BG Placeholder Upload: Заглушка для {file_id} загружена: {thumb_s3_filename}")
                              preview_info = {'is_preview': True, 'thumbnail': thumb_s3_filename, 'size': file_size}
                              s3_file_cache[file_id] = preview_info
-                             s3_file_cache.move_to_end(file_id) # Обновляем порядок в кэше
+                             s3_file_cache.move_to_end(file_id)
                              while len(s3_file_cache) > MAX_CACHE_SIZE: s3_file_cache.popitem(last=False)
                          else:
                               logger.error(f"BG Placeholder Upload Error: Не удалось загрузить заглушку {thumb_s3_filename}")
-
                     except Exception as e:
                         logger.error(f"BG Placeholder Error: Ошибка при создании заглушки для {file_id}: {e}", exc_info=True)
-                    # Выходим после обработки заглушки
                     return
 
-                # Обычное скачивание (не большое видео)
+                # Обычное скачивание (не видео-плейсхолдер)
                 logger.debug(f"BG Download: Начинаем скачивание медиа {file_id} в {local_path}")
                 try:
                     downloaded_path = await client.download_media(media_object, local_path)
@@ -414,14 +417,20 @@ async def close_scheduler():
 # --- Функции обработки медиа --- 
 
 async def optimize_image(file_path, output_path):
-    """Сжимает изображение, сохраняя его в output_path."""
+    """Сжимает изображение, сохраняя его в output_path. При thumbnails_only даунскейлит до THUMBNAIL_MAX_DIM и JPEG=THUMBNAIL_JPEG_QUALITY."""
     try:
         with Image.open(file_path) as img:
             # Конвертируем в RGB, если изображение в RGBA (например, PNG с прозрачностью)
-            if img.mode == 'RGBA':
+            if img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
-            # Сжимаем изображение
-            img.save(output_path, 'JPEG', quality=80, optimize=True)
+            # Политика: уменьшать до миниатюры
+            if TG_MEDIA_POLICY == 'thumbnails_only':
+                # Сохраняем пропорции, ограничиваем по большей стороне (дефолтный ресемплинг для совместимости)
+                img.thumbnail((THUMBNAIL_MAX_DIM, THUMBNAIL_MAX_DIM))
+                img.save(output_path, 'JPEG', quality=THUMBNAIL_JPEG_QUALITY, optimize=True)
+            else:
+                # Обычная оптимизация без изменения размеров
+                img.save(output_path, 'JPEG', quality=80, optimize=True)
         logger.debug(f"Изображение сжато: {output_path}")
     except Exception as e:
         logger.error(f"Ошибка при сжатии изображения {file_path}: {e}")
@@ -723,7 +732,11 @@ async def get_media_info(client, msg, album_messages=None, non_blocking=True) ->
                 logger.debug(f"Подготовка задачи для file_id={file_id}, type={media_type}, ext={file_ext}")
                 
                 # Формируем имя S3 файла с префиксом
-                s3_filename = f"mediaTg/{file_id}{file_ext}"
+                # Политика: для видео — всегда плейсхолдер
+                if media_type == 'video' and TG_VIDEO_PLACEHOLDER_ALWAYS:
+                    s3_filename = f"mediaTg/{file_id}_thumb.jpg"
+                else:
+                    s3_filename = f"mediaTg/{file_id}{file_ext}"
                 s3_link = S3_LINK_TEMPLATE.format(filename=s3_filename)
                 
                 # Добавляем ссылку в результат сразу
@@ -814,6 +827,46 @@ async def process_upload_queue():
                 media_type = task['media_type']
                 s3_filename = task['s3_filename']
                 file_ext = task.get('file_ext', '.bin')
+                
+                # Если это видео и политика требует только плейсхолдер – создаем и загружаем, без скачивания оригинала
+                if media_type == 'video' and (TG_VIDEO_PLACEHOLDER_ALWAYS or s3_filename.endswith('_thumb.jpg')):
+                    logger.info(f"Воркер: Плейсхолдер для видео {file_id} по политике, без скачивания оригинала")
+                    temp_dir = tempfile.mkdtemp(dir=MEDIA_DOWNLOAD_DIR)
+                    try:
+                        placeholder_path = os.path.join(temp_dir, f"placeholder_{file_id}.jpg")
+                        width, height = 640, 360
+                        img = Image.new('RGB', (width, height), color=(50, 50, 50))
+                        draw = ImageDraw.Draw(img)
+                        title_text = "Видео (prev only)"
+                        subtitle_text = "Оригинал доступен в посте"
+                        try:
+                            # Безопасный расчёт bbox для центрирования
+                            bbox = getattr(draw, 'textbbox', None)
+                            if callable(bbox):
+                                title_box = draw.textbbox((0,0), title_text, font=ImageFont.load_default())
+                                title_w = title_box[2]-title_box[0]
+                                title_h = title_box[3]-title_box[1]
+                            else:
+                                title_w = draw.textlength(title_text, font=ImageFont.load_default())
+                                title_h = 12
+                            title_x = (width - title_w)/2
+                            title_y = height/2 - 20
+                        except Exception:
+                            title_x, title_y = width/2 - 60, height/2 - 20
+                        draw.text((title_x, title_y), title_text, font=ImageFont.load_default(), fill=(255,255,255))
+                        draw.text((width/2 - 80, height/2 + 10), subtitle_text, font=ImageFont.load_default(), fill=(200,200,200))
+                        img.save(placeholder_path, "JPEG", quality=90)
+                        upload_success, _ = await upload_to_s3(placeholder_path, s3_filename if s3_filename.endswith('_thumb.jpg') else f"mediaTg/{file_id}_thumb.jpg", check_size=False)
+                        if upload_success:
+                            s3_file_cache[file_id] = {'is_preview': True, 'thumbnail': s3_filename if s3_filename.endswith('_thumb.jpg') else f"mediaTg/{file_id}_thumb.jpg"}
+                            s3_file_cache.move_to_end(file_id)
+                            if len(s3_file_cache) > MAX_CACHE_SIZE: s3_file_cache.popitem(last=False)
+                        else:
+                            logger.error(f"Воркер: Не удалось загрузить плейсхолдер для {file_id}")
+                    finally:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    upload_queue.task_done()
+                    continue
                 
                 # Формируем путь для скачивания
                 local_path = os.path.join(MEDIA_DOWNLOAD_DIR, f"{file_id}{file_ext}")
@@ -1153,7 +1206,7 @@ def generate_media_links(msg):
             elif mime_type.startswith('image/'):
                 media_type = 'photo'
                 file_ext = '.jpg'
-            elif mime_type.startswith('audio/'):
+            elif mime_type.startswith('audio'):
                 media_type = 'audio'
                 file_ext = '.mp3'
             else:
@@ -1181,8 +1234,8 @@ def generate_media_links(msg):
             # Для видео большого размера можем сразу формировать ссылку на заглушку
             # Определяем размер файла
             file_size = getattr(media_object, 'size', 0)
-            if media_type == 'video' and file_size > MAX_FILE_SIZE:
-                # Для больших видео используем специальный суффикс для превью
+            if media_type == 'video' and (TG_VIDEO_PLACEHOLDER_ALWAYS or file_size > MAX_FILE_SIZE):
+                # Для видео в политике/больших используем превью
                 thumb_s3_filename = f"mediaTg/{file_id}_thumb.jpg"
                 thumb_s3_link = S3_LINK_TEMPLATE.format(filename=thumb_s3_filename)
                 media_urls.append(thumb_s3_link)
@@ -1250,7 +1303,7 @@ async def generate_media_links_with_album(client, msg):
 #     """
 #     Обрабатывает медиа в фоновом режиме после ответа API.
 #     Включает проверку кэша и скачивание файлов, если их нет в S3.
-    
+#     
 #     Args:
 #         client: Клиент Telegram
 #         msg: Сообщение Telegram
@@ -1260,7 +1313,7 @@ async def generate_media_links_with_album(client, msg):
 #         # Если нет медиа, нечего обрабатывать
 #         if not hasattr(msg, 'media') or not msg.media:
 #             return
-            
+#         
 #         # Проверяем, является ли сообщение частью альбома
 #         album_messages = None
 #         if hasattr(msg, 'grouped_id') and msg.grouped_id:
@@ -1269,20 +1322,20 @@ async def generate_media_links_with_album(client, msg):
 #                 album_messages = await get_album_messages(client, msg.input_chat, msg)
 #             except Exception as e:
 #                 logger.error(f"Ошибка при получении альбома для {msg.id}: {e}")
-        
+#         
 #         # Для каждого медиа-файла проверяем кэш и при необходимости скачиваем
 #         messages_to_process = album_messages if album_messages else [msg]
-        
+#         
 #         for current_msg in messages_to_process:
 #             if not hasattr(current_msg, 'media') or not current_msg.media:
 #                 continue
-                
+#             
 #             media = current_msg.media
 #             media_type = 'unknown'
 #             file_id = None
 #             media_object = None
 #             file_ext = '.bin'
-            
+#             
 #             # Определяем тип медиа и получаем file_id
 #             if isinstance(media, types.MessageMediaPhoto):
 #                 media_type = 'photo'
@@ -1301,7 +1354,7 @@ async def generate_media_links_with_album(client, msg):
 #                     logger.warning("Объект медиа без id, пропускаем")
 #                     return []
 #                 mime_type = getattr(media_object, 'mime_type', 'application/octet-stream').lower()
-                
+#                 
 #                 # Определяем тип и расширение файла
 #                 if mime_type.startswith('video/'):
 #                     media_type = 'video'
@@ -1322,7 +1375,7 @@ async def generate_media_links_with_album(client, msg):
 #                             _, _ext = os.path.splitext(fname_attr)
 #                             if _ext: 
 #                                 file_ext = _ext.lower()
-                            
+#                             
 #                 # Уточняем тип для GIF/стикеров
 #                 attributes = getattr(media_object, 'attributes', [])
 #                 for attr in attributes:
@@ -1332,12 +1385,12 @@ async def generate_media_links_with_album(client, msg):
 #                     elif isinstance(attr, types.DocumentAttributeSticker): 
 #                         media_type = 'sticker'
 #                         file_ext = '.webp'
-            
+#             
 #             # Если успешно определили медиа
 #             if file_id and media_object:
 #                 # Формируем имя S3 файла
 #                 s3_filename = f"mediaTg/{file_id}{file_ext}"
-                
+#                 
 #                 # Проверяем кэш ТОЛЬКО здесь, в фоновом процессе, а не перед ответом
 #                 cache_hit = False
 #                 if file_id in s3_file_cache:
@@ -1354,114 +1407,8 @@ async def generate_media_links_with_album(client, msg):
 #                         else:
 #                             logger.warning(f"Файл {cached_entry} из кэша для {file_id} не найден в S3. Удаляем из кэша.")
 #                             del s3_file_cache[file_id]
-                
+#                 
 #                 # Если файла нет в кэше S3, скачиваем и загружаем
 #                 if not cache_hit:
 #                     logger.info(f"Начинаем фоновую обработку медиа {file_id} (тип: {media_type})")
-                    
-#                     # Создаем временную директорию и путь для скачивания
-#                     temp_dir = tempfile.mkdtemp()
-#                     try:
-#                         local_path = os.path.join(temp_dir, f"{file_id}{file_ext}")
-                        
-#                         # Для видео проверяем размер файла
-#                         file_size = getattr(media_object, 'size', 0) if hasattr(media_object, 'size') else 0
-                        
-#                         # Для больших видео создаем заглушку вместо скачивания
-#                         if media_type == 'video' and file_size > MAX_FILE_SIZE:
-#                             logger.info(f"Видео {file_id} ({file_size} байт) превышает лимит, создаем текстовую заглушку")
-                            
-#                             # Вместо скачивания используем функцию для создания заглушки
-#                             # (копия логики из upload_to_s3 для больших видео)
-#                             placeholder_path = os.path.join(temp_dir, f"placeholder_{file_id}.jpg")
-                            
-#                             # Создаем заглушку с информацией о файле
-#                             try:
-#                                 from PIL import Image, ImageDraw, ImageFont
-                                
-#                                 # Создаем изображение-заглушку
-#                                 width, height = 640, 360  # Стандартное соотношение 16:9
-#                                 img = Image.new('RGB', (width, height), color=(50, 50, 50))
-#                                 draw = ImageDraw.Draw(img)
-                                
-#                                 # Пытаемся загрузить шрифт, или используем default
-#                                 try:
-#                                     font_path = os.path.join(os.environ.get('WINDIR', ''), 'Fonts', 'Arial.ttf')
-#                                     if os.path.exists(font_path):
-#                                         title_font = ImageFont.truetype(font_path, 30)
-#                                         regular_font = ImageFont.truetype(font_path, 20)
-#                                     else:
-#                                         title_font = ImageFont.load_default()
-#                                         regular_font = ImageFont.load_default()
-#                                 except Exception:
-#                                     title_font = ImageFont.load_default()
-#                                     regular_font = ImageFont.load_default()
-                                    
-#                                 # Определяем размер файла в МБ
-#                                 file_size_mb = round(file_size / (1024 * 1024), 1)
-                                
-#                                 # Добавляем текст
-#                                 title_text = f"Большой видеофайл ({file_size_mb} МБ)"
-#                                 subtitle_text = "Просмотр доступен только в оригинальном посте"
-                                
-#                                 # Центрируем текст
-#                                 title_width = draw.textlength(title_text, font=title_font)
-#                                 subtitle_width = draw.textlength(subtitle_text, font=regular_font)
-                                
-#                                 # Рисуем текст
-#                                 draw.text(((width - title_width) / 2, height / 2 - 30), title_text, font=title_font, fill=(255, 255, 255))
-#                                 draw.text(((width - subtitle_width) / 2, height / 2 + 10), subtitle_text, font=regular_font, fill=(200, 200, 200))
-                                
-#                                 # Добавляем значок видео
-#                                 draw.polygon([(width/2 - 40, height/2 - 80), (width/2 + 40, height/2 - 80), 
-#                                             (width/2 + 40, height/2 - 160), (width/2 - 40, height/2 - 160)], 
-#                                             fill=(200, 50, 50))
-#                                 draw.polygon([(width/2 - 15, height/2 - 120), (width/2 + 25, height/2 - 140), 
-#                                             (width/2 - 15, height/2 - 160)], fill=(255, 255, 255))
-                                
-#                                 # Сохраняем изображение
-#                                 img.save(placeholder_path, "JPEG", quality=90)
-                                
-#                                 # Загружаем заглушку в S3
-#                                 thumb_s3_filename = s3_filename.replace(os.path.splitext(s3_filename)[1], "_thumb.jpg")
-#                                 upload_success, preview_info = await upload_to_s3(placeholder_path, thumb_s3_filename, check_size=False)
-                                
-#                                 if upload_success:
-#                                     logger.debug(f"Заглушка для большого видео загружена в S3: {thumb_s3_filename}")
-#                                     # Сохраняем информацию в кэш
-#                                     preview_info = {
-#                                         'is_preview': True,
-#                                         'thumbnail': thumb_s3_filename,
-#                                         'size': file_size
-#                                     }
-#                                     s3_file_cache[file_id] = preview_info
-#                             except Exception as e:
-#                                 logger.error(f"Ошибка при создании заглушки для {file_id}: {e}")
-#                         else:
-#                             # Для обычных файлов скачиваем и загружаем в S3
-#                             try:
-#                                 # Скачиваем файл
-#                                 await client.download_media(media_object, local_path)
-                                
-#                                 # Проверяем, существует ли файл
-#                                 if os.path.exists(local_path):
-#                                     # Загружаем в S3
-#                                     upload_success, _ = await upload_to_s3(local_path, s3_filename)
-                                    
-#                                     if upload_success:
-#                                         logger.info(f"Файл {file_id} успешно загружен в S3 как {s3_filename}")
-#                                         # Сохраняем в кэш
-#                                         s3_file_cache[file_id] = s3_filename
-#                                     else:
-#                                         logger.error(f"Ошибка при загрузке {file_id} в S3")
-#                                 else:
-#                                     logger.error(f"Файл {local_path} не был создан при скачивании")
-#                             except Exception as e:
-#                                 logger.error(f"Ошибка при скачивании файла {file_id}: {e}")
-#                     finally:
-#                         # Удаляем временную директорию
-#                         shutil.rmtree(temp_dir, ignore_errors=True)
-                    
-#         logger.info(f"Фоновая обработка медиа для сообщения {msg.id} завершена")
-#     except Exception as e:
-#         logger.error(f"Ошибка при фоновой обработке медиа для сообщения {msg.id}: {e}")
+#                     ...

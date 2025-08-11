@@ -69,6 +69,10 @@ except ImportError as e:
 # --- Добавляем константы (значения из media_utils.py) ---
 MAX_FILE_SIZE = 50 * 1024 * 1024 
 S3_LINK_TEMPLATE = os.getenv('S3_LINK_TEMPLATE', 'https://scraper.website.yandexcloud.net/{filename}')
+# Политика медиа и плейсхолдеров видео
+TG_MEDIA_POLICY = os.getenv('TG_MEDIA_POLICY', 'all').lower()  # all | thumbnails_only
+TG_VIDEO_PLACEHOLDER_ALWAYS = os.getenv('TG_VIDEO_PLACEHOLDER_ALWAYS', 'false').lower() == 'true'
+TG_DEGRADED_REQ_THRESHOLD = int(os.getenv('TG_DEGRADED_REQ_THRESHOLD', '150'))
 # ----------------------------------------------------
 
 # load_dotenv()
@@ -141,6 +145,15 @@ class TelegramClientWrapper:
 
     async def _apply_delays(self):
         """Применяет задержки перед выполнением запроса."""
+        # Мягкая деградация по Redis-счётчику
+        try:
+            if self.api_key and self.account_id:
+                stats = await redis_utils.get_account_stats_redis(self.account_id, 'telegram')
+                reqs = int(stats.get('requests_count', 0)) if isinstance(stats, dict) else 0
+                self.degraded_mode = reqs >= TG_DEGRADED_REQ_THRESHOLD
+        except Exception as _:
+            pass
+
         current_time = time.time()
         if self.degraded_mode:
             request_delay = random.uniform(REQUEST_DELAY_MIN + 1, REQUEST_DELAY_MAX + 1)
@@ -879,6 +892,9 @@ async def _process_channels_for_trending(
                 try:
                     async for post in client.iter_messages(entity=peer_identifier, limit=3000):
                         iter_count += 1
+                        # Лёгкая пауза каждые 20 сообщений, чтобы сгладить нагрузку
+                        if iter_count % 20 == 0:
+                            await asyncio.sleep(random.uniform(0.2, 0.6))
                         if not post or not isinstance(post, types.Message) or not post.date:
                             logger.debug(f"[Acc: {account_id}][Chan: {channel_id_input}] Iter {iter_count}: Пропуск (None, не Message или нет даты)")
                             continue
@@ -975,7 +991,7 @@ async def _process_channels_for_trending(
                                     s3_filename = None
                                     s3_thumb_filename = None
                                     s3_filename_to_use = None
-                                    if media_type == 'video' and file_size > MAX_FILE_SIZE:
+                                    if media_type == 'video' and (TG_VIDEO_PLACEHOLDER_ALWAYS or file_size > MAX_FILE_SIZE):
                                         is_placeholder = True
                                         s3_thumb_filename = f"mediaTg/{file_id}_thumb.jpg"
                                         s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_thumb_filename)
@@ -994,11 +1010,16 @@ async def _process_channels_for_trending(
                                         media_list.append(media_entry)
                                         processed_media_urls.add(s3_url_to_add)
                                     if file_id not in media_tasks_for_post:
+                                        post_url_for_task = (
+                                            f"https://t.me/{entity_username}/{main_album_msg.id}" if entity_username else f"https://t.me/c/{abs(chat_entity_id_for_data)}/{main_album_msg.id}"
+                                        )
                                         media_tasks_for_post[file_id] = {
-                                            "account_id": account_id, 
-                                            "media_object": media_object, 
-                                            "file_id": file_id, 
-                                            "s3_filename": s3_filename_to_use
+                                            "account_id": account_id,
+                                            "media_object": media_object,
+                                            "file_id": file_id,
+                                            "s3_filename": s3_filename_to_use,
+                                            "post_url": post_url_for_task,
+                                            "post_text": post_text_found
                                         }
                                 background_tasks_queue.extend(media_tasks_for_post.values())
                                 raw_engagement_score = (main_album_msg.views or 0) + (reactions * 10) + (comments * 20) + (forwards * 50)
@@ -1119,7 +1140,7 @@ async def _process_channels_for_trending(
                             s3_thumb_filename = None # <<< Инициализируем None
                             s3_filename_to_use = None 
                             # Проверяем размер видео
-                            if media_type == 'video' and file_size > MAX_FILE_SIZE:
+                            if media_type == 'video' and (TG_VIDEO_PLACEHOLDER_ALWAYS or file_size > MAX_FILE_SIZE):
                                 is_placeholder = True
                                 s3_thumb_filename = f"mediaTg/{file_id}_thumb.jpg"
                                 s3_url_to_add = S3_LINK_TEMPLATE.format(filename=s3_thumb_filename)
@@ -1147,10 +1168,12 @@ async def _process_channels_for_trending(
                             # Передаем file_size в задачу (хотя media_utils.py его сам получит)
                             if file_id not in media_tasks_for_post and s3_filename_to_use:
                                 media_tasks_for_post[file_id] = {
-                                    "account_id": account_id, 
-                                    "media_object": media_object, 
-                                    "file_id": file_id, 
-                                    "s3_filename": s3_filename_to_use
+                                    "account_id": account_id,
+                                    "media_object": media_object,
+                                    "file_id": file_id,
+                                    "s3_filename": s3_filename_to_use,
+                                    "post_url": post_data.get('url'),
+                                    "post_text": post_text_found
                                 }
                             elif not s3_filename_to_use:
                                 logger.warning(f"[Acc: {account_id}] Не удалось определить имя файла для media {file_id} ({media_type}) — задача не будет добавлена.")
